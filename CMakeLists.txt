@@ -18,13 +18,16 @@
 ###
 
 cmake_minimum_required(VERSION 3.21)
+
 project(eyil-secure-gateway VERSION 1.0.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CTest)
 include(CMakePackageConfigHelpers)
 include(services.cmake)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 include(Coverage)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -46,7 +49,9 @@ if(PLUGIN_EYILGATEWAY)
     find_package(${NAMESPACE}Core REQUIRED)
     find_package(${NAMESPACE}COM REQUIRED)
     find_package(${NAMESPACE}Plugins REQUIRED)
+
     include(CmakeHelperFunctions)
+
     add_subdirectory(EyilGateway)
 endif()
 
@@ -55,6 +60,9 @@ if(BUILD_TESTING)
 endif()
 
 install(FILES LICENSE NOTICE
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/eyil-secure-gateway)
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/eyil-secure-gateway
+)
+
 install(FILES doc/EyilSecureGateway.md
-    DESTINATION ${CMAKE_INSTALL_DOCDIR})
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+)

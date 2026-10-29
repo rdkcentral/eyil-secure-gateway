@@ -22,6 +22,7 @@ function(eyil_enable_coverage target)
         if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
             message(FATAL_ERROR "ENABLE_COVERAGE currently requires GCC")
         endif()
+
         target_compile_options(${target} PRIVATE --coverage -O0 -g)
         target_link_options(${target} PRIVATE --coverage)
     endif()

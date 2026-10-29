@@ -20,5 +20,7 @@
 # Add real unit tests with the L1 label when behavior is implemented.
 add_custom_target(check-l1
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/run-tests.py
-        --build-dir ${PROJECT_BINARY_DIR} --label L1
-    VERBATIM)
+        --build-dir ${PROJECT_BINARY_DIR}
+        --label L1
+    VERBATIM
+)

@@ -18,15 +18,23 @@
 ###
 
 cmake_minimum_required(VERSION 3.21)
+
 project(EyilInstalledConsumer LANGUAGES C CXX)
 
 find_package(EyilClient CONFIG REQUIRED)
+
 add_executable(eyil-c-consumer main.c)
+
 target_link_libraries(eyil-c-consumer PRIVATE EyilClient::EyilClient)
 
 find_package(EyilProtocol CONFIG REQUIRED)
+
 add_executable(eyil-protocol-consumer protocol.cpp)
+
 target_compile_features(eyil-protocol-consumer PRIVATE cxx_std_17)
-target_link_libraries(eyil-protocol-consumer PRIVATE
-    EyilProtocol::EyilProtocol
-    EyilClient::EyilClient)
+
+target_link_libraries(eyil-protocol-consumer
+    PRIVATE
+        EyilProtocol::EyilProtocol
+        EyilClient::EyilClient
+)

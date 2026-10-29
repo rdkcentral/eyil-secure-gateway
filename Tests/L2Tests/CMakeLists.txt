@@ -20,5 +20,7 @@
 # Add real integration tests with the L2 label when request handling exists.
 add_custom_target(check-l2
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/run-tests.py
-        --build-dir ${PROJECT_BINARY_DIR} --label L2
-    VERBATIM)
+        --build-dir ${PROJECT_BINARY_DIR}
+        --label L2
+    VERBATIM
+)

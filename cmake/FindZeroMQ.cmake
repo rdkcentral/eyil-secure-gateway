@@ -22,23 +22,31 @@ find_library(ZeroMQ_LIBRARY NAMES zmq)
 
 if(ZeroMQ_INCLUDE_DIR)
     file(STRINGS "${ZeroMQ_INCLUDE_DIR}/zmq.h" _zmq_version
-        REGEX "^#define ZMQ_VERSION_(MAJOR|MINOR|PATCH) ")
+        REGEX "^#define ZMQ_VERSION_(MAJOR|MINOR|PATCH) "
+    )
+
     foreach(part MAJOR MINOR PATCH)
         string(REGEX MATCH "ZMQ_VERSION_${part} +([0-9]+)" _match "${_zmq_version}")
         set(_zmq_${part} "${CMAKE_MATCH_1}")
     endforeach()
+
     set(ZeroMQ_VERSION "${_zmq_MAJOR}.${_zmq_MINOR}.${_zmq_PATCH}")
 endif()
 
 include(FindPackageHandleStandardArgs)
+
 find_package_handle_standard_args(ZeroMQ
     REQUIRED_VARS ZeroMQ_INCLUDE_DIR ZeroMQ_LIBRARY
-    VERSION_VAR ZeroMQ_VERSION)
+    VERSION_VAR ZeroMQ_VERSION
+)
 
 if(ZeroMQ_FOUND AND NOT TARGET ZeroMQ::ZeroMQ)
     add_library(ZeroMQ::ZeroMQ UNKNOWN IMPORTED)
+
     set_target_properties(ZeroMQ::ZeroMQ PROPERTIES
         IMPORTED_LOCATION "${ZeroMQ_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${ZeroMQ_INCLUDE_DIR}")
+        INTERFACE_INCLUDE_DIRECTORIES "${ZeroMQ_INCLUDE_DIR}"
+    )
 endif()
+
 mark_as_advanced(ZeroMQ_INCLUDE_DIR ZeroMQ_LIBRARY)

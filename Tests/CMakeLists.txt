@@ -22,6 +22,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 if(RDK_SERVICES_L1_TEST)
     add_subdirectory(L1Tests)
 endif()
+
 if(RDK_SERVICE_L2_TEST)
     add_subdirectory(L2Tests)
 endif()
@@ -31,4 +32,5 @@ add_custom_target(coverage
         --build-dir ${PROJECT_BINARY_DIR}
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
     COMMENT "Run registered tests and report coverage availability"
-    VERBATIM)
+    VERBATIM
+)
