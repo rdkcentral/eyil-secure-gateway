@@ -109,7 +109,7 @@ dedicated-thread wording. See TODO(CLIENT-MONITOR).
 | ID | Target acceptance criterion |
 | --- | --- |
 | AC3.1 | Firebolt Crypto uses EyilClient to route app requests to Gateway and ultimately the external Crypto backend. |
-| AC3.2 | Firebolt Crypto serializes/deserializes service-specific Crypto payloads using the agreed Protobuf definitions. The EyilClient envelope contract must be aligned with its public header before implementation. |
+| AC3.2 | Firebolt Crypto serializes/deserializes service-specific Crypto payloads using the agreed Protobuf definitions. EyilClient handles the outer RPC envelope, owns request IDs and sets schema version 1; this agreed functionality remains to be implemented in the skeleton. |
 
 Firebolt Crypto and the real Crypto plugin are separate deliverables. Their
 presence in diagrams does not add their implementation to this repository.
@@ -121,7 +121,7 @@ presence in diagrams does not add their implementation to this repository.
 | Thunder wrapper | IPlugin, Root<IConfiguration>(), Configure(), release and remote-connection notification | Integrate a deterministic stop/drain lifecycle |
 | Implementation library | IConfiguration, configuration guard and dependency logging | Transport, authentication seam, registry, private pool, router and buffers |
 | EyilClient | Nine C functions with placeholder results and response freeing | Connection handles, coordinator, I/O thread, pending requests and callbacks |
-| Protocol | Generated rpc.proto and crypto.proto, schema constant 1 | Envelope processing, validation and service mapping |
+| Protocol | Generated rpc.proto and crypto.proto, schema constant 1 | Agreed RPC envelope processing, validation and service mapping; implement TODO(CLIENT-ENVELOPE) and align the client header comment |
 | ZeroMQ | Located and linked by CMake | Runtime sockets, monitors and target peer-credential support |
 | AppManager / RuntimeManager | No calls or authentication dependency in this code | TODO(AUTH-APPMANAGER); optional lifecycle integration remains TODO |
 | Crypto / ICrypto | No ICrypto header dependency, adapter binding, real backend or stub | TODO(BACKEND-ICRYPTO), after interface and lifecycle contracts are approved |
@@ -162,21 +162,23 @@ flowchart LR
         MAP --> SHM
     end
     subgraph TH["Existing host Thunder process - initial deployment"]
-        WR["NEW EyilGateway IPlugin"]
-        IM["NEW EyilGatewayImplementation"]
-        IO["PLANNED ROUTER, ZAP and monitor"]
-        REG["PLANNED connection registry"]
-        POOL["PLANNED private Thunder request pool"]
-        AD["PLANNED service adapter boundary"]
-        BM["PLANNED shared-buffer manager"]
+        subgraph GW["EyilGateway - org.rdk.EyilGateway"]
+            WR["NEW EyilGateway IPlugin"]
+            IM["NEW EyilGatewayImplementation"]
+            IO["PLANNED ROUTER, ZAP and monitor"]
+            REG["PLANNED connection registry"]
+            POOL["PLANNED private Thunder request pool"]
+            AD["PLANNED service adapter boundary"]
+            BM["PLANNED shared-buffer manager"]
+            WR --> IM
+            IM --> IO
+            IO --> REG
+            IO --> POOL
+            POOL --> AD
+            POOL --> BM
+        end
         AM["Existing AppManager"]
         RM["Existing RuntimeManager"]
-        WR --> IM
-        IM --> IO
-        IO --> REG
-        IO --> POOL
-        POOL --> AD
-        POOL --> BM
         AM --> RM
     end
     CP["External Crypto plugin / ICrypto - NOT INTEGRATED"]
@@ -194,7 +196,9 @@ flowchart LR
     CP -. "Future open/map/use/close via trusted path" .-> SHM
 ```
 
-The diagram distinguishes existing platform infrastructure from new Gateway
+The inner EyilGateway block groups components owned by the plugin. AppManager
+and RuntimeManager remain separate plugins within the Thunder process. The
+diagram distinguishes existing platform infrastructure from new Gateway
 components and future integrations. Crypto may itself be in process or remote;
 Gateway must not depend on a raw pointer or FD being meaningful in Crypto's
 process.
@@ -288,16 +292,26 @@ schema to **1**. EyilClient sets it for each RPC. There is no version negotiatio
 or fallback protocol in the current schema. Library/package ABI versions and
 Thunder plugin metadata versions are separate concepts.
 
-**TODO(CLIENT-ENVELOPE):** the public byte API currently says that it does not
-serialize or deserialize Protobuf. Its arguments also lack a service parameter.
-The design requires EyilClient to own request IDs and set schema 1. Before coding
-this path, align the contract: a proposed compatible signature-level approach
-is for the caller to provide a serialized RpcRequest containing service/payload,
-then for EyilClient to parse only the envelope, replace request_id/schema_version
-and return a serialized RpcResponse. Crypto payload bytes stay opaque.
-Alternatively, changing the public API to accept a service and payload requires
-explicit agreement. Diagrams use the first proposal and mark this dependency;
-they do not assume that arbitrary raw bytes identify a service.
+**Agreed functionality — not yet implemented in the skeleton:** EyilClient
+serializes/deserializes the outer RPC envelope, owns request IDs, sets
+schema_version to 1 and correlates responses. These are implementation tasks,
+not open architecture decisions.
+
+For the existing byte API, the caller supplies a serialized RpcRequest carrying
+service and payload. EyilClient parses the envelope, assigns request_id, sets
+schema_version and serializes it for transmission. On receipt, it parses and
+validates RpcResponse, matches request_id to the pending call and returns the
+serialized response to that caller. The service is carried in the envelope;
+no separate service argument is needed. Crypto payload bytes remain opaque to
+EyilClient and are interpreted by the service-specific consumer.
+
+**TODO(CLIENT-ENVELOPE):** implement this agreed behavior and update the public
+header comment accordingly. The current comment above client_send_request()
+says that the API does not perform Protobuf serialization/deserialization; it
+has not yet been aligned with the agreed envelope handling. Its wording should
+distinguish RPC envelope processing from service-payload interpretation. The
+flows below show the agreed target behavior, which is missing from the current
+skeleton.
 
 ### 4.2 Status and error layers
 
@@ -385,11 +399,12 @@ than the client password. See the
 
 ### 4.5 Reference baseline and deliberate changes from samples
 
-The local review inputs are the latest `CryptoGateway/EyilGateway/` sample,
+The architect-provided reference materials are the latest
+`CryptoGateway/EyilGateway/` sample,
 its `Gateway-Owned-Shared-Memory-Proposal.md`,
-`zmq_disconnect_sending_UID_GID_PID.patch`, `zmq_server.cpp`, and the older
-`entservices-eyilgateway` modular implementation. They are design references,
-not build dependencies or the authoritative implementation of this repository.
+`zmq_disconnect_sending_UID_GID_PID.patch` and `zmq_server.cpp`.
+The table below compares these materials with the agreed implementation
+decisions for this repository. They are design references, not build dependencies.
 
 | Reference behavior | Direction for this repository |
 | --- | --- |
@@ -398,8 +413,6 @@ not build dependencies or the authoritative implementation of this repository.
 | Sample heartbeat/inactivity timeout | Do not adopt; lifecycle rules remain TODO |
 | Sample single pending client request and multiple socket users | One I/O owner and a request-ID pending map |
 | Sample synchronous dispatch in the ROUTER loop | One private Thunder-pool dispatch job per accepted request |
-| Older modular implementation's serial backend worker | Use as component-boundary reference only; retain parallel request design |
-| Older implementation's invalid-Crypto-request readiness probe | Do not adopt; define connection readiness without assuming Crypto is present |
 | Credential monitor patch | Evaluate for events; it does not provide a complete per-connection correlation token |
 | Sample hardcoded identities / detached watchdog threads | Generate independent connection identities; own and join all Gateway threads |
 
@@ -568,7 +581,7 @@ sequenceDiagram
 It does not prove that ZAP accepted the client or that the service is ready.
 Proposed behavior is to return a handle after authenticated transport readiness;
 the timeout, event support and distinction from backend readiness need agreement.
-Do not use an intentionally invalid Crypto request as a readiness probe.
+Connection readiness must be defined independently of Crypto backend availability.
 
 On partial startup failure, close created sockets on their owner, stop/join the
 thread, terminate its context and free the incomplete handle. No callback may
@@ -589,7 +602,7 @@ sequenceDiagram
     API->>API: Validate, clear outputs, retain Client
     API->>API: Copy request, allocate waiter, enqueue and wake
     IO->>IO: Parse outer envelope, assign ID and schema 1
-    Note over API,IO: TODO(CLIENT-ENVELOPE): align public header
+    Note over API,IO: Agreed envelope handling, TODO implementation and header alignment
     IO->>IO: Register pending waiter before send
     IO->>Z: zmq_send(serialized RpcRequest, nonblocking)
     Z->>G: IPC request body
@@ -1687,11 +1700,12 @@ remain **Gap 2**.
 Implement the transport and registry behind the seams described above before
 adding external dependencies. The following order keeps each step reviewable:
 
-1. Align the envelope, client error/callback and connection-correlation
+1. Resolve the remaining client error/callback and connection-correlation
    contracts that block the first implementation. Record unresolved lifecycle
    policy without adding speculative heartbeat/expiry behavior.
-2. Implement EyilClient's owner loop, bounded queues, pending map and shutdown;
-   prove two callers can use one connection without touching its socket.
+2. Implement the agreed RPC envelope handling and align the header comment,
+   together with EyilClient's owner loop, bounded queues, pending map and
+   shutdown. Prove two callers can use one connection without touching its socket.
 3. Implement Gateway startup/ZAP/interim identities, the registry and monitor
    integration. Prove multiple connections from one PID remain independent.
 4. Add private-pool jobs, bounded admission and completion routing using an
@@ -2021,9 +2035,8 @@ Answers required:
   worker on work that is itself queued behind them?
 
 **Implementation constraint:** one dispatch object per request does not imply
-unrestricted simultaneous access to every resource. Keep unrelated requests
-concurrent while defining resource-specific ordering. Do not restore a single
-global serial backend worker as an accidental workaround.
+unrestricted simultaneous access to every resource. Define resource-specific
+ordering while keeping unrelated requests concurrent on the private worker pool.
 
 **Blocks:** safe concurrent request, release and disconnect behavior.
 **Coverage affected:** AC1.6–AC1.10; AC2.4.
@@ -2068,7 +2081,6 @@ a public API, even though they are not new Gateway architecture gaps.
 | API-AUTHORIZATION | Exact entitlement format and mapping from service/operation to allowed APIs; currently all supported APIs are allowed |
 | LIFECYCLE-EVENTS | Whether to subscribe to stop/hibernate/resume events, through which plugin API, and what each event does to connections/resources |
 | CONNECTION-LIFETIME | Client connect-on-first-use versus app-lifetime guidance, idle policy, reconnect behavior and multiple-connection lifecycle; no heartbeat/expiry assumed |
-| CLIENT-ENVELOPE | Confirm caller input/return message types, EyilClient request-ID/schema ownership and corresponding header wording |
 | CLIENT-CALLBACKS | Local async failure representation, callback affinity/reentrancy, handler replacement, unregister/disconnect quiescence and absence of user-data parameters |
 | CLIENT-DEADLINES | Connect/request timeout configuration, exactly-once local completion and late-response handling without claiming remote cancellation |
 | CLIENT-MONITOR | Dedicated monitor thread required by literal AC, or PAIR handling on the serving thread accepted |
