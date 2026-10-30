@@ -98,11 +98,11 @@ parallelism when workers, backend capacity or shared resources are exhausted.
 | AC2.3 | Receive socket monitor events through a `ZMQ_PAIR` at `inproc://app-eyil-client-monitor-<unique-client-id>`. |
 | AC2.4 | Implement all four binary/string request methods, including client_send_request_async and client_send_request_string_async. Support multiple outstanding requests on one connection and responses arriving out of order. Async calls return CLIENT_OK after the I/O owner successfully submits the message to libzmq, then deliver a validated response through the supplied response callback with no response timeout. Section 5.4 defines send failures and cleanup when no response can be delivered. |
 
-Notification registration/unregistration is referenced indirectly by AC2.1
-through EyilClient.h. The ACs do not explicitly define unsolicited Gateway
-messages. Their implementation scope and delivery contract require architect
-clarification under TODO(NOTIFICATIONS); this does not change async responses
-or connection-state callbacks.
+Notification APIs are retained for future support. In this version,
+client_register_notifications returns CLIENT_NOT_IMPLEMENTED and
+client_unregister_notifications has no effect. No notification handler is stored
+or invoked. Async responses and connection-state callbacks retain their separate
+contracts.
 
 The accepted implementation direction is a **library-owned serving/I/O
 thread**, initially one per `Client`. Applications do not supply an I/O
@@ -349,6 +349,7 @@ carry local ClientResult errors.
 | Situation | ClientResult | Response handling |
 | --- | --- | --- |
 | Invalid arguments or invalid caller-supplied request envelope | CLIENT_INVALID_ARGUMENT | No response |
+| client_register_notifications is called | CLIENT_NOT_IMPLEMENTED | Reserved for future support; no handler is stored or invoked |
 | client_connect receives a valid, already allocated Client handle in the caller's slot | CLIENT_ALREADY_CONNECTED | Preserve the existing handle and connection state; create no new connection and invoke no callback |
 | Submission without a usable connection | CLIENT_NOT_CONNECTED | No response |
 | Authentication explicitly rejected | CLIENT_AUTH_FAILED | No response |
@@ -414,7 +415,7 @@ Transport/authentication failures can occur before any RpcResponse is possible.
 | uint32 buffer fields | Validate size/ranges with overflow-safe arithmetic and stricter configured quotas |
 | No app identity fields | Derive context from trusted transport metadata |
 | No deadline/cancel message | A local timeout cannot cancel backend work or prove buffer reuse is safe |
-| No notification envelope | The header includes notification APIs, but required Gateway events and their wire identification need architect clarification under TODO(NOTIFICATIONS) |
+| No notification envelope | Notification support is reserved for the future; registration returns CLIENT_NOT_IMPLEMENTED and creates no subscription |
 | No retry/deduplication contract | Do not replay key generation, import or other operations automatically |
 | No text encoding definition | String API cannot carry arbitrary binary Protobuf via strlen(); its codec remains TODO |
 | No lifecycle/heartbeat messages | Do not invent idle expiry, hibernation commands or heartbeat services |
@@ -551,7 +552,6 @@ flowchart LR
         SEND_RESULT["Per-call async send-result waiter"]
         CB["Async response callback<br/>Client + owned response"]
         HANDLERS["Connection event handler"]
-        LOCAL_HANDLER["Local notification handler registration"]
         EVENTS["libzmq internal monitor sender<br/>DEALER connection events"]
         M["PAIR monitor receiver<br/>Polled and decoded by the I/O owner<br/>Same monitor-event collection duties"]
         MN["Design note - AC confirmation<br/>PAIR receiver + I/O owner cover monitor-thread duties<br/>No separate monitor worker in this proposal"]
@@ -560,7 +560,6 @@ flowchart LR
         LIFE -- "Start / join serving thread" --> IO
         LIFE -- "Connection handler registration" --> HANDLERS
         REQ -- "Validate and prepare owned request" --> CO
-        NOTIFY -- "Register / remove local handler" --> LOCAL_HANDLER
         Q -- "Commands and requests" --> IO
         IO -- "Send requests" --> D
         D -- "Receive responses" --> IO
@@ -578,7 +577,8 @@ flowchart LR
     G["Gateway ROUTER<br/>ipc:///tmp/app-eyil-gateway.ipc"]
     A -- "Connect / disconnect" --> LIFE
     A -- "Sync / async request calls" --> REQ
-    A -- "Register / unregister notifications" --> NOTIFY
+    A -- "Call reserved notification APIs" --> NOTIFY
+    NOTIFY -- "Register returns CLIENT_NOT_IMPLEMENTED<br/>Unregister returns without changes" --> A
     A -- "Free returned response storage" --> FREE
     SYNC -- "Return ClientResult and response" --> A
     SEND_RESULT -- "Return async submission ClientResult" --> A
@@ -593,9 +593,8 @@ block. Those entry points run on the calling application thread; request and
 control queues transfer work to the library-owned I/O loop. Synchronous results
 return to the caller, while asynchronous results use the registered per-request
 response handler. Section 5.4 defines send waiting and callback execution rules.
-Response freeing and notification registration are local API operations.
-The notification implementation contract remains subject to architect
-clarification; the registry block does not define a Gateway event producer.
+Response freeing is a local operation. The reserved notification APIs do not
+create callback state, subscriptions or Gateway event producers.
 
 The PAIR monitor receiver is an internal socket plus event-decoding code.
 Enabling monitoring on DEALER makes libzmq create the other PAIR endpoint, which
@@ -750,8 +749,8 @@ public functionality under AC2.4, alongside their synchronous counterparts.
 | client_send_request_string | Defined text codec plus synchronous request core | AC2.1, AC2.4 |
 | client_send_request_string_async | Selected text codec plus the same send-acceptance contract and response-only callback | AC2.1, AC2.4 |
 | client_free_response | Release a library-allocated result | AC2.1 |
-| client_register_notifications | Local handler registration; notification implementation requires architect clarification under NOTIFICATIONS | AC2.1 through the supplied header |
-| client_unregister_notifications | Local handler removal; delivery/quiescence contract requires architect clarification under NOTIFICATIONS | AC2.1 through the supplied header |
+| client_register_notifications | Return CLIENT_NOT_IMPLEMENTED; reserved for future support | AC2.1 through the supplied header |
+| client_unregister_notifications | Return without changing state; reserved for future support | AC2.1 through the supplied header |
 | client_disconnect | Stop admission/I/O, settle pending work and destroy the handle | AC2.1–AC2.3; AC1.10 on the Gateway side |
 
 #### Required asynchronous request behavior
@@ -816,8 +815,8 @@ The pending map associates the library-assigned request_id with the handler
 supplied for that request. Callback arguments carry the actual response only.
 The app inspects RpcStatus and service status, then releases the owned response
 through client_free_response(). A valid Gateway error response is delivered
-through the same callback. ClientNotificationHandler is a separate local
-registration API and is not used to deliver request results or local errors.
+through the same callback. ClientNotificationHandler is reserved for future
+support and is not used to deliver request results or local errors.
 
 Copy input before returning so the caller may reuse its request storage.
 Keep pending bookkeeping and callback code valid until response delivery or
@@ -1582,73 +1581,48 @@ Do not pass a mapped buffer, stack memory or a Gateway buffer ID.
 
 ### 5.11 client_register_notifications()
 
-Coverage: **AC2.1**.
+Coverage: **AC2.1**, retaining the supplied API for future support.
 
-**Architect clarification required — TODO(NOTIFICATIONS).** Retain the supplied
-API declarations. The sequence below describes the local registration boundary;
-it does not settle the notification implementation or authorize a Gateway-pushed
-event protocol.
+**Return CLIENT_NOT_IMPLEMENTED.** The function ignores its arguments and does
+not store or invoke the handler, allocate notification state, subscribe to events
+or send a message to Gateway.
 
 ```mermaid
 sequenceDiagram
     participant A as Application
     participant API as client_register_notifications
-    participant C as Coordinator / local callback state
     A->>API: Client and notification handler
-    API->>C: Validate Client and handler
-    opt Arguments and Client state are valid
-        C->>C: Store or replace handler under synchronization
-    end
-    C-->>API: Registration result
-    API-->>A: ClientResult
-    Note over A,C: Local registration only, no ZMQ subscribe/RPC message
+    API-->>A: CLIENT_NOT_IMPLEMENTED
+    Note over A,API: Future support only, no handler retention or transport activity
 ```
 
-The supplied header defines the callback signature, execution-thread restrictions
-and ownership of notification bytes. The ACs do not explicitly require
-Gateway-pushed events, and the RPC schema defines no notification message.
-Architects need to confirm:
-
-- Whether notification delivery is required for this version or the API is
-  retained for future use; if required, which events Gateway sends and when.
-- How notifications are identified on the wire and which Protobuf payloads they
-  carry, independently of normal request/response correlation.
-- Any subscription, delivery-ordering and unregister/quiescence guarantees
-  beyond the existing header contract.
-
-Keep the notification implementation pending that clarification. Do not infer
-events, a subscription exchange or a message discriminator from the sample's
-fallback behavior when no request is pending.
+Notification delivery is outside this version's scope. A future feature must
+define the events, Protobuf payloads, wire identification and callback lifecycle
+before enabling this API. It is not a pending decision for the current delivery.
 
 Connection-state events go to ClientConnectionEventHandler registered through
-client_connect(). Async request results go to their per-request response
-handlers. Neither uses this notification registration. A late or unmatched RPC
-response must follow the response-validation rules in section 5.6, never be
-reclassified as a notification.
+client_connect(). Async responses go to the response handler supplied with each
+request. A late or unmatched RPC response follows the validation rules in
+section 5.6 and must not be reclassified as a notification.
 
 ### 5.12 client_unregister_notifications()
 
-Coverage: **AC2.1**.
+Coverage: **AC2.1**, retaining the supplied API for future support.
 
-**Architect clarification required — TODO(NOTIFICATIONS).** This sequence shows
-local handler removal. Any coordination with queued or active notification
-delivery depends on the clarified notification contract.
+This void function returns without changing state. Notification registration
+is unsupported, so there is no handler to remove or notification delivery to drain.
 
 ```mermaid
 sequenceDiagram
     participant A as Application
     participant API as client_unregister_notifications
-    participant C as Coordinator / local callback state
     A->>API: Client
-    API->>C: Clear stored handler under synchronization
-    C-->>API: Unregistration complete
-    API-->>A: Return
-    Note over A,C: Local state only, application calls this before disconnect
+    API-->>A: Return without changing state
+    Note over A,API: No notification state, callbacks or ZMQ activity
 ```
 
-The public header requires unregistering this handler before disconnect.
-Clearing it does not unregister the connection-event handler or cancel pending
-request completions. Those have their own lifecycle and ownership rules.
+Calling this function is not required before client_disconnect in this version.
+It does not affect the connection-event handler or pending request responses.
 
 ### 5.13 client_disconnect()
 
@@ -1662,7 +1636,7 @@ sequenceDiagram
     participant IO as Serving thread
     participant Z as libzmq / DEALER and monitor
     participant G as Gateway monitor
-    A->>API: Client, after unregistering notifications
+    A->>API: Client
     API->>C: Stop new API admissions, request shutdown
     C->>IO: Wake, resolve active sync/send-result waiters and retire async records
     Note over C,IO: No async error callbacks, local-close status/order for waiters is TODO
@@ -1836,9 +1810,8 @@ Application / Firebolt Crypto
       retire accepted async response records, no synthetic error callback
       notify connection handler
 
-  client_register_notifications / client_unregister_notifications
-    CallbackRegistry -> local store / clear boundary
-      Notification implementation and delivery contract -> NOTIFICATIONS clarification
+  client_register_notifications -> CLIENT_NOT_IMPLEMENTED, future support
+  client_unregister_notifications -> return without changing state
 
   client_free_response -> free
   client_disconnect
@@ -3251,7 +3224,6 @@ a public API, even though they are not new Gateway architecture gaps.
 | CLIENT-ADMISSION | Local full-queue result after the selected 64 outstanding requests per Client; ClientResult lacks a queue-full value, and server RpcStatus must not be fabricated for local rejection |
 | CLIENT-MONITOR | Confirm the monitor-responsibility checklist in section 5.2 and whether PAIR plus the I/O owner satisfies the AC, or a distinct OS thread is mandatory |
 | STRING-CODEC | Choose later between Base64 of the entire binary envelope and ProtoJSON, including text/binary size limits |
-| NOTIFICATIONS | Architects to confirm whether notification delivery is required now or reserved for future use; if required, define Gateway events/triggers, Protobuf payloads, an explicit wire discriminator and delivery/unregister guarantees. Unknown request_id values must not automatically become notifications |
 | ERROR-MAPPING | Invalid service payload, duplicate/malformed IDs, backend unavailable, busy/release-pending and quota errors |
 | BUFFER-HELPER | Ownership of app-side shm_open/mmap helpers, output validation and release coordination |
 | DEPLOYMENT | UDS mount/recreation, permissions, procfs/user-namespace access, private /dev/shm and blocked direct Crypto communicator access |
