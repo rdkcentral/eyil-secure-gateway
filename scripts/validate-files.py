@@ -49,6 +49,9 @@ def main():
         if "\r" in text or not text.endswith("\n"):
             errors.append(f"{name}: use LF with a final newline")
         for index, line in enumerate(text.splitlines(), 1):
+            # A unified diff represents an empty context line with one space.
+            if path.suffix == ".patch" and line == " ":
+                continue
             if line.rstrip() != line:
                 errors.append(f"{name}:{index}: trailing whitespace")
         if path.suffix == ".json":

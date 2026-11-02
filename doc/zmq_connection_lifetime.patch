@@ -1,0 +1,1420 @@
+Subject: [PATCH] libzmq: bind ZAP, messages and monitors to a stream lifetime
+
+Copyright 2026 RDK Management
+
+Patch contents follow the licenses and linking exception of the affected
+libzmq component. Existing licensing notices are preserved in the diff.
+
+Base: upstream libzmq 4.3.4 release archive
+Upstream-Status: Pending
+
+Allocate an immutable local connection ID before the stream handshake. Expose
+it and the FD as local ZAP and received-message metadata; snapshot UDS peer
+credentials and include the lifetime in version-2 ACCEPTED/DISCONNECTED events.
+Keep version-1 monitoring and the ZAP/ZMTP wire frames unchanged.
+
+Add the opt-in downstream ROUTER_EXPECTED_CONNECTION_ID draft option so a
+reply cannot follow a reused routing ID to another connection. Native transport
+metadata cannot be overwritten by ZAP reply or peer metadata.
+
+This replaces, rather than stacks on, the credential-only disconnect patch.
+Version-2 consumers must handle the documented value counts. Gateway must
+consume the new binding and use the send guard; the patch alone does not
+implement Gateway session cleanup. Enable draft APIs in the library build.
+
+Includes a Linux CMake regression test and integration documentation.
+
+---
+ doc/connection-lifetime-extension.md | 374 +++++++++++++++++++++++++++
+ include/zmq.h                        |   5 +
+ src/i_engine.hpp                     |   6 +
+ src/router.cpp                       |  46 ++++
+ src/router.hpp                       |   6 +
+ src/session_base.cpp                 |   5 +
+ src/socket_base.cpp                  |  27 +-
+ src/socket_base.hpp                  |   7 +-
+ src/stream_engine_base.cpp           |  63 ++++-
+ src/stream_engine_base.hpp           |  10 +
+ src/stream_listener_base.cpp         |   3 +-
+ src/zmq_draft.h                      |   5 +
+ tests/CMakeLists.txt                 |  10 +
+ tests/test_connection_lifetime.cpp   | 478 +++++++++++++++++++++++++++++++++++
+ 14 files changed, 1027 insertions(+), 18 deletions(-)
+
+diff --git a/doc/connection-lifetime-extension.md b/doc/connection-lifetime-extension.md
+new file mode 100644
+index 0000000..8f92d64
+--- /dev/null
++++ b/doc/connection-lifetime-extension.md
+@@ -0,0 +1,374 @@
++<!--
++Copyright (c) 2026 RDK Management.
++This documentation is distributed under libzmq's component license and
++linking exception. See COPYING, COPYING.LESSER and the source-file headers.
++-->
++
++# Local connection lifetime extension for libzmq 4.3.4
++
++This downstream extension binds an accepted TCP/IPC stream to ZAP, received
++messages and disconnect events before the first application request. It also
++provides an opt-in ROUTER send guard against routing-ID reuse. It does not change
++the ZAP multipart body, ZMTP wire protocol or application payloads. An unmodified
++DEALER can connect to the modified server library.
++
++Build libzmq with `-DENABLE_DRAFTS=ON`. Consumers using the macros, version-2
++monitor or ROUTER option below must compile with `ZMQ_BUILD_DRAFT_API` defined
++and use the matching headers and library. These extensions are not upstream
++libzmq 4.3.4 APIs. Checking only `zmq_version()` is insufficient.
++
++## Rationale: authentication succeeds before the first message
++
++Coverage: **AC1.4, AC1.6, AC1.10**. The source extension supplies the common
++connection identity needed for cleanup under the selected authentication-time
++session lifecycle. It is not needed merely to obtain an accepted FD.
++
++Unmodified libzmq 4.3.4 already reports the accepted transport FD through
++ZMQ_EVENT_ACCEPTED. Its ZAP request exposes the peer credentials, but neither
++that FD nor a shared connection-lifetime identifier. A received application
++message can provide User-Id and FD together, using message metadata and the
++existing ZMQ_SRCFD accessor. That last association exists only if a message
++actually reaches the Gateway receiver.
++[Monitor events](https://libzmq.readthedocs.io/en/latest/zmq_socket_monitor.html),
++[4.3.4 message metadata](https://github.com/zeromq/libzmq/blob/v4.3.4/src/stream_engine_base.cpp),
++[4.3.4 ZAP request construction](https://github.com/zeromq/libzmq/blob/v4.3.4/src/zap_client.cpp).
++
++The distinction between connection readiness and first-message delivery is
++essential. The transport handshake and ZAP exchange happen during connection
++setup. client_connect returns CLIENT_OK after handshake success; this does not
++require the application to submit a Crypto RPC or confirm that Gateway has
++received any application message. The application may immediately disconnect
++one of its Clients while keeping its other connections open. A transport failure
++can also occur before its first queued message reaches Gateway.
++
++Gateway already creates an independent ApplicationContext and completes
++NotifyAppState(CONNECTED) during authentication, before ZAP success. That context
++needs matching cleanup even if no RPC follows. This failure does not require a
++shared-memory allocation to exist: the authenticated context and Crypto session
++are enough to make targeted disconnect handling necessary.
++
++### Failure sequence without a shared transport identity
++
++Clients A and B below are two DEALER sockets in the same application process,
++with identical UID/GID/PID. The diagram shows B's authentication being processed
++first to illustrate independent scheduling. The A/B labels describe the actual
++connections for the reader; they are not extra information available to the ZAP
++handler. Neither connection sends an application message in this sequence.
++
++```mermaid
++sequenceDiagram
++    participant A as Client A
++    participant B as Client B - same process
++    participant T as Gateway libzmq
++    participant M as Gateway monitor PAIR
++    participant Z as Gateway ZAP handler
++    participant R as Gateway registry
++    participant C as Private lifecycle worker / ICrypto
++    A->>T: Open UDS connection A
++    T-->>M: ACCEPTED with FD 42
++    M->>R: Record accepted FD 42
++    B->>T: Open UDS connection B
++    T-->>M: ACCEPTED with FD 43
++    M->>R: Record accepted FD 43
++    Note over T,R: Monitor and ZAP processing have no shared per-connection key
++    T->>Z: ZAP for B, shared peer credentials, no FD or lifetime
++    Z->>R: Create context U1 from trusted credentials
++    R->>C: Scoped NotifyAppState(context for U1, CONNECTED)
++    C-->>R: Completed successfully
++    R-->>Z: Context published
++    Z-->>T: ZAP 200 with User-Id U1
++    T-->>B: Handshake succeeds, client_connect returns CLIENT_OK
++    T->>Z: ZAP for A, identical peer credentials, no FD or lifetime
++    Z->>R: Create context U2 from trusted credentials
++    R->>C: Scoped NotifyAppState(context for U2, CONNECTED)
++    C-->>R: Completed successfully
++    R-->>Z: Context published
++    Z-->>T: ZAP 200 with User-Id U2
++    T-->>A: Handshake succeeds, client_connect returns CLIENT_OK
++    Note over A,R: No received RPC or probe has associated either User-Id with an FD
++    B->>T: Close only connection B before its first message arrives
++    T-->>M: DISCONNECTED with FD 43
++    M->>R: Resolve FD 43 to its authenticated context
++    Note over R,C: U1 and U2 share credentials, so the registry cannot safely choose one
++    Note over A,R: Closing both would invalidate live A<br/>Retaining both would leave B's session unreclaimed
++```
++
++Adding UID/GID/PID to the disconnect event identifies the process but still
++does not distinguish U1 from U2. Pairing the first ACCEPTED event with the first
++ZAP request is also insufficient: independent queues and I/O threads do not
++provide that ordering contract. The FD can identify the disconnected transport
++while the application still lacks its association with the authenticated session.
++
++### Why an immediate request or automatic probe does not close the gap
++
++ZMQ_PROBE_ROUTER=1 can make DEALER automatically send an empty message when a
++connection is established. It defaults to 0. This is a one-time probe, not a
++periodic heartbeat; Gateway would have to recognize it separately from an RPC.
++If received, it can help associate routing identity, User-Id and FD. It is not
++enabled by the current client design.
++[ZMQ_PROBE_ROUTER](https://libzmq.readthedocs.io/en/latest/zmq_setsockopt.html#zmq-probe-router-bootstrap-connections-to-router-sockets).
++
++Neither a probe nor an application HELLO is guaranteed to reach Gateway before
++the connection fails. Successful zmq_send only establishes local queue
++acceptance. A successful transport handshake is not an acknowledgement that
++Gateway's application loop has consumed the probe. The failure sequence above
++therefore also applies when a first message was queued but never received.
++[Send completion contract](https://libzmq.readthedocs.io/en/latest/zmq_send.html).
++
++An explicit HELLO/ACK protocol could define a different session-activation
++boundary and defer Crypto CONNECTED until Gateway receives HELLO. That would
++require a new bootstrap contract and rules for all pre-HELLO state. It would
++change the selected requirement to bind the context and notify Crypto during
++ZAP. The source extension satisfies that existing requirement without depending
++on a new application message. FD and outgoing-route reuse also require lifetime
++checks independently of when the first message arrives.
++
++### Selected sequence with the connection-lifetime extension
++
++The extension assigns the lifetime before authentication and carries it through
++local ZAP metadata, received messages and monitor events. The registry can bind
++the FD to User-Id before acknowledging ZAP. The sequence below shows B closing
++without an RPC while A remains live.
++
++```mermaid
++sequenceDiagram
++    participant B as Client B
++    participant T as Gateway libzmq
++    participant M as Gateway monitor PAIR
++    participant Z as Gateway ZAP handler
++    participant R as Gateway registry
++    participant C as Private lifecycle worker / ICrypto
++    Note over R,C: Client A already has independent context U2, FD 42, lifetime 101
++    B->>T: Open UDS connection B
++    T->>T: Capture credentials, assign FD 43 and lifetime 102
++    T-->>M: ACCEPTED with FD 43 and lifetime 102
++    M->>R: Record transport lifetime 102 in the current activation
++    T->>Z: ZAP credentials plus local FD 43 and lifetime 102 metadata
++    Z->>R: Bind User-Id U1 to FD 43 and lifetime 102
++    R->>C: Scoped NotifyAppState(context for U1, CONNECTED)
++    C-->>R: Completed successfully
++    R-->>Z: Context ready, binding established
++    Z-->>T: ZAP 200 with User-Id U1
++    T-->>B: Handshake succeeds, client_connect returns CLIENT_OK
++    Note over B,R: No application RPC or probe is required to establish this binding
++    B->>T: Close connection B before sending any RPC
++    T-->>M: DISCONNECTED with FD 43, peer credentials and lifetime 102
++    M->>R: Resolve current activation and lifetime 102, verify stored FD
++    R->>R: Mark only U1 closing, finish its accepted work if any
++    R->>C: Scoped NotifyAppState(context for U1, DISCONNECTED)
++    C-->>R: Completed successfully
++    R->>R: Retire U1 and its releasable resources
++    Note over R,C: Client A and context U2 remain active
++    opt A later connection reuses the numeric FD
++        T->>T: Reuse FD 43 with a new lifetime 103
++        T-->>M: ACCEPTED with FD 43 and lifetime 103
++        M->>R: Track the new lifetime independently
++        Note over M,R: Old lifetime 102 events or cleanup work cannot select lifetime 103
++    end
++```
++
++The shown ordering is one valid execution, not a requirement that monitor
++events arrive before ZAP. Both paths use the same lifetime, so the registry can
++merge their evidence without guessing. If disconnect overtakes an in-progress
++authentication or CONNECTED job, retain a CLOSING record for that lifetime.
++After the job settles, send matching DISCONNECTED if CONNECTED succeeded;
++late authentication completion must not reactivate the closed context.
++
++The non-reused lifetime is also necessary after the initial binding: a delayed
++event, retained job or cleanup action keyed only by FD could otherwise select
++a replacement connection. Carry the activation/lifetime tuple through every
++such record. For outgoing responses, check the original lifetime against the
++currently selected ROUTER pipe before sending, as specified under Guarding an outgoing ROUTER reply. The patch
++provides the transport evidence and send guard; Gateway must implement the
++registry transitions and resource cleanup that consume them.
++
++## Identity and lifetime
++
++Each stream engine gets a nonzero, monotonically allocated `uint64_t` identity
++before its handshake. Allocation is serialized across I/O threads and contexts
++in the loaded libzmq instance. A counter wrap terminates instead of reusing an
++identity. Reusing an FD or a ROUTER routing ID does not reuse this identity.
++
++The identity is local to the library instance and process. Pair it with the
++Gateway activation generation; it is not persistent across process restart or
++library unloading. The client's transport identity and FD are unrelated to the
++server's. Neither is a credential, an application ID or the ZAP `User-Id`.
++
++For Linux UDS, UID/GID/PID are captured with `SO_PEERCRED` while the FD belongs
++to the engine. Disconnect reporting uses this snapshot, without parsing an IP
++address or looking up credentials on a possibly reused FD. Unavailable
++credential fields are `UINT64_MAX`; TCP does not claim UDS credentials.
++
++## Local message metadata
++
++Every body frame received by the local ZAP handler has the following metadata,
++also available on received application messages and ROUTER routing frames:
++
++| Macro / property string | Value |
++| --- | --- |
++| `ZMQ_MSG_PROPERTY_CONNECTION_ID` / `Transport-Connection-Id` | Decimal connection lifetime, nonzero uint64 |
++| `ZMQ_MSG_PROPERTY_TRANSPORT_FD` / `Transport-FD` | Decimal transport FD, observed only |
++| `Peer-Address` | Existing peer address, including UDS credentials on Linux |
++
++Read the properties with `zmq_msg_gets()` and copy/parse them before closing the
++message. `zmq_msg_get(..., ZMQ_SRCFD)` continues to work, including on ZAP frames,
++but new code should use the named FD property. The ZAP request-ID frame remains
++an opaque authentication-exchange value; it is not the transport lifetime.
++
++```c
++const char *connection_id = zmq_msg_gets(
++    &zap_frame, ZMQ_MSG_PROPERTY_CONNECTION_ID);
++const char *transport_fd = zmq_msg_gets(
++    &zap_frame, ZMQ_MSG_PROPERTY_TRANSPORT_FD);
++/* Validate and copy both before zmq_msg_close(&zap_frame). */
++```
++
++The ZAP handler assigns its own unique `User-Id` and records its binding to this
++FD/lifetime before returning success. `User-Id` becomes available on application
++messages after authentication. Native transport properties take precedence over
++properties supplied by the ZAP reply or the remote peer.
++
++These are local `zmq_msg_t` properties, not extra ZAP frames or metadata sent
++over the network. A ZAP proxy that rebuilds messages from byte strings loses
++them unless it explicitly preserves them within the trusted local path. The
++direct inproc ZAP REP handler is the intended deployment.
++
++## Version-2 monitor values
++
++The normal v2 framing is preserved:
++`[event:uint64][value_count:uint64][values...][local endpoint][remote endpoint]`.
++Integer frames use the monitor API's native byte order.
++
++| Event for the TCP/IPC stream path | Values, in order |
++| --- | --- |
++| `ZMQ_EVENT_ACCEPTED` | FD, connection ID (`value_count = 2`) |
++| `ZMQ_EVENT_DISCONNECTED` | FD, UID, GID, PID, connection ID (`value_count = 5`) |
++
++Version-1 framing and its single FD value are unchanged. Other event types keep
++their existing values. Event producers without a stream identity retain their
++original single-value format; consumers must reject unsupported bindings rather
++than guess. This extension does not promise the complete binding for WebSocket,
++UDP, inproc or arbitrary transport implementations.
++
++The first four DISCONNECTED values retain the credential extension's ordering,
++but ACCEPTED now has a second value. Update any v2 consumer that assumes every
++event has exactly one value. This patch replaces the previous credential-only
++patch; do not apply both patches to the same source tree.
++
++Use `(activation generation, connection ID)` to resolve a context and verify
++its stored FD. Do not select every connection matching a PID. ZAP, monitor and
++request queues have independent scheduling: retain a closing record when a
++disconnect overtakes authentication; late ZAP success must not reopen it.
++Authentication rejection and closure before the first RPC still carry the
++original identity. A peer closing before ZAP has monitor identity only.
++
++Explicit server shutdown must retire its own contexts. This patch does not add
++DISCONNECTED events for every locally terminated engine, reliable replay of
++monitor events or a remote cleanup acknowledgement.
++
++## Guarding an outgoing ROUTER reply
++
++`ZMQ_ROUTER_EXPECTED_CONNECTION_ID` is a downstream draft socket option with
++local numeric value `10001`; it is not an upstream-assigned option number.
++Its argument is a native `uint64_t`. Zero disables the guard, which is the
++default. A nonzero value persists until explicitly replaced or reset.
++
++Set it on the ROUTER owner thread immediately before each reply's routing frame:
++
++```c
++uint64_t expected = original_request_connection_id;
++int rc = zmq_setsockopt(router, ZMQ_ROUTER_EXPECTED_CONNECTION_ID,
++                       &expected, sizeof(expected));
++if (rc == 0) {
++    rc = zmq_send(router, route, route_size, ZMQ_SNDMORE | ZMQ_DONTWAIT);
++    if (rc >= 0) {
++        rc = zmq_send(router, reply, reply_size, ZMQ_DONTWAIT);
++    }
++}
++/* Check every result. Do not send the body after the routing frame fails. */
++```
++
++The ROUTER records the native transport identity from the stream's handshake
++identity message. At routing-frame admission, it checks the currently selected
++pipe on the same socket-owner thread. A missing, unsupported or different
++identity fails with `EHOSTUNREACH`, even if ROUTER_MANDATORY is disabled. Failure
++does not enter multipart-send state, so the next complete reply can be attempted
++normally. The body then uses that selected pipe, never a new lookup by route.
++
++Wrong option size returns `EINVAL`; changing it after the routing frame but
++before the final body returns `EFSM`. Normal HWM and routing errors still apply.
++Use `ROUTER_MANDATORY=1`, `ROUTER_HANDOVER=0` and nonblocking sends in Gateway.
++A successful send still means local queue acceptance, not peer receipt.
++
++The guard is intended for a binding ROUTER and accepted ZMTP 3.x TCP/IPC peers.
++A ROUTER route without handshake transport metadata fails closed when guarded.
++Existing unguarded ROUTER behavior is unchanged. Gateway must check that setting
++this option succeeds; an unpatched library must not silently disable protection.
++
++## Regression test
++
++The Linux CMake build registers `test_connection_lifetime` when draft APIs,
++IPC and SO_PEERCRED are enabled. The test requires C++11; the extension's library
++code does not introduce a C++11 atomic or a 64-bit libatomic dependency.
++
++```sh
++cmake -S . -B build -DENABLE_DRAFTS=ON -DBUILD_TESTS=ON
++cmake --build build --target test_connection_lifetime
++ctest --test-dir build -R '^test_connection_lifetime$' --output-on-failure
++```
++
++It covers multiple connections from one process with three libzmq I/O threads,
++ZAP/request/event correlation, disconnect without an RPC, rejected and unfinished
++authentication, close before ZAP, actual FD reuse, distinct IDs after context
++recreation, v1 compatibility, native metadata precedence and stale reply rejection
++after an intentionally forced ROUTER handover. Target-device validation remains
++necessary for the deployed library and Gateway integration.
++
++## Applying in the RDK build
++
++The source baseline is the upstream `zeromq-4.3.4.tar.gz` release selected by
++the RDK `rdk-4.0.0` meta-openembedded recipe. Its SHA-256 is
++`c593001a89f5a85dd2ddf564805deb860e02471171b3f204944857336295c3e5`.
++Keep the recipe's existing libsodium-path CMake patch. Replace any previous
++credential-only disconnect patch with `zmq_connection_lifetime.patch`.
++
++For a product-layer `zeromq_4.3.4.bbappend`, place the patch in the adjacent
++`files/` directory and add:
++
++```bitbake
++FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
++SRC_URI:append = " file://zmq_connection_lifetime.patch"
++EXTRA_OECMAKE:append = " -DENABLE_DRAFTS=ON"
++```
++
++Rebuild libzmq and its development package/SDK; rebuilding Gateway alone cannot
++add this functionality. Keep the platform's selected libsodium configuration.
++This snippet does not change package installation or product rootfs policy.
++
++For an extracted source tree, apply with:
++
++```sh
++patch -p1 < /path/to/zmq_connection_lifetime.patch
++```
++
++The patch changes libzmq and supplies a CMake regression test and this document.
++Gateway integration must read/copy the properties, maintain lifetime-to-User-Id
++bindings, decode the extended monitor values and set/check the reply guard.
++The patch does not implement Gateway connection-context cleanup by itself.
++
++## Native validation scope
++
++Validation used Linux x86-64 and GCC 9.4 in the RDK development container, with
++the checksum-verified 4.3.4 source and shared Debug builds. Results:
++
++- Draft build: the new lifetime test and 13 existing tests passed, covering
++  PLAIN, NULL, ZAP, bundled CURVE, metadata, monitors, ROUTER behavior and IPC.
++- The new test passed 25 additional runs: 950 connections, with actual FD reuse,
++  three I/O threads, both monitor formats and recreated contexts.
++- Draft-disabled build: PLAIN, metadata, SRCFD and stable monitor tests passed.
++- No deployment, BitBake product build, ARM execution or Gateway runtime test
++  is claimed. The native build used bundled crypto instead of optional libsodium;
++  verify the product's selected libsodium build on the target.
++- AddressSanitizer validation could not be completed in this container: even
++  an independent empty C program repeatedly failed inside its ASan runtime.
++  No successful sanitizer result is claimed.
+diff --git a/include/zmq.h b/include/zmq.h
+index d05659f..aab5d20 100644
+--- a/include/zmq.h
++++ b/include/zmq.h
+@@ -721,6 +721,11 @@ zmq_msg_init_buffer (zmq_msg_t *msg_, const void *buf_, size_t size_);
+ #define ZMQ_MSG_PROPERTY_USER_ID "User-Id"
+ #define ZMQ_MSG_PROPERTY_PEER_ADDRESS "Peer-Address"
+ 
++/*  Local connection-lifetime extension; not an upstream socket option.       */
++#define ZMQ_MSG_PROPERTY_CONNECTION_ID "Transport-Connection-Id"
++#define ZMQ_MSG_PROPERTY_TRANSPORT_FD "Transport-FD"
++#define ZMQ_ROUTER_EXPECTED_CONNECTION_ID 10001
++
+ /*  Router notify options                                                     */
+ #define ZMQ_NOTIFY_CONNECT 1
+ #define ZMQ_NOTIFY_DISCONNECT 2
+diff --git a/src/i_engine.hpp b/src/i_engine.hpp
+index 7d05df8..6e3ad5d 100644
+--- a/src/i_engine.hpp
++++ b/src/i_engine.hpp
+@@ -32,10 +32,12 @@
+ 
+ #include "endpoint.hpp"
+ #include "macros.hpp"
++#include "stdint.hpp"
+ 
+ namespace zmq
+ {
+ class io_thread_t;
++class metadata_t;
+ 
+ //  Abstract interface to be implemented by various engines.
+ 
+@@ -76,6 +78,10 @@ struct i_engine
+     virtual void zap_msg_available () = 0;
+ 
+     virtual const endpoint_uri_pair_t &get_endpoint () const = 0;
++
++    //  Local transport identity; never transmitted to the remote peer.
++    virtual uint64_t get_connection_id () const { return 0; }
++    virtual metadata_t *get_transport_metadata () const { return NULL; }
+ };
+ }
+ 
+diff --git a/src/router.cpp b/src/router.cpp
+index 77526e4..1524ee7 100644
+--- a/src/router.cpp
++++ b/src/router.cpp
+@@ -35,6 +35,8 @@
+ #include "random.hpp"
+ #include "likely.hpp"
+ #include "err.hpp"
++#include <locale>
++#include <sstream>
+ 
+ zmq::router_t::router_t (class ctx_t *parent_, uint32_t tid_, int sid_) :
+     routing_socket_base_t (parent_, tid_, sid_),
+@@ -142,6 +144,23 @@ int zmq::router_t::xsetsockopt (int option_,
+             break;
+ 
+ #ifdef ZMQ_BUILD_DRAFT_API
++        case ZMQ_ROUTER_EXPECTED_CONNECTION_ID:
++            if (_more_out) {
++                errno = EFSM;
++                return -1;
++            }
++            if (optval_ && optvallen_ == sizeof (uint64_t)) {
++                uint64_t id;
++                memcpy (&id, optval_, sizeof (id));
++                std::ostringstream stream;
++                stream.imbue (std::locale::classic ());
++                if (id)
++                    stream << id;
++                _expected_connection_id = stream.str ();
++                return 0;
++            }
++            break;
++
+         case ZMQ_ROUTER_NOTIFY:
+             if (is_int && value >= 0
+                 && value <= (ZMQ_NOTIFY_CONNECT | ZMQ_NOTIFY_DISCONNECT)) {
+@@ -162,6 +181,7 @@ int zmq::router_t::xsetsockopt (int option_,
+ 
+ void zmq::router_t::xpipe_terminated (pipe_t *pipe_)
+ {
++    _out_connection_ids.erase (pipe_);
+     if (0 == _anonymous_pipes.erase (pipe_)) {
+         erase_out_pipe (pipe_);
+         _fq.pipe_terminated (pipe_);
+@@ -205,6 +225,20 @@ int zmq::router_t::xsend (msg_t *msg_)
+               blob_t (static_cast<unsigned char *> (msg_->data ()),
+                       msg_->size (), zmq::reference_tag_t ()));
+ 
++            //  Check on the owning thread, before selecting the output pipe.
++            //  A delayed reply must not follow a reused routing id.
++            if (!_expected_connection_id.empty ()) {
++                const std::map<pipe_t *, std::string>::const_iterator it =
++                  out_pipe ? _out_connection_ids.find (out_pipe->pipe)
++                           : _out_connection_ids.end ();
++                if (it == _out_connection_ids.end ()
++                    || it->second != _expected_connection_id) {
++                    _more_out = false;
++                    errno = EHOSTUNREACH;
++                    return -1;
++                }
++            }
++
+             if (out_pipe) {
+                 _current_out = out_pipe->pipe;
+ 
+@@ -401,6 +435,8 @@ bool zmq::router_t::xhas_in ()
+     errno_assert (rc == 0);
+     memcpy (_prefetched_id.data (), routing_id.data (), routing_id.size ());
+     _prefetched_id.set_flags (msg_t::more);
++    if (_prefetched_msg.metadata ())
++        _prefetched_id.set_metadata (_prefetched_msg.metadata ());
+ 
+     _prefetched = true;
+     _routing_id_sent = false;
+@@ -453,6 +489,7 @@ bool zmq::router_t::identify_peer (pipe_t *pipe_, bool locally_initiated_)
+ {
+     msg_t msg;
+     blob_t routing_id;
++    std::string connection_id;
+ 
+     if (locally_initiated_ && connect_routing_id_is_set ()) {
+         const std::string connect_routing_id = extract_connect_routing_id ();
+@@ -475,6 +512,13 @@ bool zmq::router_t::identify_peer (pipe_t *pipe_, bool locally_initiated_)
+         if (!ok)
+             return false;
+ 
++        if (msg.metadata ()) {
++            const char *id =
++              msg.metadata ()->get (ZMQ_MSG_PROPERTY_CONNECTION_ID);
++            if (id)
++                connection_id = id;
++        }
++
+         if (msg.size () == 0) {
+             //  Fall back on the auto-generation
+             unsigned char buf[5];
+@@ -520,6 +564,8 @@ bool zmq::router_t::identify_peer (pipe_t *pipe_, bool locally_initiated_)
+     }
+ 
+     pipe_->set_router_socket_routing_id (routing_id);
++    if (!connection_id.empty ())
++        _out_connection_ids[pipe_] = connection_id;
+     add_out_pipe (ZMQ_MOVE (routing_id), pipe_);
+ 
+     return true;
+diff --git a/src/router.hpp b/src/router.hpp
+index f020672..f2c1e52 100644
+--- a/src/router.hpp
++++ b/src/router.hpp
+@@ -31,6 +31,7 @@
+ #define __ZMQ_ROUTER_HPP_INCLUDED__
+ 
+ #include <map>
++#include <string>
+ 
+ #include "socket_base.hpp"
+ #include "session_base.hpp"
+@@ -125,6 +126,11 @@ class router_t : public routing_socket_base_t
+     // will be terminated.
+     bool _handover;
+ 
++    //  Socket-owner state: bind a reply to the original accepted transport,
++    //  independently of a peer-selected, reusable ROUTER routing id.
++    std::map<pipe_t *, std::string> _out_connection_ids;
++    std::string _expected_connection_id;
++
+     ZMQ_NON_COPYABLE_NOR_MOVABLE (router_t)
+ };
+ }
+diff --git a/src/session_base.cpp b/src/session_base.cpp
+index 551ae31..27e8064 100644
+--- a/src/session_base.cpp
++++ b/src/session_base.cpp
+@@ -213,6 +213,11 @@ int zmq::session_base_t::read_zap_msg (msg_t *msg_)
+ 
+ int zmq::session_base_t::write_zap_msg (msg_t *msg_)
+ {
++    //  ZAP is local to this context. Preserve its standard multipart body;
++    //  attach trusted transport metadata before authentication completes.
++    if (_engine && _engine->get_transport_metadata ())
++        msg_->set_metadata (_engine->get_transport_metadata ());
++
+     if (_zap_pipe == NULL || !_zap_pipe->write (msg_)) {
+         errno = ENOTCONN;
+         return -1;
+diff --git a/src/socket_base.cpp b/src/socket_base.cpp
+index bbb378c..41d9b99 100644
+--- a/src/socket_base.cpp
++++ b/src/socket_base.cpp
+@@ -1888,10 +1888,14 @@ void zmq::socket_base_t::event_bind_failed (
+ }
+ 
+ void zmq::socket_base_t::event_accepted (
+-  const endpoint_uri_pair_t &endpoint_uri_pair_, zmq::fd_t fd_)
++  const endpoint_uri_pair_t &endpoint_uri_pair_,
++  zmq::fd_t fd_,
++  uint64_t connection_id_)
+ {
+-    uint64_t values[1] = {static_cast<uint64_t> (fd_)};
+-    event (endpoint_uri_pair_, values, 1, ZMQ_EVENT_ACCEPTED);
++    uint64_t values[2] = {static_cast<uint64_t> (fd_), connection_id_};
++    const int count =
++      options.monitor_event_version == 2 && connection_id_ ? 2 : 1;
++    event (endpoint_uri_pair_, values, count, ZMQ_EVENT_ACCEPTED);
+ }
+ 
+ void zmq::socket_base_t::event_accept_failed (
+@@ -1916,10 +1920,19 @@ void zmq::socket_base_t::event_close_failed (
+ }
+ 
+ void zmq::socket_base_t::event_disconnected (
+-  const endpoint_uri_pair_t &endpoint_uri_pair_, zmq::fd_t fd_)
+-{
+-    uint64_t values[1] = {static_cast<uint64_t> (fd_)};
+-    event (endpoint_uri_pair_, values, 1, ZMQ_EVENT_DISCONNECTED);
++  const endpoint_uri_pair_t &endpoint_uri_pair_,
++  zmq::fd_t fd_,
++  uint64_t connection_id_,
++  const uint64_t *peer_credentials_)
++{
++    uint64_t values[5] = {static_cast<uint64_t> (fd_), UINT64_MAX, UINT64_MAX,
++                          UINT64_MAX, connection_id_};
++    if (peer_credentials_)
++        for (size_t i = 0; i != 3; ++i)
++            values[i + 1] = peer_credentials_[i];
++    const int count =
++      options.monitor_event_version == 2 && connection_id_ ? 5 : 1;
++    event (endpoint_uri_pair_, values, count, ZMQ_EVENT_DISCONNECTED);
+ }
+ 
+ void zmq::socket_base_t::event_handshake_failed_no_detail (
+diff --git a/src/socket_base.hpp b/src/socket_base.hpp
+index 92deb9f..7c7e23b 100644
+--- a/src/socket_base.hpp
++++ b/src/socket_base.hpp
+@@ -135,7 +135,8 @@ class socket_base_t : public own_t,
+     void event_bind_failed (const endpoint_uri_pair_t &endpoint_uri_pair_,
+                             int err_);
+     void event_accepted (const endpoint_uri_pair_t &endpoint_uri_pair_,
+-                         zmq::fd_t fd_);
++                         zmq::fd_t fd_,
++                         uint64_t connection_id_ = 0);
+     void event_accept_failed (const endpoint_uri_pair_t &endpoint_uri_pair_,
+                               int err_);
+     void event_closed (const endpoint_uri_pair_t &endpoint_uri_pair_,
+@@ -143,7 +144,9 @@ class socket_base_t : public own_t,
+     void event_close_failed (const endpoint_uri_pair_t &endpoint_uri_pair_,
+                              int err_);
+     void event_disconnected (const endpoint_uri_pair_t &endpoint_uri_pair_,
+-                             zmq::fd_t fd_);
++                             zmq::fd_t fd_,
++                             uint64_t connection_id_ = 0,
++                             const uint64_t *peer_credentials_ = NULL);
+     void event_handshake_failed_no_detail (
+       const endpoint_uri_pair_t &endpoint_uri_pair_, int err_);
+     void event_handshake_failed_protocol (
+diff --git a/src/stream_engine_base.cpp b/src/stream_engine_base.cpp
+index bb64e0d..6e78ab6 100644
+--- a/src/stream_engine_base.cpp
++++ b/src/stream_engine_base.cpp
+@@ -62,10 +62,29 @@
+ #include "tcp.hpp"
+ #include "likely.hpp"
+ #include "wire.hpp"
++#include "mutex.hpp"
++#include <locale>
++#include <limits>
+ 
+-static std::string get_peer_address (zmq::fd_t s_)
++namespace
++{
++zmq::mutex_t connection_id_sync;
++uint64_t last_connection_id = 0;
++
++uint64_t next_connection_id ()
++{
++    zmq::scoped_lock_t lock (connection_id_sync);
++    //  Never wrap and make a delayed event refer to a different connection.
++    zmq_assert (last_connection_id != std::numeric_limits<uint64_t>::max ());
++    return ++last_connection_id;
++}
++}
++
++static std::string get_peer_address (zmq::fd_t s_, uint64_t credentials_[3])
+ {
+     std::string peer_address;
++    for (size_t i = 0; i != 3; ++i)
++        credentials_[i] = std::numeric_limits<uint64_t>::max ();
+ 
+     const int family = zmq::get_peer_ip_address (s_, peer_address);
+     if (family == 0)
+@@ -75,7 +94,11 @@ static std::string get_peer_address (zmq::fd_t s_)
+         struct ucred cred;
+         socklen_t size = sizeof (cred);
+         if (!getsockopt (s_, SOL_SOCKET, SO_PEERCRED, &cred, &size)) {
++            credentials_[0] = cred.uid;
++            credentials_[1] = cred.gid;
++            credentials_[2] = cred.pid;
+             std::ostringstream buf;
++            buf.imbue (std::locale::classic ());
+             buf << ":" << cred.uid << ":" << cred.gid << ":" << cred.pid;
+             peer_address += buf.str ();
+         }
+@@ -86,7 +109,11 @@ static std::string get_peer_address (zmq::fd_t s_)
+         socklen_t size = sizeof (cred);
+         if (!getsockopt (s_, 0, LOCAL_PEERCRED, &cred, &size)
+             && cred.cr_version == XUCRED_VERSION) {
++            credentials_[0] = cred.cr_uid;
++            if (cred.cr_ngroups > 0)
++                credentials_[1] = cred.cr_groups[0];
+             std::ostringstream buf;
++            buf.imbue (std::locale::classic ());
+             buf << ":" << cred.cr_uid << ":";
+             if (cred.cr_ngroups > 0)
+                 buf << cred.cr_groups[0];
+@@ -122,8 +149,10 @@ zmq::stream_engine_base_t::stream_engine_base_t (
+     _has_ttl_timer (false),
+     _has_timeout_timer (false),
+     _has_heartbeat_timer (false),
+-    _peer_address (get_peer_address (fd_)),
++    _peer_address (get_peer_address (fd_, _peer_credentials)),
+     _s (fd_),
++    _connection_id (next_connection_id ()),
++    _transport_metadata (NULL),
+     _handle (static_cast<handle_t> (NULL)),
+     _plugged (false),
+     _handshaking (true),
+@@ -132,6 +161,11 @@ zmq::stream_engine_base_t::stream_engine_base_t (
+     _socket (NULL),
+     _has_handshake_stage (has_handshake_stage_)
+ {
++    properties_t properties;
++    init_properties (properties);
++    _transport_metadata = new (std::nothrow) metadata_t (properties);
++    alloc_assert (_transport_metadata);
++
+     const int rc = _tx_msg.init ();
+     errno_assert (rc == 0);
+ 
+@@ -171,6 +205,9 @@ zmq::stream_engine_base_t::~stream_engine_base_t ()
+         }
+     }
+ 
++    if (_transport_metadata->drop_ref ())
++        LIBZMQ_DELETE (_transport_metadata);
++
+     LIBZMQ_DELETE (_encoder);
+     LIBZMQ_DELETE (_decoder);
+     LIBZMQ_DELETE (_mechanism);
+@@ -539,11 +576,14 @@ void zmq::stream_engine_base_t::mechanism_ready ()
+     if (_options.recv_routing_id) {
+         msg_t routing_id;
+         _mechanism->peer_routing_id (&routing_id);
++        routing_id.set_metadata (_transport_metadata);
+         const int rc = _session->push_msg (&routing_id);
+         if (rc == -1 && errno == EAGAIN) {
+             // If the write is failing at this stage with
+             // an EAGAIN the pipe must be being shut down,
+             // so we can just bail out of the routing id set.
++            const int close_rc = routing_id.close ();
++            errno_assert (close_rc == 0);
+             return;
+         }
+         errno_assert (rc == 0);
+@@ -710,7 +750,8 @@ void zmq::stream_engine_base_t::error (error_reason_t reason_)
+         }
+     }
+ 
+-    _socket->event_disconnected (_endpoint_uri_pair, _s);
++    _socket->event_disconnected (_endpoint_uri_pair, _s, _connection_id,
++                                 _peer_credentials);
+     _session->flush ();
+     _session->engine_error (
+       !_handshaking
+@@ -733,17 +774,23 @@ void zmq::stream_engine_base_t::set_handshake_timer ()
+ 
+ bool zmq::stream_engine_base_t::init_properties (properties_t &properties_)
+ {
+-    if (_peer_address.empty ())
+-        return false;
+-    properties_.ZMQ_MAP_INSERT_OR_EMPLACE (
+-      std::string (ZMQ_MSG_PROPERTY_PEER_ADDRESS), _peer_address);
++    if (!_peer_address.empty ())
++        properties_.ZMQ_MAP_INSERT_OR_EMPLACE (
++          std::string (ZMQ_MSG_PROPERTY_PEER_ADDRESS), _peer_address);
+ 
+     //  Private property to support deprecated SRCFD
+     std::ostringstream stream;
+-    stream << static_cast<int> (_s);
++    stream.imbue (std::locale::classic ());
++    stream << static_cast<uint64_t> (_s);
+     std::string fd_string = stream.str ();
++    properties_.ZMQ_MAP_INSERT_OR_EMPLACE (
++      std::string (ZMQ_MSG_PROPERTY_TRANSPORT_FD), fd_string);
+     properties_.ZMQ_MAP_INSERT_OR_EMPLACE (std::string ("__fd"),
+                                            ZMQ_MOVE (fd_string));
++    stream.str (std::string ());
++    stream << _connection_id;
++    properties_.ZMQ_MAP_INSERT_OR_EMPLACE (
++      std::string (ZMQ_MSG_PROPERTY_CONNECTION_ID), stream.str ());
+     return true;
+ }
+ 
+diff --git a/src/stream_engine_base.hpp b/src/stream_engine_base.hpp
+index 58bf957..051e360 100644
+--- a/src/stream_engine_base.hpp
++++ b/src/stream_engine_base.hpp
+@@ -70,6 +70,11 @@ class stream_engine_base_t : public io_object_t, public i_engine
+     void restart_output () ZMQ_FINAL;
+     void zap_msg_available () ZMQ_FINAL;
+     const endpoint_uri_pair_t &get_endpoint () const ZMQ_FINAL;
++    uint64_t get_connection_id () const ZMQ_FINAL { return _connection_id; }
++    metadata_t *get_transport_metadata () const ZMQ_FINAL
++    {
++        return _transport_metadata;
++    }
+ 
+     //  i_poll_events interface implementation.
+     void in_event () ZMQ_FINAL;
+@@ -176,6 +181,8 @@ class stream_engine_base_t : public io_object_t, public i_engine
+     bool _has_heartbeat_timer;
+ 
+ 
++    //  Snapshot credentials while the descriptor still belongs to this engine.
++    uint64_t _peer_credentials[3];
+     const std::string _peer_address;
+ 
+   private:
+@@ -191,6 +198,9 @@ class stream_engine_base_t : public io_object_t, public i_engine
+     //  Underlying socket.
+     fd_t _s;
+ 
++    const uint64_t _connection_id;
++    metadata_t *_transport_metadata;
++
+     handle_t _handle;
+ 
+     bool _plugged;
+diff --git a/src/stream_listener_base.cpp b/src/stream_listener_base.cpp
+index ecd21be..b585d0b 100644
+--- a/src/stream_listener_base.cpp
++++ b/src/stream_listener_base.cpp
+@@ -109,6 +109,7 @@ void zmq::stream_listener_base_t::create_engine (fd_t fd_)
+     else
+         engine = new (std::nothrow) zmtp_engine_t (fd_, options, endpoint_pair);
+     alloc_assert (engine);
++    const uint64_t connection_id = engine->get_connection_id ();
+ 
+     //  Choose I/O thread to run connecter in. Given that we are already
+     //  running in an I/O thread, there must be at least one available.
+@@ -123,5 +124,5 @@ void zmq::stream_listener_base_t::create_engine (fd_t fd_)
+     launch_child (session);
+     send_attach (session, engine, false);
+ 
+-    _socket->event_accepted (endpoint_pair, fd_);
++    _socket->event_accepted (endpoint_pair, fd_, connection_id);
+ }
+diff --git a/src/zmq_draft.h b/src/zmq_draft.h
+index b384d03..55eb435 100644
+--- a/src/zmq_draft.h
++++ b/src/zmq_draft.h
+@@ -105,6 +105,11 @@ int zmq_msg_init_buffer (zmq_msg_t *msg_, const void *buf_, size_t size_);
+ #define ZMQ_MSG_PROPERTY_USER_ID "User-Id"
+ #define ZMQ_MSG_PROPERTY_PEER_ADDRESS "Peer-Address"
+ 
++/*  Local connection-lifetime extension; not an upstream socket option.       */
++#define ZMQ_MSG_PROPERTY_CONNECTION_ID "Transport-Connection-Id"
++#define ZMQ_MSG_PROPERTY_TRANSPORT_FD "Transport-FD"
++#define ZMQ_ROUTER_EXPECTED_CONNECTION_ID 10001
++
+ /*  Router notify options                                                     */
+ #define ZMQ_NOTIFY_CONNECT 1
+ #define ZMQ_NOTIFY_DISCONNECT 2
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 0805614..a9408bb 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -143,6 +143,9 @@ if(WITH_VMCI)
+ endif()
+ 
+ if(ENABLE_DRAFTS)
++  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ZMQ_HAVE_IPC AND ZMQ_HAVE_SO_PEERCRED)
++    list(APPEND tests test_connection_lifetime)
++  endif()
+   list(
+     APPEND
+     tests
+@@ -239,6 +242,9 @@ foreach(test ${tests})
+     add_executable(${test} ${test}.cpp)
+   endif()
+   target_link_libraries(${test} ${TESTUTIL_LIB})
++  if(test STREQUAL "test_connection_lifetime")
++    set_target_properties(${test} PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRED ON)
++  endif()
+   if(WIN32)
+     # This is the output for Debug dynamic builds on Visual Studio 6.0 You should provide the correct directory, don't
+     # know how to do it automatically
+@@ -278,6 +284,10 @@ foreach(test ${tests})
+   set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
+ endforeach()
+ 
++if(TARGET test_connection_lifetime)
++  set_tests_properties(test_connection_lifetime PROPERTIES TIMEOUT 60)
++endif()
++
+ # override timeout for these tests
+ if(ZMQ_HAVE_CURVE)
+   set_tests_properties(test_security_curve PROPERTIES TIMEOUT 60)
+diff --git a/tests/test_connection_lifetime.cpp b/tests/test_connection_lifetime.cpp
+new file mode 100644
+index 0000000..1c88ab2
+--- /dev/null
++++ b/tests/test_connection_lifetime.cpp
+@@ -0,0 +1,478 @@
++/*
++    Copyright (c) 2026 RDK Management
++
++    This file is part of libzmq, the ZeroMQ core engine in C++.
++
++    libzmq is free software; you can redistribute it and/or modify it under
++    the terms of the GNU Lesser General Public License (LGPL) as published
++    by the Free Software Foundation; either version 3 of the License, or
++    (at your option) any later version.
++
++    As a special exception, the Contributors give you permission to link
++    this library with independent modules to produce an executable,
++    regardless of the license terms of these independent modules, and to
++    copy and distribute the resulting executable under terms of your choice,
++    provided that you also meet, for each linked independent module, the
++    terms and conditions of the license of that module. An independent
++    module is a module which is not derived from or based on this library.
++    If you modify this library, you must extend this exception to your
++    version of the library.
++
++    libzmq is distributed in the hope that it will be useful, but WITHOUT
++    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++    FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public
++    License for more details.
++
++    You should have received a copy of the GNU Lesser General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "platform.hpp"
++#include <zmq.h>
++#include <unistd.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++
++#include <chrono>
++#include <cstring>
++#include <functional>
++#include <iostream>
++#include <map>
++#include <set>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace
++{
++void require (bool ok, const char *what)
++{
++    if (!ok)
++        throw std::runtime_error (std::string (what) + ": "
++                                  + zmq_strerror (zmq_errno ()));
++}
++
++struct frame_t
++{
++    std::string data, id, fd, user, peer;
++};
++
++std::string property (zmq_msg_t *msg, const char *name)
++{
++    const char *value = zmq_msg_gets (msg, name);
++    return value ? value : "";
++}
++
++std::vector<frame_t> receive (void *socket)
++{
++    std::vector<frame_t> frames;
++    do {
++        zmq_msg_t msg;
++        require (zmq_msg_init (&msg) == 0, "message init");
++        const int rc = zmq_msg_recv (&msg, socket, 0);
++        if (rc < 0) {
++            zmq_msg_close (&msg);
++            require (false, "message receive");
++        }
++        frame_t f;
++        f.data.assign (static_cast<const char *> (zmq_msg_data (&msg)),
++                       zmq_msg_size (&msg));
++        f.id = property (&msg, ZMQ_MSG_PROPERTY_CONNECTION_ID);
++        f.fd = property (&msg, ZMQ_MSG_PROPERTY_TRANSPORT_FD);
++        f.user = property (&msg, "User-Id");
++        f.peer = property (&msg, "Peer-Address");
++        const bool more = zmq_msg_more (&msg) != 0;
++        zmq_msg_close (&msg);
++        frames.push_back (f);
++        if (!more)
++            return frames;
++    } while (true);
++}
++
++void send (void *socket, const std::vector<std::string> &frames)
++{
++    for (size_t i = 0; i != frames.size (); ++i)
++        require (zmq_send (socket, frames[i].data (), frames[i].size (),
++                           i + 1 < frames.size () ? ZMQ_SNDMORE : 0)
++                   >= 0,
++                 "multipart send");
++}
++
++void set_int (void *socket, int option, int value)
++{
++    require (zmq_setsockopt (socket, option, &value, sizeof (value)) == 0,
++             "integer option");
++}
++
++void set_string (void *socket, int option, const std::string &value)
++{
++    require (zmq_setsockopt (socket, option, value.data (), value.size ()) == 0,
++             "string option");
++}
++
++uint64_t read64 (const std::string &bytes)
++{
++    require (bytes.size () == sizeof (uint64_t), "64-bit monitor frame");
++    uint64_t value;
++    memcpy (&value, bytes.data (), sizeof (value));
++    return value;
++}
++
++std::string spoofed_metadata ()
++{
++    std::string result;
++    const char *names[] = {ZMQ_MSG_PROPERTY_CONNECTION_ID,
++                           ZMQ_MSG_PROPERTY_TRANSPORT_FD, "__fd",
++                           "Peer-Address"};
++    for (size_t i = 0; i != sizeof (names) / sizeof (*names); ++i) {
++        result += static_cast<char> (strlen (names[i]));
++        result += names[i];
++        result.append ("\0\0\0\1", 4);
++        result += '0';
++    }
++    return result;
++}
++
++struct binding_t
++{
++    uint64_t id, fd;
++    std::string user, route;
++    int requests;
++};
++
++class fixture_t
++{
++  public:
++    explicit fixture_t (int version, std::set<uint64_t> &all_ids) :
++        ctx (zmq_ctx_new ()),
++        version (version),
++        all_ids (all_ids),
++        accepted (0),
++        authenticated (0),
++        disconnected (0),
++        requests (0),
++        handshakes (0),
++        reused_fds (0)
++    {
++        require (ctx != NULL, "context");
++        require (zmq_ctx_set (ctx, ZMQ_IO_THREADS, 3) == 0, "I/O threads");
++        zap = socket (ZMQ_REP);
++        require (zmq_bind (zap, "inproc://zeromq.zap.01") == 0, "ZAP bind");
++        router = socket (ZMQ_ROUTER);
++        set_int (router, ZMQ_PLAIN_SERVER, 1);
++        set_int (router, ZMQ_ROUTER_MANDATORY, 1);
++        set_int (router, ZMQ_ROUTER_HANDOVER, 0);
++        set_string (router, ZMQ_ZAP_DOMAIN, "lifetime-test");
++        const char *monitor_endpoint = "inproc://lifetime-monitor";
++        require (zmq_socket_monitor_versioned (router, monitor_endpoint,
++                                               ZMQ_EVENT_ALL, version, ZMQ_PAIR)
++                   == 0,
++                 "monitor setup");
++        monitor = socket (ZMQ_PAIR);
++        require (zmq_connect (monitor, monitor_endpoint) == 0,
++                 "monitor connect");
++        endpoint = "ipc:///tmp/zmq-lifetime-" + std::to_string (getpid ()) + "-"
++                   + std::to_string (version) + ".ipc";
++        require (zmq_bind (router, endpoint.c_str ()) == 0, "ROUTER bind");
++    }
++
++    ~fixture_t ()
++    {
++        for (size_t i = 0; i != sockets.size (); ++i)
++            if (sockets[i])
++                zmq_close (sockets[i]);
++        zmq_ctx_term (ctx);
++        unlink (endpoint.substr (6).c_str ());
++    }
++
++    void *socket (int type)
++    {
++        void *s = zmq_socket (ctx, type);
++        require (s != NULL, "socket");
++        sockets.push_back (s);
++        set_int (s, ZMQ_LINGER, 0);
++        set_int (s, ZMQ_SNDTIMEO, 2000);
++        set_int (s, ZMQ_RCVTIMEO, 2000);
++        return s;
++    }
++
++    void close (void *s)
++    {
++        require (zmq_close (s) == 0, "socket close");
++        for (size_t i = 0; i != sockets.size (); ++i)
++            if (sockets[i] == s)
++                sockets[i] = NULL;
++    }
++
++    void *connect (const char *name, const char *route = NULL)
++    {
++        void *s = socket (ZMQ_DEALER);
++        set_string (s, ZMQ_ROUTING_ID, route ? route : name);
++        set_string (s, ZMQ_PLAIN_USERNAME, name);
++        set_string (s, ZMQ_PLAIN_PASSWORD, "dummy");
++        set_int (s, ZMQ_RECONNECT_IVL, -1);
++        set_int (s, ZMQ_IMMEDIATE, 1);
++        require (zmq_connect (s, endpoint.c_str ()) == 0, "DEALER connect");
++        return s;
++    }
++
++    void pump (const std::function<bool ()> &done)
++    {
++        const auto deadline =
++          std::chrono::steady_clock::now () + std::chrono::seconds (4);
++        while (!done ()) {
++            require (std::chrono::steady_clock::now () < deadline,
++                     "event deadline");
++            zmq_pollitem_t items[] = {{zap, 0, ZMQ_POLLIN, 0},
++                                      {monitor, 0, ZMQ_POLLIN, 0},
++                                      {router, 0, ZMQ_POLLIN, 0}};
++            require (zmq_poll (items, 3, 10) >= 0, "poll");
++            if (items[0].revents & ZMQ_POLLIN)
++                on_zap ();
++            if (items[1].revents & ZMQ_POLLIN)
++                on_monitor ();
++            if (items[2].revents & ZMQ_POLLIN)
++                on_request ();
++        }
++    }
++
++    void on_zap ()
++    {
++        const auto frames = receive (zap);
++        require (frames.size () == 8 && frames[0].data == "1.0"
++                   && frames[1].data == "1" && frames[5].data == "PLAIN",
++                 "unchanged PLAIN ZAP framing");
++        const frame_t &f = frames[3];
++        require (!f.id.empty () && !f.fd.empty (), "ZAP transport metadata");
++        binding_t b = {std::stoull (f.id), std::stoull (f.fd), "user-" + f.id,
++                       "", 0};
++        require (b.id != 0 && all_ids.insert (b.id).second,
++                 "unique lifetime across connections and contexts");
++        for (const auto &part : frames)
++            require (part.id == f.id && part.fd == f.fd && part.peer == f.data
++                       && part.user.empty (),
++                     "trusted binding on every ZAP body frame");
++        const std::string credentials =
++          "localhost:" + std::to_string (getuid ()) + ":"
++          + std::to_string (getgid ()) + ":" + std::to_string (getpid ());
++        require (f.data == credentials, "kernel peer credentials");
++        bindings.emplace (b.id, b);
++        names[frames[6].data] = b.id;
++        ++authenticated;
++        if (frames[6].data == "hold") {
++            held_reply = {frames[0].data, frames[1].data, "200",
++                          "OK",           b.user,         ""};
++        } else if (frames[6].data == "denied") {
++            send (zap,
++                  {frames[0].data, frames[1].data, "400", "DENIED", "", ""});
++        } else {
++            //  A ZAP handler cannot overwrite the library's transport identity.
++            send (zap, {frames[0].data, frames[1].data, "200", "OK", b.user,
++                        spoofed_metadata ()});
++        }
++    }
++
++    void on_monitor ()
++    {
++        const auto frames = receive (monitor);
++        uint64_t event;
++        std::vector<uint64_t> values;
++        if (version == 1) {
++            require (frames.size () == 2 && frames[0].data.size () == 6,
++                     "unchanged v1 event framing");
++            uint16_t type;
++            int32_t value;
++            memcpy (&type, frames[0].data.data (), sizeof (type));
++            memcpy (&value, frames[0].data.data () + 2, sizeof (value));
++            event = type;
++            values.push_back (value);
++        } else {
++            event = read64 (frames.at (0).data);
++            const uint64_t count = read64 (frames.at (1).data);
++            require (frames.size () == count + 4, "v2 multipart framing");
++            for (uint64_t i = 0; i != count; ++i)
++                values.push_back (read64 (frames[i + 2].data));
++        }
++        if (event == ZMQ_EVENT_HANDSHAKE_SUCCEEDED)
++            ++handshakes;
++        if (event == ZMQ_EVENT_ACCEPTED) {
++            ++accepted;
++            if (!seen_fds.insert (values[0]).second)
++                ++reused_fds;
++            if (version == 2) {
++                require (values.size () == 2 && values[1] != 0,
++                         "accepted FD and lifetime");
++                require (accepts.emplace (values[1], values[0]).second,
++                         "distinct accepted transport lifetime");
++            }
++        }
++        if (event == ZMQ_EVENT_DISCONNECTED) {
++            ++disconnected;
++            if (version == 2) {
++                require (values.size () == 5 && values[1] == getuid ()
++                           && values[2] == getgid () && values[3] == getpid ()
++                           && values[4] != 0,
++                         "disconnect FD/UID/GID/PID/lifetime");
++                require (closes.emplace (values[4], values[0]).second,
++                         "one disconnect per lifetime");
++            }
++        }
++    }
++
++    void on_request ()
++    {
++        const auto frames = receive (router);
++        require (frames.size () == 2, "ROUTER framing");
++        const frame_t &f = frames[1];
++        require (!f.id.empty (), "request lifetime metadata");
++        binding_t &b = bindings.at (std::stoull (f.id));
++        require (std::stoull (f.fd) == b.fd && f.user == b.user,
++                 "request matches authenticated lifetime");
++        require (frames[0].id == f.id && frames[0].fd == f.fd,
++                 "prefetched routing frame retains metadata");
++        require (f.peer != "0", "native properties resist ZAP override");
++        b.route = frames[0].data;
++        ++b.requests;
++        ++requests;
++    }
++
++    void reply (const std::string &route, uint64_t id, bool expected_success)
++    {
++        require (zmq_setsockopt (router, ZMQ_ROUTER_EXPECTED_CONNECTION_ID, &id,
++                                 sizeof (id))
++                   == 0,
++                 "set expected route lifetime");
++        const int rc = zmq_send (router, route.data (), route.size (),
++                                 ZMQ_SNDMORE | ZMQ_DONTWAIT);
++        if (expected_success) {
++            require (rc >= 0, "guard accepts original connection");
++            require (zmq_send (router, "reply", 5, ZMQ_DONTWAIT) == 5,
++                     "send guarded body");
++        } else {
++            require (rc == -1 && zmq_errno () == EHOSTUNREACH,
++                     "guard rejects stale route before multipart body");
++        }
++    }
++
++    void run ()
++    {
++        void *a = connect ("A"), *b = connect ("B"), *c = connect ("C");
++        pump ([&] { return handshakes == 3 && accepted == 3; });
++        const uint64_t original = names.at ("A");
++        require (original != names.at ("B") && original != names.at ("C"),
++                 "same process has distinct authenticated connections");
++        send (a, {"request A"});
++        send (c, {"request C"});
++        pump ([&] { return requests == 2; });
++        reply ("A", original, true);
++        require (receive (a).at (0).data == "reply", "guarded reply received");
++
++        close (b);
++        pump ([&] { return disconnected == 1; });
++        require (
++          bindings.at (names.at ("B")).requests == 0,
++          "silent authenticated connection has no request-derived state");
++        if (version == 2)
++            require (closes.count (names.at ("B")) == 1
++                       && closes.count (original) == 0
++                       && closes.count (names.at ("C")) == 0,
++                     "only the silent connection disconnects");
++
++        //  Deliberately force a route takeover to exercise the atomic guard.
++        set_int (router, ZMQ_ROUTER_HANDOVER, 1);
++        void *replacement = connect ("replacement", "A");
++        pump ([&] { return handshakes == 4 && accepted == 4; });
++        send (replacement, {"new A"});
++        pump ([&] { return requests == 3; });
++        reply ("A", original, false);
++        reply ("A", names.at ("replacement"), true);
++        require (receive (replacement).at (0).data == "reply",
++                 "new connection receives only its own reply");
++        char byte;
++        require (zmq_recv (replacement, &byte, 1, ZMQ_DONTWAIT) == -1
++                   && zmq_errno () == EAGAIN,
++                 "no stale response leaked to replacement");
++        close (a);
++        close (c);
++        close (replacement);
++        pump ([&] { return disconnected == 4; });
++        set_int (router, ZMQ_ROUTER_HANDOVER, 0);
++
++        for (int i = 0; i != 12; ++i) {
++            const std::string name = "fresh-" + std::to_string (i);
++            void *s = connect (name.c_str ());
++            pump ([&] { return handshakes == 5 + i && accepted == 5 + i; });
++            close (s);
++            pump ([&] { return disconnected == 5 + i; });
++        }
++        require (reused_fds > 0, "exercise actual FD reuse");
++
++        void *denied = connect ("denied");
++        pump ([&] { return authenticated == 17 && disconnected == 17; });
++        close (denied);
++
++        void *held = connect ("hold");
++        pump ([&] { return authenticated == 18; });
++        close (held);
++        pump ([&] { return disconnected == 18; });
++        send (zap, held_reply);
++
++        //  A raw UDS peer closes before it ever reaches ZAP.
++        const int raw = ::socket (AF_UNIX, SOCK_STREAM, 0);
++        require (raw >= 0, "raw UDS socket");
++        struct sockaddr_un address = {};
++        address.sun_family = AF_UNIX;
++        const std::string path = endpoint.substr (6);
++        require (path.size () < sizeof (address.sun_path), "UDS path length");
++        memcpy (address.sun_path, path.c_str (), path.size () + 1);
++        const int rc = ::connect (raw, reinterpret_cast<sockaddr *> (&address),
++                                  sizeof (address));
++        ::close (raw);
++        require (rc == 0, "raw UDS connect");
++        pump ([&] { return accepted == 19 && disconnected == 19; });
++        require (authenticated == 18,
++                 "raw close does not invent authentication");
++
++        if (version == 2) {
++            require (accepts == closes,
++                     "accepted and closed lifetime bindings");
++            for (const auto &entry : bindings)
++                require (
++                  closes.at (entry.first) == entry.second.fd,
++                  "all ZAP contexts close with their original FD/lifetime");
++        }
++        std::cout << "PASS monitor=" << version << " connections=" << accepted
++                  << " authentications=" << authenticated
++                  << " observed_fd_reuses=" << reused_fds << std::endl;
++    }
++
++  private:
++    void *ctx, *zap, *router, *monitor;
++    int version;
++    std::set<uint64_t> &all_ids;
++    std::vector<void *> sockets;
++    std::string endpoint;
++    int accepted, authenticated, disconnected, requests, handshakes, reused_fds;
++    std::set<uint64_t> seen_fds;
++    std::map<uint64_t, uint64_t> accepts, closes;
++    std::map<uint64_t, binding_t> bindings;
++    std::map<std::string, uint64_t> names;
++    std::vector<std::string> held_reply;
++};
++}
++
++int main ()
++{
++    try {
++        std::set<uint64_t> all_ids;
++        for (int version = 1; version <= 2; ++version) {
++            fixture_t fixture (version, all_ids);
++            fixture.run ();
++        }
++        return 0;
++    }
++    catch (const std::exception &error) {
++        std::cerr << "FAIL " << error.what () << std::endl;
++        return 1;
++    }
++}

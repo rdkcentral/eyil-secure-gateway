@@ -127,7 +127,7 @@ for socket settings and sections 5.14 and 6.14 for lifecycle assumptions.
 
 The supplied ACs do not define automatic reconnect, retry or session-restoration
 behavior. This is a **missing lifecycle requirement**, tracked as
-TODO(RECONNECT-LIFECYCLE) in section 7.3. The current delivery follows the agreed
+TODO(RECONNECT-LIFECYCLE) in section 7.2. The current delivery follows the agreed
 explicit-reconnect policy while the broader platform lifecycle requirements
 remain to be specified.
 
@@ -457,7 +457,8 @@ the operation automatically or claim that its shared buffer is safe to reuse.
 
 Use the existing **RPC_STATUS_INTERNAL** for duplicate request IDs, invalid
 service payloads, shared-buffer quota failures and rejected operations involving
-a busy or release-pending buffer. No additional wire error codes are needed.
+a busy, releasing or already released buffer. No additional wire error codes
+are needed.
 The Gateway must log the specific cause at **ERROR** severity where the
 rejection is detected, independently of whether an error response can be sent.
 
@@ -466,12 +467,12 @@ rejection is detected, independently of whether an error response can be sent.
 | Duplicate request ID | RPC_STATUS_INTERNAL | Duplicate ID and the original request's state |
 | Invalid service payload | RPC_STATUS_INTERNAL | Decode failure, operation/oneof mismatch, invalid field, enum, range or buffer reference, as applicable |
 | Shared-buffer quota exceeded | RPC_STATUS_INTERNAL | Requested size/count, current usage, applicable limit and whether the quota is per connection or global |
-| Operation rejected because a buffer is release-pending | RPC_STATUS_INTERNAL | Buffer ID and release state |
-| Operation rejected because a buffer is busy | RPC_STATUS_INTERNAL | Buffer ID and reserved/active-use state |
+| Operation rejected because a buffer is releasing or already released | RPC_STATUS_INTERNAL | Buffer ID and release state or failed lookup |
+| Operation or release rejected because a buffer is busy | RPC_STATUS_INTERNAL | Buffer ID and active-use state |
 
 Include the connection token/generation, request_id, service and operation when
 known. Record a specific reason such as `duplicate_request_id`,
-`invalid_service_payload`, `buffer_quota_exceeded`, `buffer_release_pending` or
+`invalid_service_payload`, `buffer_quota_exceeded`, `buffer_unavailable` or
 `buffer_busy`; these are local diagnostics, not new protocol fields. Do not log
 request payloads, key material or shared-memory contents. Rejected work must not
 invoke Crypto, overwrite another request's state or invalidate active buffer
@@ -493,9 +494,9 @@ to a replacement connection.
 Error replies follow the same single nonblocking send-attempt rule as successful
 responses. Log any delivery failure separately and drop the reply without a
 retry. A generic failure does not acknowledge buffer release or prove that an
-earlier operation finished. Buffer admission, deferred release and completion
-timing remain resource-lifecycle questions; their rejection status and logging
-are settled here.
+earlier operation finished. Sections 6.10–6.13 define execution-time buffer
+checks and immediate rejection of conflicts. Gateway does not preserve queued
+buffer operations through a release, defer a rejected request or replay it.
 
 ### 4.3 Protocol capabilities and limitations
 
@@ -1626,7 +1627,7 @@ The 15-second synchronous deadline is selected. The queue and pending map grow
 dynamically; detected allocation failures use CLIENT_OUT_OF_MEMORY, with no
 local queue-full result. Section 5.14 defines terminal loss and explicit reconnect.
 Section 5.13 defines explicit-close results and callback quiescence. Per-message
-size bounds remain under RESOURCE-LIMITS in section 7.3.
+size bounds remain under RESOURCE-LIMITS in section 7.2.
 
 ### 5.7 client_send_request_async()
 
@@ -2538,7 +2539,7 @@ Application / Firebolt Crypto
 
 The call hierarchy contains no application heartbeat producer, heartbeat
 service dispatch or inactivity-watchdog task. Pending lifecycle/API choices are
-kept in sections 5.5 and 7.3.
+kept in sections 5.5 and 7.2.
 
 ## 6. EyilGateway design and flows
 
@@ -2741,7 +2742,7 @@ Each connection context contains:
 | Routing | Binary ROUTER routing ID plus a proven binding to this connection generation |
 | Admission | AUTHENTICATING, ACTIVE, DRAINING, CLOSING or RETIRED; admission policy and accepted/queued/in-flight bookkeeping |
 | Crypto context | Per-connection initialization/drain state and last observed call outcome; no ICrypto pointer or background plugin-health state |
-| Resources | Owned buffer IDs, queued/active leases, completion accounting |
+| Resources | Owned buffer IDs, execution-time active-use leases, completion accounting; queued jobs do not reserve buffers |
 | Lifecycle | Correlated closing reason and exactly-once cleanup/notification state |
 
 Preserve runtime app-instance identity separately when a future platform API
@@ -2756,13 +2757,18 @@ do not look up "whatever connection now has this routing ID."
 
 Required synchronization rules:
 
-- The I/O owner serializes admission, route publication and terminal connection
-  transitions. ZAP/monitor workers submit bounded control events.
+- The Gateway ROUTER I/O owner serializes admission, route publication and
+  terminal connection transitions. ZAP/monitor workers submit bounded control
+  events.
 - ZAP must publish its context before returning acceptance; an acknowledgement
   or a protected registry insertion is needed so the first request cannot race
   ahead of its record. No backend call runs under the registry lock.
-- Buffer records use retained leases and synchronized ownership/quota accounting.
-  A release removes admission to that allocation before physical destruction.
+- SharedBufferManager protects lookup, ownership, active-use state and quota
+  accounting with short locks. A worker checks and acquires an idle buffer
+  atomically when it executes; queuing a request reserves no buffer dependency.
+  Release atomically claims an idle allocation and prevents subsequent use.
+  A missing, busy or releasing buffer fails immediately with the error/logging
+  contract in section 4.2. No lock is held across ICrypto or transport calls.
 - CONNECTED runs once during authentication before a context becomes ACTIVE
   and ZAP returns success. RPC workers never perform lazy session creation.
   Keep notification bookkeeping, not internal Crypto key state or health data.
@@ -2778,9 +2784,10 @@ Required synchronization rules:
   jobs and lifecycle tasks. Purge entitlement/admission visibility immediately;
   retain only what those jobs and cleanup need.
 
-These rules define invariants. The exact locking/owner-thread implementation
-and dependency ordering remain **Gap 2**, not an assertion that arbitrary
-concurrent access to these records is safe.
+These rules require synchronized records, not an ordering guarantee between
+queued operations. Section 6.13 defines the outcome when release overtakes use.
+The client's DEALER I/O owner cannot enforce Gateway buffer ownership or stop
+an application from writing through its own mapping.
 
 ### 6.4 Startup and partial-start failure
 
@@ -3353,7 +3360,8 @@ sequenceDiagram
 Key generation/import/derivation may change backend state. Loss of a response
 does not justify retrying automatically. Ordering UnloadKey or FlushKeys
 is handled by Crypto under its ICrypto contract. Gateway does not implement
-key-policy synchronization; Gateway-owned buffer ordering remains **Gap 2**.
+key-policy synchronization. Gateway buffer conflicts follow the immediate
+failure rules in sections 6.10–6.13.
 
 ### 6.10 Shared-memory identity, records and invariants
 
@@ -3369,8 +3377,9 @@ the application and access by Crypto are separate responsibilities.
 | BufferRegion | `{ offset, length }` | Byte range in the same allocation, not a pointer |
 
 Each buffer record retains the owner token/generation, peer evidence, opaque ID,
-client name, backend path, actual capacity, FD, reserved/active use count and
-release state. Per-connection count/byte quotas and a global byte budget require
+client name, backend path, actual capacity, FD, active-use state and release
+state. Queued requests retain their context and buffer ID, but reserve no
+buffer use. Per-connection count/byte quotas and a global byte budget require
 atomic reservation and rollback on every failure path.
 Quota rejection returns RPC_STATUS_INTERNAL and emits an ERROR log containing
 the requested allocation, usage and limit, as specified in section 4.2.
@@ -3390,27 +3399,84 @@ that a later open of the pathname obtains the same object.
 Required invariants:
 
 - Only the owner connection may resolve a buffer_id; same UID/PID is insufficient.
-- A connection may have multiple allocations. Initially allow at most one
-  operation using an allocation at a time, with queued-use reservation rules
-  still to be settled.
+- A connection may have multiple allocations. Allow at most one executing
+  operation per allocation. A worker atomically checks ownership/state and
+  takes the active-use lease when execution begins. A competing use or release
+  fails with RPC_STATUS_INTERNAL and an ERROR log; it is not queued behind the
+  active operation. Other allocations and connections remain independent.
 - Check `offset <= size && length <= size - offset`; avoid unchecked
   `offset + length` arithmetic. Enforce per-operation region presence and
   overlap rules.
-- Keep a lease from the point at which the operation depends on the allocation
-  until backend access is definitively over. Release/disconnect cannot invalidate it.
+- Keep the active-use lease through the ICrypto invocation. A completed
+  synchronous invocation, including a defined CryptoError, ends that access
+  under the Crypto contract. Release/disconnect must not invalidate Gateway's
+  own live records. Queued operations have no lease: release may overtake them,
+  and their execution-time lookup then fails without calling Crypto.
 - The app must not resize, unlink or modify participating regions while an
   operation is outstanding. This cooperation rule is not protection against
   a malicious writable client; mutation/truncation defenses remain TODO.
 - Gateway owns unlink/cleanup. An app unmaps/closes its own view; it does not
   call shm_unlink(). Unlink/close by Gateway also does not revoke an existing
   app mapping.
-- A local client timeout or uncertain COM-RPC failure is not safe completion.
+- A local client timeout is not a backend completion event. Gateway does not
+  receive that timer event or prolong the client's wait; it lets the invocation
+  finish and handles the result normally. An uncertain COM-RPC failure remains
+  different from a completed invocation returning a defined service error.
 
 Configure maximum shared-buffer size, buffer count and aggregate byte quotas
 per connection and globally. Their values must match platform memory and
 concurrency budgets. Section 6.2 lists
 [proposed initial quotas](#proposed-initial-resource-sizing); final product
 values remain subject to validation under TODO(RESOURCE-LIMITS).
+
+#### Application/container access and failure limits
+
+The app opens its allocation with O_RDWR and maps it with MAP_SHARED. Its
+mapping is writable without going through EyilClient or Gateway. A client-side
+mutex or an advisory in-use flag can coordinate cooperating callers, but cannot
+stop another app thread from writing, truncating or unlinking the object using
+ordinary memory access or system calls. A container's private /dev/shm separates
+its namespace; it does not remove the app's access to its own allocation.
+
+| App action | Effect and error boundary |
+| --- | --- |
+| Close its FD or unmap its own view | Does not invalidate an FD or mapping already held by Gateway or Crypto; no Crypto failure is implied |
+| Unlink before Crypto opens the object | A later open can fail; Crypto handles that failure and returns its service result |
+| Unlink after Crypto has opened/mapped the object | Existing references remain usable; unlink alone does not cancel the operation |
+| Replace the name | A later open may resolve a different object; failure is not guaranteed merely because Gateway still holds the original FD |
+| Rewrite input through its mapping during execution | Crypto may consume changed or inconsistent data without detecting an error |
+| Shrink an object already mapped by Crypto | Access beyond its new end can raise SIGBUS; this is not automatically a returned CryptoError |
+
+These are Linux shared-memory semantics, described by
+[shm_open/shm_unlink](https://man7.org/linux/man-pages/man3/shm_open.3.html),
+[mmap](https://man7.org/linux/man-pages/man2/mmap.2.html) and the shared-memory
+hazards in [memfd_create](https://man7.org/linux/man-pages/man2/memfd_create.2.html).
+They do not require Gateway to preserve an invalid request until it succeeds.
+
+Crypto owns validation and safe access inside its ICrypto implementation.
+Gateway forwards a returned CryptoError in the service response with
+RPC_STATUS_OK when the invocation and Gateway handling succeeded. It does not
+retry the operation. A failed ICrypto invocation uses RPC_STATUS_INTERNAL and
+an ERROR log. A fault
+that terminates the backend, or Thunder when Crypto shares its process, cannot
+be assumed to yield a normal response. The application must follow the buffer
+cooperation rules; whether the platform/backend must contain violations by an
+untrusted app remains the access-protection question in Gap 1.
+
+EyilClient cannot revoke another process's mapping, and Gateway changing file
+permissions does not revoke existing writable mappings. Hard enforcement would
+require a deliberate platform/backend mechanism: for example, protected object
+identity and sealable storage to prevent resizing, or Crypto-owned input
+snapshots to avoid using bytes while the app changes them. Preventing resizing
+alone does not prevent writes to an existing writable mapping. No such mechanism
+is silently added to the current path/name-based ICrypto contract.
+
+If a synchronous call has already returned CLIENT_TIMEOUT after 15 seconds,
+its pending ID is retired. Gateway may subsequently send Crypto's success or
+error result, but EyilClient discards that late reply. There is no second return
+or notification callback. An accepted async request can receive the error
+through its response callback while its connection and pending ID remain live.
+Both follow the single response-send attempt and delivery limits in section 6.6.
 
 ### 6.11 AllocateSharedBuffer and client mapping
 
@@ -3465,7 +3531,11 @@ quota accounting and eventual connection cleanup must still cover it.
 ### 6.12 Shared-memory operations: common backend boundary
 
 For all four operations, the app writes inputs before sending the request.
-The Gateway resolves buffer_id and validates owner/ranges, then passes the
+When a worker executes the request, SharedBufferManager atomically resolves
+buffer_id, validates owner/ranges/state and claims the idle allocation. Missing,
+released or busy buffers fail with RPC_STATUS_INTERNAL and an ERROR log before
+any ICrypto call. Do not reserve buffers for queued jobs, wait for a conflict to
+clear or replay failed work. After a successful claim, Gateway passes the
 trusted backend path and regions to the Crypto adapter. Crypto independently
 opens the object, checks its actual size, maps it, performs the operation and
 unmaps/closes it before a successful synchronous invocation returns.
@@ -3500,28 +3570,34 @@ sequenceDiagram
     A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
-    J->>B: Acquire owner-checked lease, validate regions
-    B-->>J: Retained object identity and capacity
-    J->>T: Query ICrypto using configuration.cryptocallsign
-    T-->>J: Scoped reference or nullptr
-    alt Lookup returns nullptr
-        J->>B: End this job's unused lease
-        J-->>R: RPC_STATUS_INTERNAL
-    else Scoped reference acquired
-        J->>C: Encrypt(context, buffer, algorithm, keyId, initData, inputData)
-        C->>C: Open/check/map, enforce key policy, write ciphertext
-        C->>C: Unmap and close before normal return
-        C-->>J: Invocation result, CryptoError, encryptedData region
-        alt Core invocation failed
-            J->>C: Release scoped reference after call returns
-            J->>B: Retain lease if backend completion is uncertain
-            J-->>R: RPC_STATUS_INTERNAL, no automatic replay
-        else Invocation completed
-            J->>C: Release immediately after invocation
-            J->>J: Preserve CryptoError and copy defined outputs
-            J->>J: Validate successful output or preserve overflow result
-            J->>B: End lease only when backend access is known finished
-            J-->>R: Completion with EncryptResponse
+    J->>B: TryUse(owner, buffer_id, regions) at execution time
+    alt Missing, released, releasing, busy or invalid buffer
+        B->>B: Log ERROR with exact cause, owner and request ID
+        B-->>J: RPC_STATUS_INTERNAL, no active-use lease
+        J-->>R: Error completion, no Crypto call and no retry
+    else Idle owned allocation claimed atomically
+        B-->>J: Retained object identity and capacity
+        J->>T: Query ICrypto using configuration.cryptocallsign
+        T-->>J: Scoped reference or nullptr
+        alt Lookup returns nullptr
+            J->>B: End this job's unused lease
+            J-->>R: RPC_STATUS_INTERNAL
+        else Scoped reference acquired
+            J->>C: Encrypt(context, buffer, algorithm, keyId, initData, inputData)
+            C->>C: Open/check/map, enforce key policy, write ciphertext
+            C->>C: Unmap and close before normal return
+            C-->>J: Invocation result, CryptoError, encryptedData region
+            alt Core invocation failed
+                J->>C: Release scoped reference after call returns
+                J->>B: Retain lease if backend completion is uncertain
+                J-->>R: RPC_STATUS_INTERNAL, no automatic replay
+            else Invocation completed
+                J->>C: Release immediately after invocation
+                J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
+                J->>J: Validate successful output or preserve overflow result
+                J->>B: End lease only when backend access is known finished
+                J-->>R: Completion with EncryptResponse
+            end
         end
     end
     R-->>L: RpcResponse
@@ -3547,28 +3623,34 @@ sequenceDiagram
     A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
-    J->>B: Acquire owner-checked lease, validate input regions
-    B-->>J: Trusted object identity and capacity
-    J->>T: Query ICrypto using configuration.cryptocallsign
-    T-->>J: Scoped reference or nullptr
-    alt Lookup returns nullptr
-        J->>B: End this job's unused lease
-        J-->>R: RPC_STATUS_INTERNAL
-    else Scoped reference acquired
-        J->>C: Decrypt(context, buffer, algorithm, keyId, initData, encryptedData)
-        C->>C: Open/check/map, enforce key policy, write plaintext
-        C->>C: Unmap and close before normal return
-        C-->>J: Invocation result, CryptoError, outputData region
-        alt Core invocation failed
-            J->>C: Release scoped reference after call returns
-            J->>B: Retain lease if backend completion is uncertain
-            J-->>R: RPC_STATUS_INTERNAL, no automatic replay
-        else Invocation completed
-            J->>C: Release immediately after invocation
-            J->>J: Preserve CryptoError and copy defined outputs
-            J->>J: Validate result and successful output bounds
-            J->>B: End lease after definitive backend completion
-            J-->>R: Completion with DecryptResponse
+    J->>B: TryUse(owner, buffer_id, regions) at execution time
+    alt Missing, released, releasing, busy or invalid buffer
+        B->>B: Log ERROR with exact cause, owner and request ID
+        B-->>J: RPC_STATUS_INTERNAL, no active-use lease
+        J-->>R: Error completion, no Crypto call and no retry
+    else Idle owned allocation claimed atomically
+        B-->>J: Trusted object identity and capacity
+        J->>T: Query ICrypto using configuration.cryptocallsign
+        T-->>J: Scoped reference or nullptr
+        alt Lookup returns nullptr
+            J->>B: End this job's unused lease
+            J-->>R: RPC_STATUS_INTERNAL
+        else Scoped reference acquired
+            J->>C: Decrypt(context, buffer, algorithm, keyId, initData, encryptedData)
+            C->>C: Open/check/map, enforce key policy, write plaintext
+            C->>C: Unmap and close before normal return
+            C-->>J: Invocation result, CryptoError, outputData region
+            alt Core invocation failed
+                J->>C: Release scoped reference after call returns
+                J->>B: Retain lease if backend completion is uncertain
+                J-->>R: RPC_STATUS_INTERNAL, no automatic replay
+            else Invocation completed
+                J->>C: Release immediately after invocation
+                J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
+                J->>J: Validate result and successful output bounds
+                J->>B: End lease after definitive backend completion
+                J-->>R: Completion with DecryptResponse
+            end
         end
     end
     R-->>L: RpcResponse
@@ -3594,28 +3676,34 @@ sequenceDiagram
     A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
-    J->>B: Acquire owner-checked lease, validate input region
-    B-->>J: Trusted object identity and capacity
-    J->>T: Query ICrypto using configuration.cryptocallsign
-    T-->>J: Scoped reference or nullptr
-    alt Lookup returns nullptr
-        J->>B: End this job's unused lease
-        J-->>R: RPC_STATUS_INTERNAL
-    else Scoped reference acquired
-        J->>C: Sign(context, buffer, algorithm, keyId, digestAlgorithm, inputData)
-        C->>C: Open/check/map, sign, select/write signature region
-        C->>C: Unmap and close before normal return
-        C-->>J: Invocation result, CryptoError, signature region
-        alt Core invocation failed
-            J->>C: Release scoped reference after call returns
-            J->>B: Retain lease if backend completion is uncertain
-            J-->>R: RPC_STATUS_INTERNAL, no automatic replay
-        else Invocation completed
-            J->>C: Release immediately after invocation
-            J->>J: Preserve CryptoError and copy defined outputs
-            J->>J: Validate success region or overflow result
-            J->>B: End lease after definitive backend completion
-            J-->>R: Completion with SignResponse
+    J->>B: TryUse(owner, buffer_id, regions) at execution time
+    alt Missing, released, releasing, busy or invalid buffer
+        B->>B: Log ERROR with exact cause, owner and request ID
+        B-->>J: RPC_STATUS_INTERNAL, no active-use lease
+        J-->>R: Error completion, no Crypto call and no retry
+    else Idle owned allocation claimed atomically
+        B-->>J: Trusted object identity and capacity
+        J->>T: Query ICrypto using configuration.cryptocallsign
+        T-->>J: Scoped reference or nullptr
+        alt Lookup returns nullptr
+            J->>B: End this job's unused lease
+            J-->>R: RPC_STATUS_INTERNAL
+        else Scoped reference acquired
+            J->>C: Sign(context, buffer, algorithm, keyId, digestAlgorithm, inputData)
+            C->>C: Open/check/map, sign, select/write signature region
+            C->>C: Unmap and close before normal return
+            C-->>J: Invocation result, CryptoError, signature region
+            alt Core invocation failed
+                J->>C: Release scoped reference after call returns
+                J->>B: Retain lease if backend completion is uncertain
+                J-->>R: RPC_STATUS_INTERNAL, no automatic replay
+            else Invocation completed
+                J->>C: Release immediately after invocation
+                J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
+                J->>J: Validate success region or overflow result
+                J->>B: End lease after definitive backend completion
+                J-->>R: Completion with SignResponse
+            end
         end
     end
     R-->>L: RpcResponse
@@ -3641,27 +3729,33 @@ sequenceDiagram
     A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
-    J->>B: Acquire owner-checked lease, validate both input regions
-    B-->>J: Trusted object identity and capacity
-    J->>T: Query ICrypto using configuration.cryptocallsign
-    T-->>J: Scoped reference or nullptr
-    alt Lookup returns nullptr
-        J->>B: End this job's unused lease
-        J-->>R: RPC_STATUS_INTERNAL
-    else Scoped reference acquired
-        J->>C: Verify(context, buffer, algorithms, keyId, input, signature)
-        C->>C: Open/check/map, enforce key policy, compare signature
-        C->>C: Unmap and close before normal return
-        C-->>J: Invocation result, CryptoError, verificationStatus
-        alt Core invocation failed
-            J->>C: Release scoped reference after call returns
-            J->>B: Retain lease if backend completion is uncertain
-            J-->>R: RPC_STATUS_INTERNAL, no automatic replay
-        else Invocation completed
-            J->>C: Release immediately after invocation
-            J->>J: Preserve CryptoError and copy defined outputs
-            J->>B: End lease after definitive backend completion
-            J-->>R: Completion with VerifyResponse
+    J->>B: TryUse(owner, buffer_id, regions) at execution time
+    alt Missing, released, releasing, busy or invalid buffer
+        B->>B: Log ERROR with exact cause, owner and request ID
+        B-->>J: RPC_STATUS_INTERNAL, no active-use lease
+        J-->>R: Error completion, no Crypto call and no retry
+    else Idle owned allocation claimed atomically
+        B-->>J: Trusted object identity and capacity
+        J->>T: Query ICrypto using configuration.cryptocallsign
+        T-->>J: Scoped reference or nullptr
+        alt Lookup returns nullptr
+            J->>B: End this job's unused lease
+            J-->>R: RPC_STATUS_INTERNAL
+        else Scoped reference acquired
+            J->>C: Verify(context, buffer, algorithms, keyId, input, signature)
+            C->>C: Open/check/map, enforce key policy, compare signature
+            C->>C: Unmap and close before normal return
+            C-->>J: Invocation result, CryptoError, verificationStatus
+            alt Core invocation failed
+                J->>C: Release scoped reference after call returns
+                J->>B: Retain lease if backend completion is uncertain
+                J-->>R: RPC_STATUS_INTERNAL, no automatic replay
+            else Invocation completed
+                J->>C: Release immediately after invocation
+                J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
+                J->>B: End lease after definitive backend completion
+                J-->>R: Completion with VerifyResponse
+            end
         end
     end
     R-->>L: RpcResponse
@@ -3675,9 +3769,35 @@ For every operation, a transport failure after remote dispatch may leave
 completion uncertain. Do not take the normal lease-release arrow in that case;
 retain/quarantine the resource until an agreed recovery mechanism resolves it.
 
-### 6.13 ReleaseSharedBuffer, reuse and concurrent release
+### 6.13 ReleaseSharedBuffer and conflicting buffer operations
 
-Coverage: **AC1.9–AC1.10**. No ICrypto call is needed for an idle allocation.
+Coverage: **AC1.9–AC1.10**. Release is a Gateway-local operation.
+
+**Failure policy:** check the buffer when a job executes. A queued operation
+has no reservation and may fail because another worker already released the
+allocation. Gateway does not promise request-arrival ordering, delay release to
+preserve queued work or automatically retry a failed operation.
+
+SharedBufferManager makes lookup and state changes atomic. It holds its lock
+only for local bookkeeping, never across ICrypto, filesystem operations or
+response delivery. A use claims IDLE → IN_USE and retains its record; release
+claims IDLE → RELEASING and excludes new use. A request finding IN_USE,
+RELEASING, an unresolved previous use or an unavailable ID fails immediately
+with RPC_STATUS_INTERNAL and an ERROR log. Normal completion returns IN_USE
+→ IDLE under the same synchronization, including a completed Crypto invocation
+with a service error. No deferred release is created for a busy-buffer rejection.
+
+| Race at the buffer manager | Result |
+| --- | --- |
+| Release claims the idle buffer before a queued Encrypt executes | Release proceeds; Encrypt later fails its buffer lookup/state check with RPC_STATUS_INTERNAL, without calling Crypto |
+| Encrypt claims the buffer before Release executes | Encrypt proceeds; Release fails immediately with RPC_STATUS_INTERNAL because the allocation is in use |
+| Two operations try to claim the same idle buffer | One claims it; the other fails with RPC_STATUS_INTERNAL if it observes IN_USE; neither waits for the other to finish |
+| A later operation executes after the previous use has finished | It may claim the still-live buffer and proceed normally |
+| The app removes the object outside Gateway before Crypto opens it | Crypto handles an open/access failure if detected; Gateway logs and forwards the returned CryptoError, without retry |
+
+These are outcomes of execution-time checks, not a dependency scheduler. The
+application submits dependent operations sequentially when it needs a particular
+order. Different buffers and connections can still execute concurrently.
 
 ```mermaid
 sequenceDiagram
@@ -3687,47 +3807,78 @@ sequenceDiagram
     participant J as Private release job
     participant B as SharedBufferManager
     participant K as Linux
-    A->>A: Wait for definitive completion of all uses
-    A->>K: munmap and close own mapping/FD
+    A->>A: Stop intended uses of this buffer, unmap and close own view
     A->>A: Wrap ReleaseSharedBufferRequest in CryptoRequest and RpcRequest
     A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over IPC
     R->>J: Dispatch release job with owner context
-    J->>B: Release(owner, buffer_id)
-    B->>B: Check owner, buffer reference and release admission
-    alt Invalid buffer reference or rejection due to busy or release-pending state
+    J->>B: TryRelease(owner, buffer_id)
+    B->>B: Under lock, check owner/state and try IDLE to RELEASING
+    alt Invalid, busy, unresolved-use or already releasing buffer
         B->>B: Log ERROR with exact cause, request context and buffer state
-        B-->>J: RPC_STATUS_INTERNAL, preserve existing leases and release ownership
-    else Release admitted
-        B->>B: Reject future use atomically
-        alt No reserved or active operation
-            B->>K: Unlink owned object and close retained FD
-            B->>B: Remove record, release quota
-            B-->>J: Released
-        else Accepted release still has an outstanding lease
-            B->>B: Mark release pending, retain object and quota
-            Note over J,B: Lifecycle TODO in Gaps 1 and 2 defines admission and release-completion timing
-            B-->>J: Completion when the agreed lifecycle contract permits
+        B-->>J: RPC_STATUS_INTERNAL, existing use unchanged
+        Note over J,B: No wait, deferred release or automatic retry
+    else Idle allocation claimed for release
+        B->>B: Exclude subsequent use and release lock
+        B->>K: Unlink owned object and close Gateway-held FD
+        alt Owned resources released
+            B->>B: Remove record and release quota under lock
+            B-->>J: Successful ReleaseSharedBufferResponse
+        else Cleanup fails
+            B->>B: Log ERROR, retain unresolved cleanup/accounting, keep ID unavailable
+            B-->>J: RPC_STATUS_INTERNAL, no successful release acknowledgement
         end
     end
-    J-->>R: Completion
-    R-->>L: RpcResponse
-    L-->>A: Matched RpcResponse bytes through waiter or callback
+    J-->>R: Completion with original ID and generation
+    R-->>L: Single RpcResponse attempt
+    L-->>A: Matched RpcResponse bytes if the request is still pending
     A->>A: Check RpcStatus and CryptoError before treating release as successful
 ```
 
-When the last definitive lease ends, the manager can finish a pending release
-exactly once. Rejected unknown/unowned buffer references, duplicate release and
-busy/release-pending requests use RPC_STATUS_INTERNAL with an explicit ERROR log.
-They do not create a second release operation or invalidate existing leases.
-The resource-lifecycle contract still determines when a release is admitted,
-whether it waits for leases, and when successful completion is acknowledged.
-Those timing/ownership decisions are separate from the settled error mapping.
+Successful release acknowledges removal of Gateway's allocation record, name
+and retained FD, with quota accounting completed. It does not revoke an app's
+existing mapping or certify that the kernel has freed pages still referenced
+by another process. The backend must have finished its access before Gateway
+releases an allocation that it marked IN_USE. Filesystem cleanup failures retain
+private accounting for the normal cleanup path; they do not publish success or
+make the ID usable again.
 
-Do not rely on the order requests arrived at ROUTER: a queued Encrypt can run
-after a Release job unless its dependency was reserved or ordered earlier.
-Similarly, `client_send_request()` timing out does not satisfy the app's
-"all uses completed" condition. These are **Gaps 1 and 2**.
+The release-before-use case is intentionally allowed:
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant R as Gateway ROUTER and waiting queue
+    participant E as Encrypt worker
+    participant F as Release worker
+    participant B as SharedBufferManager
+    A->>R: Encrypt(B), request ID 10
+    A->>R: ReleaseSharedBuffer(B), request ID 11
+    R->>E: Dispatch Encrypt, no queued buffer reservation
+    R->>F: Dispatch Release
+    Note over E,F: Worker scheduling does not guarantee arrival order
+    F->>B: TryRelease(B), claim idle allocation
+    B->>B: Remove name, close retained FD and retire allocation record
+    B-->>F: Released
+    F-->>R: Successful release response, ID 11
+    E->>B: TryUse(B) when Encrypt reaches its buffer check
+    B->>B: Log ERROR for unavailable buffer
+    B-->>E: RPC_STATUS_INTERNAL
+    E-->>R: Error response, ID 10, no Crypto invocation
+    R-->>A: One send attempt for each response using its own request ID
+```
+
+Gateway forwards a detected Crypto failure when the conflict is discovered
+inside ICrypto instead. It does not need to dispatch Crypto merely to rediscover
+an unavailable buffer it can already reject locally. A synchronous client that
+has timed out will discard a late error; there is no guarantee of delivery after
+its pending ID or connection has been retired.
+
+Connection disconnect and plugin deactivation retain their agreed accepted-work
+drain. Each queued operation either executes its checks within the dispatch
+budget or expires; it need not succeed. After active calls end, lifecycle cleanup
+releases the remaining allocations. This policy does not add a buffer dependency
+queue or change Crypto's internal synchronization responsibilities.
 
 ### 6.14 Disconnect detection, PID observations and hibernation
 
@@ -3962,6 +4113,12 @@ provides the transport evidence and send guard; Gateway must implement the
 registry transitions and resource cleanup that consume them.
 
 #### Required libzmq extension and platform integration
+
+The source patch is included in this repository:
+[zmq_connection_lifetime.patch](zmq_connection_lifetime.patch).
+Apply it to the upstream libzmq 4.3.4 sources in the platform recipe. It contains
+the connection metadata, version-2 monitor events, guarded ROUTER sends,
+regression tests and libzmq integration notes described below.
 
 The reviewed RDK manifest selects `meta-openembedded` tag `rdk-4.0.0`, whose
 [ZeroMQ recipe](https://github.com/rdkcentral/meta-openembedded/blob/4ad41baed6236d499804cbfc4f174042d84fce97/meta-oe/recipes-connectivity/zeromq/zeromq_4.3.4.bb)
@@ -4547,9 +4704,11 @@ routing and lifecycle work without deferring the ICrypto dependency:
 4. Add private-pool jobs, the 1,024-entry waiting-request limit, 10-second
    dispatch deadline and completion routing. Validate per-call ICrypto
    acquisition/release, errors and nonblocking pool handoff.
-5. Add Gateway-local allocations, ownership checks and leases. Validate
-   pathname identity, operation access and release ordering with the Crypto
-   plugin; the unresolved memory-lifetime policies remain explicit in Gap 1.
+5. Add Gateway-local allocations, atomic execution-time ownership/state
+   checks and active-use leases. Reject released or busy buffers without
+   reserving queued uses, deferring release or replaying an operation. Validate
+   the access-protection and abnormal-completion boundaries in Gap 1 with
+   the platform/Crypto implementation.
 6. Integrate AppManager/RuntimeManager authentication only at the marked TODOs,
    once their formal API exists. Add lifecycle event behavior only after a
    separate policy decision.
@@ -4577,14 +4736,14 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 string completion races | Race response-text preparation with the synchronous deadline, explicit close and transport loss; no intermediate binary success escapes, the winning result is preserved, and any losing prepared string is freed |
 | L2 text/service mapping | Once TEXT-SERVICE-CONTRACT is defined, verify routing, request interpretation and text responses including Gateway/service errors over binary Protobuf IPC; never parse arbitrary text as a CryptoRequest |
 | L1 Gateway | Envelope/oneof validation; context lookup; queued/in-flight ownership; enum/presence mapping; allocation rollback |
-| L1 Gateway rejection logging | Invalid service payload, buffer quota and rejected busy/release-pending operations produce RPC_STATUS_INTERNAL with empty payload and an ERROR log identifying the exact cause and known request/connection context; duplicate IDs cannot dispatch twice or replace the original completion; unsafe correlation logs/drops without a fabricated reply; logs contain no payload or key material |
+| L1 Gateway rejection logging | Invalid service payload, buffer quota and rejected busy/releasing/released-buffer operations produce RPC_STATUS_INTERNAL with empty payload and an ERROR log identifying the exact cause and known request/connection context; duplicate IDs cannot dispatch twice or replace the original completion; unsafe correlation logs/drops without a fabricated reply; logs contain no payload or key material |
 | L1 Gateway queue | 1,024 global waiting slots include staged/pool-queued jobs; saturation rejects with RPC_STATUS_INTERNAL; allocation failure rolls back credit; control cleanup remains possible |
 | L1 Gateway dispatch deadline | Expire after 10,000 ms without starting; include pool queue time; race expiry against Dispatch; exactly one result and no backend execution after expiry; do not time out running calls |
 | L1 Gateway drain | Atomic admission cutoff; queued work starts or expires under original deadline; active work finishes; callbacks and stop state require no new shutdown queue allocation |
 | L1 Gateway response capacity | Reserve at most 128 slots per connection and 1,024 globally plus configured byte allowances before execution; reject without service execution on exhaustion; no blocking/overflow queue; release each reservation once |
 | L1 resource configuration | Exercise the selected product message/byte/quota bounds and arithmetic; reject before side effects where possible, log exact resource failures and release reservations once; section 6.2's proposed numeric values are not hard-coded acceptance requirements |
 | L1 Gateway response send | At most one logical response attempt; EAGAIN/EHOSTUNREACH/EINTR cause local error and drop; no requeue, second error response or backend replay; storage released once; multipart frames never cross responses |
-| L1 concurrency | Queued/active leases, disconnect during dispatch, independent connections and dependency barriers |
+| L1 buffer concurrency | Queued jobs reserve no buffer; release winning before TryUse makes the operation fail with RPC_STATUS_INTERNAL and no Crypto call; use winning makes a competing use/release fail immediately; atomic state/record lifetime and quota accounting survive concurrent workers and disconnect |
 | L2 transport | Real DEALER/ROUTER IPC, ZAP metadata, reverse-order completion and simultaneous sync/async callers |
 | L2 connect readiness | CONNECTED alone cannot complete connect; HANDSHAKE_SUCCEEDED returns CLIENT_OK; explicit rejection returns CLIENT_AUTH_FAILED; unresolved/stalled attempt reaches CLIENT_TIMEOUT; each failure wakes the waiter and rolls back resources; no startup outcome invokes a callback, and immediate subsequent loss cannot expose an unpublished handle |
 | L2 explicit reconnect | Verify RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0; after loss and Gateway return, no automatic handshake or old queued send occurs; explicit close/new connect creates an empty client runtime and new Gateway session, rejects old buffer IDs and never delivers old replies to new requests |
@@ -4592,7 +4751,8 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L2 disabled heartbeats | Verify IVL/TIMEOUT/TTL are 0 on DEALER and ROUTER before connect/bind and after socket recreation; confirm monitor-driven cleanup still occurs on actual socket closure |
 | L2 disconnect | Trusted FD/lifetime-to-User-Id binding; close one of multiple connections from a PID; delayed/duplicate events and FD/route reuse; disconnect before first request; no unrelated cleanup |
 | L2 guarded responses | Apply the expected transport lifetime to successful and error replies; force route reuse and verify no old response reaches a replacement connection, including before monitor cleanup catches up |
-| L2 buffers | Container-private mapping, cross-connection rejection, release during work, size/region failures and lost replies |
+| L2 buffers | Container-private mapping, cross-connection rejection, release before queued use and rejection during active use; returned Crypto access errors are forwarded; size/region failures and lost replies; a result after a synchronous timeout is discarded |
+| Shared-memory platform validation | Verify app permissions, name identity and namespace/process reuse; validate any required containment of replacement, mutation or truncation in an isolated backend test environment; do not assume each case produces a returned CryptoError |
 | L2 lifecycle | Fail every startup stage; stop idle/busy/full-queue runtimes; CONNECTED-in-progress and disconnect races; accepted work settles before DISCONNECTED and buffer release |
 | L2 socket teardown | ROUTER closes on its owner after drain; slow/frozen reader cannot block; REP/PAIR close on stop/ETERM; no final monitor-event dependency; all threads/context retire |
 | L2 reactivation | Repeated activation cycles rebind in host/container views; fresh identities/generations; stale callbacks/events cannot reach new clients; no FD/thread leaks |
@@ -4650,7 +4810,8 @@ control interface when Gateway implementation mode is Local. Do not mix headers
 and bindings from incompatible releases.
 
 For Gateway runtime builds and transport L2 tests, use **libzmq 4.3.4 with the
-connection-lifetime extension**, ENABLE_DRAFTS=ON and matching consumer headers
+included [connection-lifetime patch](zmq_connection_lifetime.patch)**,
+ENABLE_DRAFTS=ON and matching consumer headers
 with ZMQ_BUILD_DRAFT_API. Section 6.14 defines the required metadata, monitor and
 guarded-send contract. Finding an arbitrary ZeroMQ 4.3+ package is insufficient
 to establish Gateway compatibility. Client/protocol-only builds can use a
@@ -4786,103 +4947,82 @@ plugin's reported and registered versions agree.
 
 ## 7. Gaps to answer
 
-Two lifecycle-related gaps remain about Gateway-owned memory and parallel
-request ordering. FD/lifetime binding, graceful plugin stop/reactivation, fresh
-startup after a crash, authentication-time CONNECTED and bounded response
-handoff with one send attempt are defined requirements. Crypto owns its
-internal session, key and recovery implementation; those are not Gateway gaps.
-Section 7.3 lists the remaining API/product choices and future platform
-requirements. Section 7.4 separates integration and verification of selected
+The remaining shared-memory boundary concerns app-controlled object access and
+abnormal completion evidence. Execution-time buffer checks and rejection of
+conflicts are defined in sections 6.10–6.13; preserving queued operations or
+ordering them behind release is not required. FD/lifetime binding, graceful
+plugin stop/reactivation, fresh startup after a crash, authentication-time
+CONNECTED and bounded response handoff with one send attempt are also selected.
+Crypto owns validation, safe memory access and its internal session/key/recovery
+implementation. Gateway forwards returned errors; it does not implement those
+backend responsibilities.
+
+Section 7.2 lists the remaining API/product choices and future platform
+requirements. Section 7.3 separates integration and verification of selected
 contracts from questions about their design.
 
-### 7.1 Gap 1: Stable shared-memory object identity and lifetime
+### 7.1 Gap 1: Shared-memory access protection and abnormal lifecycle completion
 
-**Lifecycle dependency:** final buffer reuse, release and cleanup behavior depends
-on the app/resource lifecycle contract, including disconnect, process exit,
-hibernation and outstanding operations. Keep those decisions pending until that
-contract is confirmed. Object identity and protection against mutation remain
-requirements during normal operation as well; the agreed Gateway plugin
-deactivation/reactivation flow is not reopened by this gap.
+**Defined behavior:** Gateway manages allocation ownership and checks the buffer
+when a worker executes. A released or busy buffer causes an immediate error;
+queued operations are not kept alive through release. A normal synchronous
+ICrypto return, including a defined service error, ends that invocation's buffer
+access. Crypto owns its validation and reports detected access/operation errors.
+Release success and conflict behavior are specified in section 6.13.
 
-**Question:** how do Gateway and Crypto guarantee they access the same backing
-object, and when is that object safe to reuse or destroy?
+**Application/container boundary:** with the current app-owned name and writable
+mapping, Gateway cannot prevent direct application writes or filesystem changes.
+The Linux behavior and limits are described in section 6.10. A returned Crypto
+error is forwarded, but not every app mutation necessarily produces such an
+error. Replacing a path can select another object, changing bytes can silently
+alter input, and truncation during mapped access can fault a process.
 
-Gateway retains an FD, but Crypto opens a pathname. A client can potentially
-replace/unlink the name, resize the file or mutate mapped bytes. A retained FD
-continues referring to the original object even if its name changes; a later
-open by name need not. `O_NOFOLLOW` alone does not secure the entire path.
-See the [Linux open API](https://man7.org/linux/man-pages/man2/open.2.html).
+Integration decisions still needed:
 
-Answers required:
+- Confirm the supported app trust/cooperation model. Is obeying the no-mutation,
+  no-resize and no-unlink rules sufficient, or must the platform/Crypto contain
+  violations by a buggy or untrusted app?
+- If stronger enforcement is required, how is SharedBuffer.name kept bound to
+  Gateway's allocation when the app controls its directory? Agree the object
+  identity and access-protection mechanism with the platform/backend; Gateway
+  does not add a new ICrypto handle or process isolation scheme implicitly.
+- Verify permissions and namespace/process-instance references for
+  /proc/PID/root access. A missing path may fail normally; it need not be kept
+  accessible merely to make a queued operation succeed. PID or path reuse must
+  not silently redirect an operation or cleanup to an unrelated allocation.
+- For an abnormal remote invocation whose return does not establish that memory
+  access ended, define what backend/platform evidence permits Gateway to finish
+  retained-resource cleanup. This is a lifecycle integration boundary, not a
+  requirement for Gateway to monitor Crypto health or implement its recovery.
 
-- Is the client-namespace pathname a sufficient identity under the accepted
-  threat model, or is a stable Gateway-controlled path/object handle needed?
-- Does the SharedBuffer.name supplied by Gateway stay bound to its retained
-  allocation throughout the call, including pathname replacement races?
-- What survives peer exit, PID reuse or loss of /proc/PID/root access? Which
-  namespace references, permissions or capabilities are required?
-- What prevents replacement, truncation and mutation during processing?
-  Are input snapshots or a different protected mapping arrangement required?
-- After a client timeout, disconnect or uncertain COM-RPC result, what proves
-  backend completion? How does the app learn that reuse is safe?
-- When does ReleaseSharedBuffer acknowledge completed release, and how does
-  the app coordinate reuse while a release or earlier access is still pending?
-  The rejection status is already defined. Crypto's BUFFER_OVERFLOW output
-  follows the selected ICrypto contract described in section 6.12.
+The 15-second synchronous client timeout is already defined: it retires the
+client's pending ID without cancelling the backend. A late success or error
+is discarded. This does not create a requirement to prolong that request or
+provide a second callback. The application must not assume that a timeout made
+its mapped bytes safe to overwrite; client-side bookkeeping cannot enforce
+that restriction against arbitrary writes.
 
-**Implementation constraint:** retain leases and quarantine uncertain use.
-Gateway ownership is allocation ownership; it is not immutability, revocation
-of client mappings or proof that a reopened pathname resolves to the same file.
+**Implementation constraint:** synchronize Gateway records and keep active-use
+references until the call's access has ended. Accept failure of operations
+whose execution-time checks or Crypto calls fail. Never substitute a different
+object to keep a request running, promise an error for every memory mutation or
+claim a late result can be delivered to an already retired client request.
 
-**Blocks:** safe shared-memory backend access and reliable cleanup/reuse.
+**Lifecycle scope:** ordinary release/conflict handling and plugin drain are
+selected. Uncertain remote completion, process replacement and protection
+against app-side mutation require platform/backend agreement. These questions
+do not reopen Crypto's internal implementation or require a Gateway dependency
+scheduler.
+
 **Coverage affected:** AC1.8–AC1.10.
 **TODOs:** SHM-IDENTITY, SHM-COMPLETION, SHM-MUTATION.
 
-### 7.2 Gap 2: Gateway ownership and ordering under parallel dispatch
+### 7.2 Remaining API and platform decisions
 
-**Lifecycle dependency:** this gap concerns coordination of Gateway-owned
-resources across use, release, disconnect and drain. Final resource-lifecycle
-requirements determine how those transitions interact with queued/running jobs.
-It does not change the agreed plugin shutdown order or assign Crypto's internal
-lifecycle to Gateway; thread-safe access is still required during normal use.
-
-**Question:** which component serializes mutable session/resource state, and
-what ordering is guaranteed for requests that depend on the same resource?
-
-Answers required:
-
-- Which Gateway registry/buffer accesses need locks or retained records across
-  the ROUTER I/O owner, ZAP/monitor workers and private-pool request jobs?
-- Does a job acquire/reserve its buffer dependency before enqueueing or when
-  execution begins? How is a queued use protected from a later Release?
-- Are dependent operations client-ordered, server-serialized, rejected while
-  busy or represented by continuations? A rejection uses the agreed
-  RPC_STATUS_INTERNAL and ERROR-log contract from section 4.2.
-- How do buffer reservations and completion publication stay consistent when
-  closing admission races an already accepted request or release?
-
-The I/O owner here is the **Gateway ROUTER thread**, which receives requests,
-admits jobs, manages routes and sends replies. Private Thunder-pool workers
-execute service jobs; ZAP and monitor workers produce control events. The
-client's DEALER I/O owner runs in the app process and is outside this question.
-
-CONNECTED during authentication and accepted-work drain before DISCONNECTED
-are defined. Crypto handles its internal key/session synchronization. Remaining
-questions concern Gateway-owned buffer dependencies and concurrent records.
-
-**Implementation constraint:** one dispatch object per request does not imply
-unrestricted simultaneous access to every resource. Define resource-specific
-ordering while keeping unrelated requests concurrent on the private worker pool.
-
-**Blocks:** safe concurrent request, release and disconnect behavior.
-**Coverage affected:** AC1.6–AC1.10; AC2.4.
-**TODO:** PARALLEL-ORDERING.
-
-### 7.3 Remaining API and platform decisions
-
-These items complement the two lifecycle-related gaps and cover client API
-and product decisions. Future platform lifecycle requirements do not block
-the selected initial explicit-close/fresh-connect and plugin-drain contracts.
+These items complement the shared-memory integration boundary and cover
+client API and product decisions. Future platform lifecycle requirements do not
+block the selected initial explicit-close/fresh-connect and plugin-drain
+contracts.
 
 | TODO | Answer needed / integration boundary |
 | --- | --- |
@@ -4896,14 +5036,14 @@ the selected initial explicit-close/fresh-connect and plugin-drain contracts.
 | BUFFER-HELPER | Ownership of app-side shm_open/mmap helpers, output validation and release coordination |
 | RESOURCE-LIMITS | Validate and select product values from the [resource-sizing proposals in section 6.2](#proposed-initial-resource-sizing): message/response byte limits, queue byte budgets, libzmq high-water marks, worker count/stacks and shared-buffer quotas; the agreed Gateway waiting limit remains 1,024/10 seconds and response slots remain 128 per connection/1,024 globally; client queue has no fixed count cap |
 
-### 7.4 Integration and validation work
+### 7.3 Integration and validation work
 
 These items implement or verify selected contracts. They are not additional
 unresolved Gateway architecture gaps.
 
 | Work item | Required integration / evidence |
 | --- | --- |
-| ZMQ-PLATFORM | Integrate the libzmq 4.3.4 connection-lifetime extension into the product build and Gateway consumers; enable draft APIs, use ZAP/request metadata, version-2 FD/lifetime events and guarded ROUTER sends, then validate the exact rootfs binary; section 6.14 defines the contract |
+| ZMQ-PLATFORM | Integrate the included [libzmq 4.3.4 patch](zmq_connection_lifetime.patch) into the product build and Gateway consumers; enable draft APIs, use ZAP/request metadata, version-2 FD/lifetime events and guarded ROUTER sends, then validate the exact rootfs binary; section 6.14 defines the contract |
 | DEPLOYMENT | Configure and verify UDS mounts across endpoint recreation, permissions, procfs/user-namespace access, private /dev/shm and blocked direct Crypto communicator access. Confirm platform ownership of leftover storage after a crash; Gateway starts fresh and does not reconstruct or blindly unlink old allocations |
 | Private Thunder pool | Validate nonblocking job handoff, ownership transfer, capacity wakeups and drain against the target Thunder API; keep application jobs off the global pool and preserve the 1,024-entry/10-second waiting contract |
 | SDK and runtime dependencies | Supply the selected topic/crypto ICrypto headers/bindings, configured Crypto callsign and matching Thunder interfaces; validate per-call references, authentication-time CONNECTED and ordered DISCONNECTED without a Crypto health observer |
