@@ -3368,17 +3368,28 @@ failure rules in sections 6.10–6.13.
 Coverage: **AC1.9–AC1.10**. Allocation is a Gateway responsibility; mapping by
 the application and access by Crypto are separate responsibilities.
 
+**Agreed application contract:** authenticated applications are trusted to
+coordinate their buffer users and follow the allocation/use/release rules.
+The app keeps the object name and size unchanged, does not unlink it, and does
+not overwrite participating regions while Crypto is using them. Authentication
+identifies the peer; this cooperation is an application responsibility, not a
+protection enforced by EyilClient. Gateway still validates connection ownership,
+ranges, states and quotas for every operation.
+
 | Identifier | Example | Meaning |
 | --- | --- | --- |
 | buffer_id | Opaque generated token | Gateway lookup key, scoped to one connection generation |
 | Client name | `/eyil.<random-token>` | POSIX name opened with shm_open() inside the app container |
 | Backend path | `/proc/<host-peer-pid>/root/dev/shm/eyil.<random-token>` | Proposed host-visible path passed as SharedBuffer.name |
 | Gateway FD | Process-local descriptor | Retains the created object; never sent as a bare integer to Crypto |
+| Shared-memory directory FD | Gateway-owned reference to the original peer shared-memory directory | Supports allocation cleanup after peer exit without resolving /proc/PID/root again |
 | BufferRegion | `{ offset, length }` | Byte range in the same allocation, not a pointer |
 
 Each buffer record retains the owner token/generation, peer evidence, opaque ID,
-client name, backend path, actual capacity, FD, active-use state and release
-state. Queued requests retain their context and buffer ID, but reserve no
+client name, backend path, actual capacity, object FD, a retained directory
+reference, active-use state and release state. Directory references may be
+shared by the connection's allocations. Queued requests retain their context
+and buffer ID, but reserve no
 buffer use. Per-connection count/byte quotas and a global byte budget require
 atomic reservation and rollback on every failure path.
 Quota rejection returns RPC_STATUS_INTERNAL and emits an ERROR log containing
@@ -3393,8 +3404,15 @@ required procfs access.
 The proposal's namespace path uses the peer's mount view. Access is subject to
 procfs checks and can become unavailable when the peer or its main thread exits.
 See [proc_pid_root](https://man7.org/linux/man-pages/man5/proc_pid_root.5.html).
-The path/FD relationship remains **Gap 1**: retaining an FD does not guarantee
-that a later open of the pathname obtains the same object.
+The selected trust model requires the app to preserve that name/object binding.
+Retaining an object FD alone does not prevent replacement of its pathname.
+Retain the original shared-memory directory FD and generated relative filename
+for Gateway cleanup, using unlinkat() against that directory after backend
+access ends. Close the directory reference after its last allocation is cleaned
+up. Do not rebuild cleanup paths using a dead or reused PID. Directory-relative
+operations keep a stable directory reference; see
+[openat](https://man7.org/linux/man-pages/man2/open.2.html) and
+[unlinkat](https://man7.org/linux/man-pages/man2/unlink.2.html).
 
 Required invariants:
 
@@ -3413,8 +3431,8 @@ Required invariants:
   own live records. Queued operations have no lease: release may overtake them,
   and their execution-time lookup then fails without calling Crypto.
 - The app must not resize, unlink or modify participating regions while an
-  operation is outstanding. This cooperation rule is not protection against
-  a malicious writable client; mutation/truncation defenses remain TODO.
+  operation is outstanding. This is the selected cooperation contract; hard
+  enforcement against a violating app is outside this version's scope.
 - Gateway owns unlink/cleanup. An app unmaps/closes its own view; it does not
   call shm_unlink(). Unlink/close by Gateway also does not revoke an existing
   app mapping.
@@ -3428,6 +3446,28 @@ per connection and globally. Their values must match platform memory and
 concurrency budgets. Section 6.2 lists
 [proposed initial quotas](#proposed-initial-resource-sizing); final product
 values remain subject to validation under TODO(RESOURCE-LIMITS).
+
+#### Application cleanup after completion or error
+
+When an allocation is no longer needed, including when abandoning it after an
+error, the app-side Crypto layer stops further use, unmaps/closes its local view
+and sends ReleaseSharedBufferRequest(buffer_id) through EyilClient. The response
+must be checked before treating Gateway release as successful. Freeing a message
+with client_free_response() does not release a shared allocation.
+
+This applies when the app knows the buffer ID and still has a usable connection.
+An error or the 15-second client timeout does not force an active Crypto call to
+finish. A release attempted while the allocation is IN_USE or has unresolved
+access fails with RPC_STATUS_INTERNAL and an ERROR log, as in section 6.13.
+That failed request creates no deferred release and no automatic retry. The app
+may explicitly request release later or close the connection; connection cleanup
+then owns eventual reclamation after accepted work and active access settle.
+
+If allocation fails before an ID is published, Gateway rolls back its partial
+allocation. If the allocation succeeded but its response was lost, the app has
+no ID to release; connection teardown reclaims that allocation as well. After
+unexpected connection loss, cleanup needs no release RPC from the app. A fresh
+connection cannot release or reuse the old connection's IDs.
 
 #### Application/container access and failure limits
 
@@ -3457,19 +3497,15 @@ Crypto owns validation and safe access inside its ICrypto implementation.
 Gateway forwards a returned CryptoError in the service response with
 RPC_STATUS_OK when the invocation and Gateway handling succeeded. It does not
 retry the operation. A failed ICrypto invocation uses RPC_STATUS_INTERNAL and
-an ERROR log. A fault
-that terminates the backend, or Thunder when Crypto shares its process, cannot
-be assumed to yield a normal response. The application must follow the buffer
-cooperation rules; whether the platform/backend must contain violations by an
-untrusted app remains the access-protection question in Gap 1.
+an ERROR log. A fault that terminates the backend, or Thunder when Crypto shares
+its process, cannot be assumed to yield a normal response. These limits are
+accepted with the trusted-app cooperation contract; they are not an outstanding
+requirement to add memory protection to EyilClient.
 
 EyilClient cannot revoke another process's mapping, and Gateway changing file
-permissions does not revoke existing writable mappings. Hard enforcement would
-require a deliberate platform/backend mechanism: for example, protected object
-identity and sealable storage to prevent resizing, or Crypto-owned input
-snapshots to avoid using bytes while the app changes them. Preventing resizing
-alone does not prevent writes to an existing writable mapping. No such mechanism
-is silently added to the current path/name-based ICrypto contract.
+permissions does not revoke existing writable mappings. Additional containment
+of a violating app would be a separate platform/backend requirement. It is not
+part of the selected path/name-based ICrypto integration.
 
 If a synchronous call has already returned CLIENT_TIMEOUT after 15 seconds,
 its pending ID is retired. Gateway may subsequently send Crypto's success or
@@ -3503,9 +3539,9 @@ sequenceDiagram
         R-->>L: Single response attempt through original connection
         L-->>A: RpcResponse error, no buffer to map
     else Validation and quota reservation succeed
-        B->>K: Safely open peer shm directory, exclusive object creation
+        B->>K: Retain peer shm directory FD, create exclusive object relative to it
         B->>K: ftruncate, set approved ownership and permissions
-        K-->>B: Retained FD and verified capacity
+        K-->>B: Retained object/directory references and verified capacity
         B->>B: Publish buffer_id, client name, host path and owner
         B-->>J: AllocateSharedBufferResponse
         J-->>R: Completion carrying original context/generation
@@ -3514,7 +3550,7 @@ sequenceDiagram
         A->>A: Check RpcStatus and CryptoError, decode buffer_id, name and size
         A->>K: shm_open(name, O_RDWR), inspect size, mmap(MAP_SHARED)
         K-->>A: Application mapping
-        Note over B,K: On creation failure roll back object, FD and quota, log ERROR and return RPC_STATUS_INTERNAL
+        Note over B,K: On creation failure roll back object, owned FDs/references and quota, log ERROR and return RPC_STATUS_INTERNAL
     end
 ```
 
@@ -3820,9 +3856,9 @@ sequenceDiagram
         Note over J,B: No wait, deferred release or automatic retry
     else Idle allocation claimed for release
         B->>B: Exclude subsequent use and release lock
-        B->>K: Unlink owned object and close Gateway-held FD
+        B->>K: unlinkat retained directory and relative name, close Gateway-held object FD
         alt Owned resources released
-            B->>B: Remove record and release quota under lock
+            B->>B: Remove record, release quota and retained directory reference
             B-->>J: Successful ReleaseSharedBufferResponse
         else Cleanup fails
             B->>B: Log ERROR, retain unresolved cleanup/accounting, keep ID unavailable
@@ -4187,6 +4223,17 @@ for accepted work. Queued requests start within their original worker deadline
 or expire; started operations finish before destructive cleanup. There is no
 reconnect grace period or idle/process-responsiveness timeout.
 
+**App crash or unexpected disconnect:** the app need not send any release
+requests. When its connection closes, the monitor's FD/lifetime binding selects
+the original context and Gateway performs the same cleanup as for an explicit
+client disconnect. Settle accepted work, notify Crypto with DISCONNECTED and
+release the connection's remaining allocations after active access ends. This
+includes allocations whose response never reached the app. Release through
+retained directory/object references rather than reopening the exited process's
+/proc/PID/root path. The application trust assumption does not remove this
+Gateway responsibility. Actual target behavior is verified by the crash and
+disconnect scenarios in section 6.17.
+
 Discard completed responses waiting for the closed route and release their
 response capacity. Later completions from retained old jobs are discarded on
 the same generation check. An explicit client reconnect authenticates a new
@@ -4205,7 +4252,7 @@ sequenceDiagram
     participant T as Thunder IShell
     participant CP as Crypto plugin / ICrypto
     participant B as SharedBufferManager
-    P->>Z: Client closes DEALER or transport fails
+    P->>Z: App exits/crashes, closes DEALER or loses the transport
     Z->>M: DISCONNECTED with FD/lifetime and peer credentials
     M->>REG: Normalize with original activation generation
     REG->>REG: Resolve established transport binding to User-Id
@@ -4230,7 +4277,7 @@ sequenceDiagram
                     C-->>REG: Log cleanup notification failure, no background retry
                 end
             end
-            REG->>B: Finalize allocations whose backend access ended
+            REG->>B: Finalize allocations through retained directory/object references
             B-->>REG: Releasable resources reclaimed
             REG->>REG: Retire private context and binding when retained cleanup references end
         else Backend buffer access remains uncertain
@@ -4706,9 +4753,10 @@ routing and lifecycle work without deferring the ICrypto dependency:
    acquisition/release, errors and nonblocking pool handoff.
 5. Add Gateway-local allocations, atomic execution-time ownership/state
    checks and active-use leases. Reject released or busy buffers without
-   reserving queued uses, deferring release or replaying an operation. Validate
-   the access-protection and abnormal-completion boundaries in Gap 1 with
-   the platform/Crypto implementation.
+   reserving queued uses, deferring release or replaying an operation. Apply
+   the trusted-app cooperation contract and retain directory references for
+   cleanup after app exit. Validate the abnormal-completion boundary in Gap 1
+   with the platform/Crypto implementation.
 6. Integrate AppManager/RuntimeManager authentication only at the marked TODOs,
    once their formal API exists. Add lifecycle event behavior only after a
    separate policy decision.
@@ -4752,7 +4800,8 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L2 disconnect | Trusted FD/lifetime-to-User-Id binding; close one of multiple connections from a PID; delayed/duplicate events and FD/route reuse; disconnect before first request; no unrelated cleanup |
 | L2 guarded responses | Apply the expected transport lifetime to successful and error replies; force route reuse and verify no old response reaches a replacement connection, including before monitor cleanup catches up |
 | L2 buffers | Container-private mapping, cross-connection rejection, release before queued use and rejection during active use; returned Crypto access errors are forwarded; size/region failures and lost replies; a result after a synchronous timeout is discarded |
-| Shared-memory platform validation | Verify app permissions, name identity and namespace/process reuse; validate any required containment of replacement, mutation or truncation in an isolated backend test environment; do not assume each case produces a returned CryptoError |
+| Shared-memory platform validation | Verify app permissions, directory/object reference lifetime and namespace/process reuse under the selected cooperation contract; cleanup does not reopen an exited or reused PID's path |
+| L2 app crash cleanup | Allocate buffers, then terminate the owning app without release RPCs; correlated disconnect settles accepted work, sends DISCONNECTED and reclaims all remaining objects/FDs/quotas through retained directory references; repeat with an active Crypto call and a lost allocation response, without early destruction |
 | L2 lifecycle | Fail every startup stage; stop idle/busy/full-queue runtimes; CONNECTED-in-progress and disconnect races; accepted work settles before DISCONNECTED and buffer release |
 | L2 socket teardown | ROUTER closes on its owner after drain; slow/frozen reader cannot block; REP/PAIR close on stop/ETERM; no final monitor-event dependency; all threads/context retire |
 | L2 reactivation | Repeated activation cycles rebind in host/container views; fresh identities/generations; stale callbacks/events cannot reach new clients; no FD/thread leaks |
@@ -4947,80 +4996,63 @@ plugin's reported and registered versions agree.
 
 ## 7. Gaps to answer
 
-The remaining shared-memory boundary concerns app-controlled object access and
-abnormal completion evidence. Execution-time buffer checks and rejection of
-conflicts are defined in sections 6.10–6.13; preserving queued operations or
-ordering them behind release is not required. FD/lifetime binding, graceful
-plugin stop/reactivation, fresh startup after a crash, authentication-time
-CONNECTED and bounded response handoff with one send attempt are also selected.
-Crypto owns validation, safe memory access and its internal session/key/recovery
-implementation. Gateway forwards returned errors; it does not implement those
-backend responsibilities.
+The application trust model is selected: authenticated apps cooperate with the
+shared-buffer rules and request release when an allocation is no longer needed,
+including after errors. Gateway automatically owns cleanup after a correlated
+unexpected disconnect or app crash; no release RPC is required from a dead app.
+Execution-time conflict rejection, normal release and disconnect/drain are
+specified in sections 6.10–6.14. They are not open design questions.
 
-Section 7.2 lists the remaining API/product choices and future platform
-requirements. Section 7.3 separates integration and verification of selected
-contracts from questions about their design.
+FD/lifetime binding, graceful plugin stop/reactivation, fresh startup after a
+crash, authentication-time CONNECTED and bounded response handoff with one send
+attempt are also selected. Crypto owns safe access, validation and its internal
+session/key/recovery implementation. Gateway forwards returned errors.
 
-### 7.1 Gap 1: Shared-memory access protection and abnormal lifecycle completion
+Section 7.1 retains only the abnormal backend-completion boundary. Section 7.2
+lists remaining API/product choices and future platform requirements. Section
+7.3 separates integration and verification from unresolved design decisions.
 
-**Defined behavior:** Gateway manages allocation ownership and checks the buffer
-when a worker executes. A released or busy buffer causes an immediate error;
-queued operations are not kept alive through release. A normal synchronous
-ICrypto return, including a defined service error, ends that invocation's buffer
-access. Crypto owns its validation and reports detected access/operation errors.
-Release success and conflict behavior are specified in section 6.13.
+### 7.1 Gap 1: Abnormal backend completion during resource cleanup
 
-**Application/container boundary:** with the current app-owned name and writable
-mapping, Gateway cannot prevent direct application writes or filesystem changes.
-The Linux behavior and limits are described in section 6.10. A returned Crypto
-error is forwarded, but not every app mutation necessarily produces such an
-error. Replacing a path can select another object, changing bytes can silently
-alter input, and truncation during mapped access can fault a process.
+**Defined behavior:** a completed synchronous ICrypto invocation, including a
+returned service error, ends its buffer access under the backend contract.
+Gateway can then settle active-use accounting and perform requested release or
+connection cleanup. The trusted app requests release after errors when it knows
+the buffer ID and has a usable connection. An app crash/disconnect transfers that
+responsibility to Gateway's normal drain and cleanup path.
 
-Integration decisions still needed:
+A 15-second synchronous client timeout retires the client request ID without
+cancelling backend work. The Gateway still observes its own ICrypto invocation
+and handles its eventual result. Release can fail while that access remains
+active; disconnect cleanup waits for it. A late response is discarded by the
+client. None of these normal paths needs an additional completion protocol.
 
-- Confirm the supported app trust/cooperation model. Is obeying the no-mutation,
-  no-resize and no-unlink rules sufficient, or must the platform/Crypto contain
-  violations by a buggy or untrusted app?
-- If stronger enforcement is required, how is SharedBuffer.name kept bound to
-  Gateway's allocation when the app controls its directory? Agree the object
-  identity and access-protection mechanism with the platform/backend; Gateway
-  does not add a new ICrypto handle or process isolation scheme implicitly.
-- Verify permissions and namespace/process-instance references for
-  /proc/PID/root access. A missing path may fail normally; it need not be kept
-  accessible merely to make a queued operation succeed. PID or path reuse must
-  not silently redirect an operation or cleanup to an unrelated allocation.
-- For an abnormal remote invocation whose return does not establish that memory
-  access ended, define what backend/platform evidence permits Gateway to finish
-  retained-resource cleanup. This is a lifecycle integration boundary, not a
-  requirement for Gateway to monitor Crypto health or implement its recovery.
+**Remaining lifecycle question:** if an abnormal remote ICrypto invocation
+fails without establishing that backend memory access ended, what existing
+backend/platform evidence permits Gateway to finish retained-resource cleanup?
+A defined CryptoError is already a completed invocation; a communication failure
+with an uncertain remote outcome is the exceptional case. Do not infer safe
+completion merely because the client disconnected or its local wait expired.
 
-The 15-second synchronous client timeout is already defined: it retires the
-client's pending ID without cancelling the backend. A late success or error
-is discarded. This does not create a requirement to prolong that request or
-provide a second callback. The application must not assume that a timeout made
-its mapped bytes safe to overwrite; client-side bookkeeping cannot enforce
-that restriction against arbitrary writes.
+Gateway keeps affected references and private cleanup state until access is
+known to have ended. It does not implement Crypto recovery, health polling,
+operation replay or forced termination of an in-process worker. A non-returning
+backend also remains subject to the platform's lifecycle policy. The required
+failure/termination evidence belongs at the backend/platform integration
+boundary, not in a new app-facing EyilClient API.
 
-**Implementation constraint:** synchronize Gateway records and keep active-use
-references until the call's access has ended. Accept failure of operations
-whose execution-time checks or Crypto calls fail. Never substitute a different
-object to keep a request running, promise an error for every memory mutation or
-claim a late result can be delivered to an already retired client request.
+Trusting the app closes the question about enforcing no-mutation/no-resize/
+no-unlink rules against that app in this version. Normal process exit and PID
+reuse are covered by retained allocation/directory references and target
+validation, not by reopening app-trust or parallel-ordering decisions.
 
-**Lifecycle scope:** ordinary release/conflict handling and plugin drain are
-selected. Uncertain remote completion, process replacement and protection
-against app-side mutation require platform/backend agreement. These questions
-do not reopen Crypto's internal implementation or require a Gateway dependency
-scheduler.
-
-**Coverage affected:** AC1.8–AC1.10.
-**TODOs:** SHM-IDENTITY, SHM-COMPLETION, SHM-MUTATION.
+**Coverage affected:** AC1.8–AC1.10 on abnormal backend failures.
+**TODO:** SHM-COMPLETION.
 
 ### 7.2 Remaining API and platform decisions
 
-These items complement the shared-memory integration boundary and cover
-client API and product decisions. Future platform lifecycle requirements do not
+These items complement the abnormal-completion boundary and cover client API
+and product decisions. Future platform lifecycle requirements do not
 block the selected initial explicit-close/fresh-connect and plugin-drain
 contracts.
 
