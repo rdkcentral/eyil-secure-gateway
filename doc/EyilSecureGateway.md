@@ -23,8 +23,8 @@ limitations under the License.
 
 This document defines the EyilClient and EyilGateway architecture: transport,
 concurrent request coordination, connection contexts, request execution and
-gateway-owned shared memory. It also records
-the integration boundaries and unanswered questions that must not be replaced
+gateway-owned shared memory. It also records the integration boundaries and
+unanswered questions that must not be replaced
 by assumptions in code.
 
 Eyil Secure Gateway is an open-source RDK component intended for the
@@ -82,9 +82,10 @@ worker pool. Workers are reused across jobs; available workers, backend
 capacity and resource dependencies determine execution concurrency.
 
 Gateway activation/deactivation is required independently of future app
-lifecycle integration. Deactivation blocks new admissions, completes all
-already accepted requests, closes client connections, stops ZeroMQ and joins
-owned threads before destruction. Reactivation and startup after a crash create
+lifecycle integration. Deactivation blocks new admissions, settles already
+accepted requests under their dispatch deadlines and drain rules, closes client
+connections, stops ZeroMQ and joins owned threads before destruction.
+Reactivation and startup after a crash create
 fresh runtime state; old connections and requests are not restored. Section
 6.16 defines the sequence.
 
@@ -124,6 +125,26 @@ its process after finishing all operations and callbacks; it owns preparation
 for that freeze. ZeroMQ heartbeats are disabled on both ends. See section 5.5
 for socket settings and sections 5.14 and 6.14 for lifecycle assumptions.
 
+The supplied ACs do not define automatic reconnect, retry or session-restoration
+behavior. This is a **missing lifecycle requirement**, tracked as
+TODO(RECONNECT-LIFECYCLE) in section 7.3. The current delivery follows the agreed
+explicit-reconnect policy while the broader platform lifecycle requirements
+remain to be specified.
+
+The agreed design makes connection loss terminal for that Client
+connection: disable automatic reconnect, retire pending client work and discard
+undelivered messages. The app closes the old Client and explicitly connects again
+with fresh client and Gateway session state. No queued request, response, buffer
+ID or session key handle is transferred to the new connection. Section 5.14
+defines cleanup and ownership.
+
+Initial connection success or failure is reported only by the synchronous
+client_connect return value. A later unexpected connection loss invokes
+CLIENT_CONNECTION_LOST once through the registered handler, subject to the
+explicit-close cutoff. Explicit disconnect emits no connection callback.
+CLIENT_CONNECTION_RESTORED and CLIENT_CONNECTION_TERMINATED are not emitted by
+this lifecycle. Section 5.5 defines the callback contract.
+
 The ACs require socket monitoring and cleanup on disconnect. They do
 not require application heartbeat RPCs, an inactivity watchdog or ZeroMQ
 transport heartbeats. EyilClient and Gateway have transport heartbeats
@@ -134,7 +155,7 @@ disabled and contain no custom heartbeat or inactivity-watchdog logic.
 | ID | Acceptance criterion |
 | --- | --- |
 | AC3.1 | Firebolt Crypto uses EyilClient to route app requests to Gateway and ultimately the external Crypto backend. |
-| AC3.2 | Firebolt Crypto serializes/deserializes service-specific Crypto payloads using the agreed Protobuf definitions. EyilClient handles the outer RPC envelope, owns request IDs and sets schema version 1. |
+| AC3.2 | Firebolt Crypto serializes CryptoRequest into RpcRequest.payload, selects RPC_SERVICE_CRYPTO and passes the serialized envelope to the byte API. EyilClient assigns request IDs and schema version 1, validates/correlates RpcResponse and returns its bytes; Firebolt Crypto inspects RpcStatus and deserializes CryptoResponse. |
 
 Firebolt Crypto and the real Crypto plugin are separate deliverables. Their
 presence in diagrams does not add their implementation to this repository.
@@ -374,6 +395,7 @@ carry local ClientResult errors.
 | client_register_notifications is called | CLIENT_NOT_IMPLEMENTED | Reserved for future support; no handler is stored or invoked |
 | client_connect receives a valid, already allocated Client handle in the caller's slot | CLIENT_ALREADY_CONNECTED | Preserve the existing handle and connection state; create no new connection and invoke no callback |
 | Submission without a usable connection | CLIENT_NOT_CONNECTED | No response |
+| Explicit client_disconnect wins while a synchronous result or an unaccepted async send is pending | CLIENT_NOT_CONNECTED | Clear synchronous outputs, cancel unsent work and retire pending IDs; no async response callback |
 | Authentication explicitly rejected | CLIENT_AUTH_FAILED | No response |
 | Detected allocation failure during connect, sync processing or async submission before libzmq acceptance, including queue insertion | CLIENT_OUT_OF_MEMORY | Roll back local state; sync outputs remain NULL/0 and async submission invokes no response callback |
 | Connect, synchronous request or async send-submission deadline expires | CLIENT_TIMEOUT | No handle on connect failure; no synchronous response on timeout; async send failure invokes no response callback. A synchronous timeout may leave remote execution in progress |
@@ -383,7 +405,8 @@ carry local ClientResult errors.
 For synchronous byte responses, every local error produces `response_data == NULL` and
 `response_size == 0`. For string responses, it produces `response_data == NULL`.
 A valid Gateway error response, including RPC_STATUS_INTERNAL, is still a
-received RPC response: return CLIENT_OK with its bytes and preserve RpcStatus.
+received RPC response: byte APIs return CLIENT_OK with its bytes and preserve
+RpcStatus.
 Do not turn a local failure into a fabricated Gateway RpcResponse or CryptoError.
 
 Byte APIs expose the complete RpcResponse for the caller to inspect. String
@@ -423,19 +446,56 @@ the operation automatically or claim that its shared buffer is safe to reuse.
 | --- | --- |
 | UNSPECIFIED (0) | Missing/unset result; reject as an invalid response |
 | OK (1) | Successfully routed and processed at the Gateway layer |
-| INVALID_REQUEST (2) | Parsed envelope/service request violates the agreed structure |
+| INVALID_REQUEST (2) | Parsed outer RPC envelope violates the agreed structure; service-payload rejections use the generic error below |
 | UNSUPPORTED_SCHEMA (3) | Unsupported envelope schema_version |
 | UNSUPPORTED_SERVICE (4) | Unknown or unregistered RPC service |
-| MALFORMED_REQUEST (5) | Cannot decode the expected message/framing |
+| MALFORMED_REQUEST (5) | Cannot decode the outer RPC envelope or its framing; service-payload decoding failures use the generic error below |
 | INVALID_CONNECTION (6) | Missing, stale or inadmissible authenticated connection context |
-| INTERNAL (7) | Gateway failure, including full 1,024-entry waiting queue, 10-second dispatch-wait expiry, allocation failure, null ICrypto lookup or failed invocation when a correlated reply is possible |
+| INTERNAL (7) | Generic Gateway rejection or execution failure, including the cases below, full 1,024-entry waiting queue, 10-second dispatch-wait expiry, allocation failure, null ICrypto lookup or failed invocation when a correlated reply is possible |
 
-Exact Gateway service-validation versus CryptoError mappings and malformed-message
-correlation remain TODO(ERROR-MAPPING). A null ICrypto lookup or failed invocation
-uses RPC_STATUS_INTERNAL; a successfully invoked Crypto method preserves its
-CryptoError in the service response.
-Without a trustworthy request ID or route, do not fabricate a correlated reply.
-Transport/authentication failures can occur before any RpcResponse is possible.
+#### Generic Gateway rejection and explicit error logging
+
+Use the existing **RPC_STATUS_INTERNAL** for duplicate request IDs, invalid
+service payloads, shared-buffer quota failures and rejected operations involving
+a busy or release-pending buffer. No additional wire error codes are needed.
+The Gateway must log the specific cause at **ERROR** severity where the
+rejection is detected, independently of whether an error response can be sent.
+
+| Rejection | RPC result when safely correlatable | Required log detail |
+| --- | --- | --- |
+| Duplicate request ID | RPC_STATUS_INTERNAL | Duplicate ID and the original request's state |
+| Invalid service payload | RPC_STATUS_INTERNAL | Decode failure, operation/oneof mismatch, invalid field, enum, range or buffer reference, as applicable |
+| Shared-buffer quota exceeded | RPC_STATUS_INTERNAL | Requested size/count, current usage, applicable limit and whether the quota is per connection or global |
+| Operation rejected because a buffer is release-pending | RPC_STATUS_INTERNAL | Buffer ID and release state |
+| Operation rejected because a buffer is busy | RPC_STATUS_INTERNAL | Buffer ID and reserved/active-use state |
+
+Include the connection token/generation, request_id, service and operation when
+known. Record a specific reason such as `duplicate_request_id`,
+`invalid_service_payload`, `buffer_quota_exceeded`, `buffer_release_pending` or
+`buffer_busy`; these are local diagnostics, not new protocol fields. Do not log
+request payloads, key material or shared-memory contents. Rejected work must not
+invoke Crypto, overwrite another request's state or invalidate active buffer
+leases. Roll back partially reserved resources.
+
+Use an empty service payload for a Gateway rejection; do not fabricate a
+CryptoError. A successfully invoked Crypto method still preserves its actual
+CryptoError in the service response. Existing outer-envelope, schema, service
+and connection status mappings remain as listed above.
+
+Only send an error when the request ID and original authenticated route permit
+unambiguous correlation. A duplicate ID still owned by an accepted request must
+not produce a second competing response under that ID: log and discard the
+duplicate, leave the original job/completion intact and never dispatch a second
+operation. Likewise, log and discard malformed input without a trustworthy ID
+or route. The generic status does not justify inventing a request ID or replying
+to a replacement connection.
+
+Error replies follow the same single nonblocking send-attempt rule as successful
+responses. Log any delivery failure separately and drop the reply without a
+retry. A generic failure does not acknowledge buffer release or prove that an
+earlier operation finished. Buffer admission, deferred release and completion
+timing remain resource-lifecycle questions; their rejection status and logging
+are settled here.
 
 ### 4.3 Protocol capabilities and limitations
 
@@ -541,6 +601,13 @@ The library does not:
 | Monitor collector | Read/decode PAIR events and hand them to connection-state handling | I/O owner performs these monitor-thread duties in the proposed design; a separate worker remains an AC wording decision |
 | Response storage | Independently allocated byte/string result | Ownership passes to application, freed with client_free_response |
 
+Each request entry point retains a scoped live-call reference before accessing
+Client state or preparing input, and releases it on every return path. The guard
+covers validation, copying/parsing, queue admission, waits and final response
+preparation. Admission and callback claims are serialized against explicit
+disconnect. Section 5.13 defines the caller's handle-lifetime obligations and
+the cleanup barrier; a raw Client pointer alone is not a lifetime reference.
+
 ```mermaid
 flowchart LR
     A["Application / Firebolt Crypto<br/>Application threads"]
@@ -559,7 +626,7 @@ flowchart LR
         SYNC["Per-call synchronous waiter"]
         SEND_RESULT["Per-call async send-result waiter"]
         CB["Async response callback<br/>Client + owned response"]
-        HANDLERS["Connection event handler"]
+        HANDLERS["Connection event handler<br/>Later unexpected loss only"]
         EVENTS["libzmq internal monitor sender<br/>DEALER connection events"]
         M["PAIR monitor receiver<br/>Polled and decoded by the I/O owner<br/>Same monitor-event collection duties"]
         MN["Design note - AC confirmation<br/>PAIR receiver + I/O owner cover monitor-thread duties<br/>No separate monitor worker in this proposal"]
@@ -576,7 +643,7 @@ flowchart LR
         IO -- "Send accepted or submission failed" --> SEND_RESULT
         P --> SYNC
         P --> CB
-        IO -- "Connection state events" --> HANDLERS
+        IO -- "CLIENT_CONNECTION_LOST once" --> HANDLERS
         D -. "Monitoring enabled" .-> EVENTS
         EVENTS -- "Internal inproc event channel" --> M
         M -- "Connection state events" --> IO
@@ -656,12 +723,12 @@ independently mutate the pending-request map.
 | --- | --- |
 | Set up event collection before connecting | The DEALER owner enables monitoring at the unique client monitor endpoint; the collector creates/connects its PAIR receiver in the same ZMQ context |
 | Receive and decode complete monitor messages | Poll PAIR alongside DEALER and the submission wakeup; validate the event frames, event value and endpoint for the configured monitor API version |
-| Establish handshake readiness | On HANDSHAKE_SUCCEEDED, publish READY and wake client_connect; CONNECTED or connection-retry events alone do not establish readiness |
-| Report initial connection/authentication failures | Decode failure details and wake the connect waiter with the exact ClientResult from section 5.5; retain the distinction between authentication denial and transport/protocol failure |
-| Handle loss of an established connection | Mark the connection unusable, stop admission, fail unresolved sync/send-result waiters with CLIENT_COMMUNICATION_ERROR, retire accepted async response records and emit the applicable connection event |
-| Handle later state transitions without duplicates | Serialize state changes, ignore events belonging to a stopped runtime and issue connection callbacks only for relevant transitions; actual reconnect behavior remains CONNECTION-LIFETIME |
+| Establish handshake readiness | On HANDSHAKE_SUCCEEDED, publish READY and wake client_connect without an application callback; CONNECTED alone does not establish readiness |
+| Report initial connection/authentication failures | Wake the connect waiter with the exact ClientResult from section 5.5, without a callback; distinguish authentication denial from transport/protocol failure |
+| Handle loss of an established connection | Mark the connection unusable, stop admission, fail unresolved sync/send-result waiters with CLIENT_COMMUNICATION_ERROR, retire accepted async response records and report CLIENT_CONNECTION_LOST once if callback admission remains open |
+| Handle later state transitions without duplicates | Serialize the terminal loss transition, retire the old generation once and ignore later events; explicit reconnect creates a new Client and session as specified in section 5.14 |
 | Keep application callbacks and request retirement coordinated | Invoke connection handlers without internal locks, resolve each active API waiter once and retire affected async response records once; no synthetic async error callback |
-| Handle monitor failure and orderly stop | Treat unexpected collector failure as a runtime error; during requested shutdown, wake the poller, stop monitoring and close PAIR on its owner without waiting indefinitely for another event |
+| Handle monitor failure and orderly stop | Treat unexpected collector failure as a runtime error; during requested shutdown, suppress intentional-close callbacks, wake the poller, stop monitoring and close PAIR on its owner without waiting indefinitely for another event |
 
 The selected monitor events and their framing come from the
 [ZeroMQ monitor API](https://libzmq.readthedocs.io/en/latest/zmq_socket_monitor.html).
@@ -722,7 +789,7 @@ sequenceDiagram
     participant P as Pending map
     participant Z as DEALER
     A->>API: Any of the four request methods
-    API->>API: Validate and allocate owned input, request record and waiter
+    API->>API: Retain live Client for the call, validate and allocate owned input, record and waiter
     Note over API,W: Initialize mode, generation and deadline before queue publication
     alt Preparation allocation fails
         API->>API: Release partial state
@@ -881,8 +948,9 @@ required by this contract. See the
 [ZeroMQ send contract](https://libzmq.readthedocs.io/en/latest/zmq_send.html).
 
 The string method accepts the same NUL-terminated text as its synchronous
-counterpart. Both asynchronous request methods are required; callers do not
-encode either input or callback output.
+counterpart, without caller encoding. Both asynchronous request methods are
+required. Byte-method callers continue to supply and interpret serialized
+Protobuf; the plain-text contract applies to the string methods.
 
 #### Async signatures and response ownership
 
@@ -965,11 +1033,13 @@ a shared buffer safe to reuse.
 - Callbacks must return promptly so other sends, replies, monitor events and
   active deadlines can progress.
 
-These rules do not depend on AppManager or the Crypto backend. Connection-handler
-lifetime and initial callback timing remain TODO(CLIENT-CALLBACKS). Explicit
-disconnect must resolve active sync/send-result waiters, retire async response
-records and quiesce callbacks. Its local-close return mapping and shutdown
-ordering remain TODO(CLIENT-SHUTDOWN).
+These rules do not depend on AppManager or the Crypto backend. Explicit
+disconnect closes callback admission, resolves unresolved sync/send-result
+waiters with CLIENT_NOT_CONNECTED, retires async response records and waits for
+already-claimed callbacks and live calls before destroying the handle. Section
+5.13 defines the complete ordering. Section 5.5 defines the connection-handler
+contract: startup uses the synchronous result, later unexpected loss emits
+CLIENT_CONNECTION_LOST and explicit close emits no connection callback.
 
 ### 5.5 client_connect()
 
@@ -993,8 +1063,10 @@ CLIENT_ALREADY_CONNECTED is local handle-ownership validation, not a Gateway
 rejection or a restriction to one connection per process, UID or app. A separate
 NULL-initialized slot may create another independent Client. An existing handle
 still occupies its slot after transport loss; calling client_connect with it is
-not a reconnect API and returns CLIENT_ALREADY_CONNECTED. Recovery of that
-existing connection remains part of the separate reconnect contract.
+not a reconnect API and returns CLIENT_ALREADY_CONNECTED. To reconnect, call
+client_disconnect on the old handle from an application thread, reset the slot
+to NULL and call client_connect again. The new call creates a fresh runtime and
+authenticated session; the old handle never returns to READY after loss.
 
 The caller must serialize access to the same handle slot, including concurrent
 connect attempts. Uninitialized, fabricated or destroyed handles are invalid
@@ -1015,6 +1087,59 @@ The startup coordinator waits for handshake success or a terminal failure
 within a **15-second connect deadline**. Deadline expiry returns CLIENT_TIMEOUT;
 explicit authentication rejection returns CLIENT_AUTH_FAILED. Section 5.14
 defines the common duration constant and its application to each timed wait.
+
+#### Connection callback contract
+
+client_connect is synchronous. Its return value reports the initial connection
+outcome; the connection handler reports only a later unexpected loss.
+
+| Situation | API result | Connection callback |
+| --- | --- | --- |
+| Initial setup and authentication succeed | CLIENT_OK with a valid Client handle | None |
+| Initial connection attempt fails | Exact ClientResult, including CLIENT_AUTH_FAILED for an explicit authentication denial; output remains NULL | None |
+| An established connection is lost unexpectedly | Retire pending work using section 5.14; later request submissions return CLIENT_NOT_CONNECTED | CLIENT_CONNECTION_LOST once, if the registered handler can be claimed before explicit close shuts callback admission |
+| Application calls client_disconnect | Synchronous local cleanup, void return | None for the intentional close; an already-claimed loss callback may finish before disconnect returns |
+
+CLIENT_CONNECTION_RESTORED and CLIENT_CONNECTION_TERMINATED are unused in this
+design. A fresh explicit client_connect reports its own success or failure
+through its return value. Authentication denial occurs during that call's
+handshake and returns CLIENT_AUTH_FAILED; it does not generate TERMINATED.
+An established socket closing does not by itself identify an authentication
+failure. Automatic reconnect and in-place reauthentication are not part of
+this lifecycle. Any future use of RESTORED or TERMINATED requires an explicit
+lifecycle contract under TODO(RECONNECT-LIFECYCLE); the enum declarations alone
+do not define that behavior.
+
+Keep connection-callback delivery disabled while the handle is unpublished.
+Serialize successful handle publication with enabling loss-callback delivery;
+retain a loss detected after startup success until it can be delivered with the
+published handle. Failed startup never exposes an incomplete Client through a
+callback. A genuine loss immediately after readiness can race the calling
+thread's resumption; it is a distinct loss event, not a startup-success callback.
+Section 5.13 defines callback claims and quiescence during explicit close.
+
+#### Socket settings for a fresh connection
+
+Set these options on each new client DEALER before zmq_connect:
+
+| Option | Required setting | Purpose |
+| --- | --- | --- |
+| ZMQ_RECONNECT_IVL | -1 | Disable libzmq automatic reconnection |
+| ZMQ_IMMEDIATE | 1 | Queue sends only on completed connections |
+| ZMQ_LINGER | 0 | Discard unsent transport messages when closing the socket |
+
+Also set zero linger on the client monitor socket. Retain the library's
+HANDSHAKE_SUCCEEDED admission barrier and nonblocking sends; IMMEDIATE does not
+replace readiness validation. Closing the old socket is required to retire its
+transport queues. These options do not cancel messages already received by
+Gateway or prove remote completion. See the
+[ZeroMQ socket options](https://libzmq.readthedocs.io/en/latest/zmq_setsockopt.html).
+
+The 15-second connect deadline still bounds readiness waiting for a new attempt.
+It does not create an automatic retry loop. If startup fails, roll back that
+attempt; another attempt requires a new explicit client_connect call. A terminal
+failure returns its mapped error promptly; an attempt still pending at the
+deadline returns CLIENT_TIMEOUT.
 
 #### Disabled ZeroMQ heartbeats
 
@@ -1060,6 +1185,7 @@ sequenceDiagram
     participant GW as Gateway libzmq / ROUTER
     participant G as Gateway ZAP handler
     Note over A,API: Caller initializes handle to NULL and serializes access to its slot
+    Note over API,IO: Startup success and failure use the return value, no initial connection callback
     A->>API: client_connect(Client handle slot, connectionHandler)
     API->>API: Validate slot, allocate only if valid and empty
     alt Output pointer is NULL
@@ -1081,17 +1207,17 @@ sequenceDiagram
             API->>C: Wait until startup result is terminal or deadline expires
             Note over API,IO: Caller waits, I/O owner continues running
             IO->>Z: Create context and DEALER
-            IO->>Z: Set PLAIN credentials, bounds and finite linger
+            IO->>Z: Set PLAIN credentials, bounds, RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0
             IO->>Z: Set ZMQ_HEARTBEAT_IVL, TIMEOUT and TTL to 0 before connect
             Note over IO,GW: Transport heartbeats disabled on DEALER and ROUTER
             IO->>Z: Enable DEALER monitoring at the unique inproc endpoint
-            IO->>Z: Create PAIR receiver and connect to that monitor endpoint
+            IO->>Z: Create PAIR receiver with LINGER=0 and connect to that monitor endpoint
             opt Local setup succeeded
                 IO->>Z: zmq_connect(ipc:///tmp/app-eyil-gateway.ipc)
             end
             alt Local setup or synchronous zmq_connect call fails
                 IO->>C: Publish FAILED with CLIENT_OUT_OF_MEMORY or CLIENT_COMMUNICATION_ERROR
-                C->>C: Notify waiting caller immediately
+                C->>C: Wake connect waiter immediately, no application callback
             else Setup succeeds and connection attempt starts
                 opt Gateway reachable and handshake progresses
                     Z->>GW: UDS connection and PLAIN handshake
@@ -1100,18 +1226,18 @@ sequenceDiagram
                     G-->>GW: Status 200 and User-Id after setup, or failure status
                     GW-->>Z: Handshake result
                 end
-                Note over IO,Z: CONNECTED, CONNECT_DELAYED and CONNECT_RETRIED do not establish readiness
+                Note over IO,Z: CONNECTED and CONNECT_DELAYED do not establish readiness, no automatic reconnect
                 alt ZMQ_EVENT_HANDSHAKE_SUCCEEDED before deadline
                     Z-->>IO: Handshake success through monitor PAIR
-                    IO->>C: Publish READY with CLIENT_OK and notify
+                    IO->>C: Publish READY with CLIENT_OK and wake connect waiter
                 else ZMQ_EVENT_HANDSHAKE_FAILED_AUTH with ZAP status 400
                     Z-->>IO: Explicit authentication rejection
-                    IO->>C: Publish FAILED with CLIENT_AUTH_FAILED and notify
+                    IO->>C: Publish FAILED with CLIENT_AUTH_FAILED and wake connect waiter
                 else Startup monitor or event-processing allocation fails
-                    IO->>C: Publish FAILED with CLIENT_OUT_OF_MEMORY and notify
+                    IO->>C: Publish FAILED with CLIENT_OUT_OF_MEMORY and wake connect waiter
                 else Terminal protocol, transport or authentication-service failure
                     Z-->>IO: Failure event, exact mapping in table below
-                    IO->>C: Publish FAILED with CLIENT_COMMUNICATION_ERROR and notify
+                    IO->>C: Publish FAILED with CLIENT_COMMUNICATION_ERROR and wake connect waiter
                 else Connect deadline expires while still PENDING
                     C->>C: Publish TIMED_OUT with CLIENT_TIMEOUT
                     C->>IO: Wake and abort pending connection attempt
@@ -1120,15 +1246,15 @@ sequenceDiagram
         end
         C-->>API: One terminal ClientResult
         alt Result is CLIENT_OK
-            API->>API: Publish initialized Client handle
-            API-->>A: CLIENT_OK, valid Client
+            API->>C: Publish initialized Client handle and enable later loss-callback delivery
+            API-->>A: CLIENT_OK, valid Client, no initial callback
         else Result is an error
             opt Serving thread was started
                 API->>IO: Set existing stop flag and signal wakeup, owner closes created sockets
                 IO-->>API: Serving loop exits
             end
             API->>API: Join started threads, terminate context, free runtime without new queue allocation
-            API-->>A: Exact ClientResult, out Client NULL
+            API-->>A: Exact ClientResult, out Client NULL, no callback
         end
     end
 ```
@@ -1148,7 +1274,7 @@ started and does not allocate a shutdown action.
 | Client/runtime/serving-thread allocation fails, including an explicit ENOMEM from local setup or startup event processing | Stop/roll back any initialized resources | CLIENT_OUT_OF_MEMORY, output NULL |
 | Non-memory context/socket/monitor/thread setup failure, or synchronous zmq_connect error | Publish FAILED and stop the attempt | CLIENT_COMMUNICATION_ERROR, output NULL |
 | ZMQ_EVENT_CONNECTED | Keep PENDING; transport connection alone is insufficient | No return yet |
-| ZMQ_EVENT_CONNECT_DELAYED or ZMQ_EVENT_CONNECT_RETRIED | Keep PENDING within the original deadline | No return yet |
+| ZMQ_EVENT_CONNECT_DELAYED | Keep PENDING within the original deadline; do not create another connection attempt | No return yet |
 | ZMQ_EVENT_HANDSHAKE_SUCCEEDED while PENDING and before the deadline | Publish READY and wake caller | CLIENT_OK, valid output handle |
 | ZMQ_EVENT_HANDSHAKE_FAILED_AUTH with ZAP status 400 | Publish FAILED and wake caller immediately | CLIENT_AUTH_FAILED, output NULL |
 | ZMQ_EVENT_HANDSHAKE_FAILED_AUTH with ZAP status 300 or 500 | End this connect attempt as an authentication-service failure | CLIENT_COMMUNICATION_ERROR, output NULL |
@@ -1156,7 +1282,7 @@ started and does not allocate a shutdown action.
 | ZMQ_EVENT_HANDSHAKE_FAILED_NO_DETAIL | Publish FAILED and wake caller immediately | CLIENT_COMMUNICATION_ERROR, output NULL |
 | ZMQ_EVENT_DISCONNECTED before initial readiness | End this connect attempt and wake caller | CLIENT_COMMUNICATION_ERROR, output NULL |
 | Monitor/receive processing terminates unexpectedly for a non-memory reason while startup is PENDING | Publish FAILED and wake caller | CLIENT_COMMUNICATION_ERROR, output NULL |
-| Absolute connection deadline expires while startup is PENDING, including an unavailable endpoint with delayed/retried connects | Publish TIMED_OUT; stop and clean up the attempt | CLIENT_TIMEOUT, output NULL |
+| Absolute connection deadline expires while startup is PENDING, including an unavailable endpoint without a terminal failure event | Publish TIMED_OUT; stop and clean up the attempt | CLIENT_TIMEOUT, output NULL |
 
 The monitor's HANDSHAKE_FAILED_AUTH event carries the ZAP status: 400 is an
 authentication denial, 300 a temporary authentication-service error and 500 an
@@ -1176,20 +1302,20 @@ The startup coordinator stores a terminal result, rather than only a
 absolute monotonic deadline. Success and explicit failures publish the result
 and notify the waiter; the timeout path publishes CLIENT_TIMEOUT. Synchronize
 these transitions so one attempt has one final outcome. A late handshake event
-cannot revive a timed-out or failed attempt, and retries do not restart its
-deadline. Reconnect behavior after a previously successful client_connect
-remains a separate lifecycle decision.
+cannot revive a timed-out or failed attempt or restart its deadline. After a
+previously successful client_connect, connection loss is terminal and recovery
+uses a new explicit connection as defined in section 5.14.
 
 On failure of a new connection attempt from an empty slot, keep the output
 handle NULL, close created sockets on their owner, stop/join started threads,
 terminate the owned context and free the incomplete handle before returning.
 CLIENT_ALREADY_CONNECTED is an earlier rejection: preserve the existing handle
 and do not run startup rollback against it. The deadline bounds the readiness
-wait; safe rollback still has to finish. Do not expose an incomplete handle through
-application callbacks on a failed attempt. Initial connection-callback timing
-around successful handle publication, including whether the first handshake
-emits RESTORED, remains CLIENT-CALLBACKS; it does not change the agreed readiness
-or error return contract.
+wait; safe rollback still has to finish. Return every startup outcome through
+client_connect alone, without a connection callback. Handshake success does
+not emit RESTORED, and authentication denial does not emit TERMINATED. Only a
+separate unexpected loss after startup success can enter the loss-callback path
+defined above.
 
 ### 5.6 client_send_request()
 
@@ -1213,6 +1339,7 @@ sequenceDiagram
     participant W as Retained response waiter
     participant G as Gateway ROUTER
     A->>API: Binary request, out response, out size
+    Note over API,C: Validate Client pointer, retain a scoped live-call guard before input work, release it on every return
     API->>API: Clear supplied outputs, validate arguments and calling thread
     opt Arguments valid and current thread may block
         API->>API: Parse RpcRequest into owned storage, validate envelope limits
@@ -1223,7 +1350,7 @@ sequenceDiagram
         API->>API: Free partial request storage
         API-->>A: CLIENT_OUT_OF_MEMORY, NULL response and size 0
     else Valid prepared request
-        API->>C: Retain live call and check connection readiness
+        API->>C: Check connection readiness under the retained live-call guard
         alt No usable connection
             C-->>API: CLIENT_NOT_CONNECTED
             API->>API: Release temporary state and call reference
@@ -1254,6 +1381,8 @@ sequenceDiagram
                         IO->>IO: Retire record and free temporary response storage
                         IO->>W: Publish CLIENT_OUT_OF_MEMORY, NULL and 0
                         Note over IO,G: Request may have executed, do not replay
+                    else Explicit disconnect wins before result completion
+                        IO->>W: Publish CLIENT_NOT_CONNECTED, NULL and 0
                     else Deadline, connection loss or other local error
                         IO->>W: Publish exact ClientResult, NULL and 0
                     end
@@ -1289,6 +1418,11 @@ mutation and monitor processing belong to the I/O owner. A record identifies
 whether its caller waits for a synchronous result or only for async send
 acceptance. Sync requests retain their total deadline after send; async requests
 disarm their submission deadline once libzmq accepts the message.
+
+Explicit local close uses CLIENT_NOT_CONNECTED for still-pending API results;
+unexpected transport loss uses CLIENT_COMMUNICATION_ERROR. Preserve any result
+that already won completion. No callback or send attempt can be newly admitted
+after the local-close cutoff; section 5.13 covers an attempt already in progress.
 
 ```mermaid
 sequenceDiagram
@@ -1360,12 +1494,18 @@ sequenceDiagram
                     IO->>P: Retire record once
                     Note over IO,H: Sync gets CLIENT_COMMUNICATION_ERROR, async records diagnostics without callback
                 else Valid response ready before any applicable deadline
-                    IO->>P: Claim response and retire record once
-                    alt Synchronous request
-                        IO-->>W: CLIENT_OK and owned response
-                    else Async request
-                        IO->>IO: Release internal locks
-                        IO-->>H: handler(Client, owned response[, size])
+                    IO->>P: Try claiming final delivery against local close and any deadline
+                    alt Claim succeeds
+                        IO->>P: Retire record and accounting once
+                        alt Synchronous request
+                            IO-->>W: CLIENT_OK and owned final byte/string response
+                        else Async request
+                            IO->>IO: Release internal locks
+                            IO-->>H: handler(Client, owned response[, size])
+                        end
+                    else Timeout or close already won
+                        IO->>P: Retire record and accounting once
+                        IO->>IO: Free uncommitted response, preserve winning result, no callback
                     end
                 end
             end
@@ -1399,7 +1539,7 @@ Implementation rules:
   path. Do not use a partly parsed ID to fail an unrelated request. Complete
   cleanup with retained state, without allocating another control action.
 - Uncorrelatable malformed input makes the connection unusable under the
-  proposed client policy. Resolve pending synchronous and not-yet-accepted send
+  terminal-loss policy. Resolve pending synchronous and not-yet-accepted send
   waiters with CLIENT_COMMUNICATION_ERROR. Retire accepted async response
   records and report connection loss through the connection-state path.
 - A parsed nonzero ID absent from the pending map is discarded. It may be a
@@ -1418,14 +1558,18 @@ Implementation rules:
   contract; they do not return the serialized binary envelope as a C string.
   If response-text preparation fails, apply the same sync-error/async-retirement
   distinction. Never truncate binary data at an embedded NUL to report success.
+- Prepare the final byte or string result before claiming synchronous success
+  or an async callback. Serialize that claim with explicit close and any active
+  synchronous deadline. If another terminal path wins during preparation, free
+  the uncommitted result; a received envelope alone does not commit public success.
 - Retire request accounting once and free temporary Protobuf/ZMQ storage on
   every terminal path. Late replies cannot revive a retired request.
 
 The connection-wide handling of an uncorrelatable malformed response or decode
-allocation failure is a client recovery policy; reconnect behavior for an
-unusable connection remains separate. An allocation failure after trustworthy
-correlation affects only that request. No async response deadline or synthetic
-local-error RpcResponse is introduced.
+allocation failure follows the terminal cleanup path in section 5.14, preserving
+the error mappings above. Recovery requires explicit close and a fresh connect.
+An allocation failure after trustworthy correlation affects only that request.
+No async response deadline or synthetic local-error RpcResponse is introduced.
 
 #### Synchronous timeout, disconnect and response races
 
@@ -1450,6 +1594,9 @@ sequenceDiagram
     else Connection is lost first
         IO->>R: TryComplete(CLIENT_COMMUNICATION_ERROR, NULL, 0)
         R-->>A: Wake with CLIENT_COMMUNICATION_ERROR
+    else Explicit client_disconnect wins first
+        IO->>R: TryComplete(CLIENT_NOT_CONNECTED, NULL, 0)
+        R-->>A: Wake with CLIENT_NOT_CONNECTED and release live-call guard on return
     end
     IO->>IO: Retire pending/unsent state and accounting exactly once
     opt Late or duplicate response arrives
@@ -1477,9 +1624,9 @@ the caller inspects that status and eventually calls client_free_response.
 
 The 15-second synchronous deadline is selected. The queue and pending map grow
 dynamically; detected allocation failures use CLIENT_OUT_OF_MEMORY, with no
-local queue-full result. Per-message size bounds and explicit close/reconnect
-behavior remain under RESOURCE-LIMITS, CLIENT-SHUTDOWN and CONNECTION-LIFETIME
-in section 7.3.
+local queue-full result. Section 5.14 defines terminal loss and explicit reconnect.
+Section 5.13 defines explicit-close results and callback quiescence. Per-message
+size bounds remain under RESOURCE-LIMITS in section 7.3.
 
 ### 5.7 client_send_request_async()
 
@@ -1495,6 +1642,7 @@ sequenceDiagram
     participant Z as Client libzmq / DEALER
     participant G as Gateway
     A->>API: Client, serialized request, size and response handler
+    Note over API,IO: Validate Client pointer, retain a scoped live-call guard before input work, release it on every return
     API->>API: Validate caller thread, arguments, envelope and connection
     alt Invalid arguments, envelope, handler or caller thread
         API-->>A: CLIENT_INVALID_ARGUMENT, no callback
@@ -1522,7 +1670,10 @@ sequenceDiagram
                     IO->>IO: Retry eligible work within original send deadline
                     Note over IO,Z: Other responses and monitor events continue
                 end
-                alt Send fails or deadline expires before acceptance
+                alt Explicit disconnect wins before send acceptance
+                    IO->>IO: Retire unsent state, prevent later send
+                    IO->>W: Publish CLIENT_NOT_CONNECTED, no response callback
+                else Send fails or deadline expires before acceptance
                     IO->>IO: Retire unsent state, prevent later send
                     IO->>W: Publish CLIENT_OUT_OF_MEMORY, CLIENT_COMMUNICATION_ERROR or CLIENT_TIMEOUT
                 else libzmq accepts the message
@@ -1530,6 +1681,9 @@ sequenceDiagram
                     IO->>W: Publish immutable CLIENT_OK once
                     Z->>G: Transport queued request over UDS
                 end
+            else Explicit disconnect wins before sending
+                IO->>IO: Retire unsent state
+                IO->>W: Publish CLIENT_NOT_CONNECTED
             else Deadline expires or connection is lost before send
                 IO->>IO: Retire unsent state
                 IO->>W: Publish CLIENT_TIMEOUT or CLIENT_COMMUNICATION_ERROR
@@ -1538,10 +1692,10 @@ sequenceDiagram
             API-->>A: ClientResult, no response wait
             opt Send accepted with CLIENT_OK
                 Note over A,G: No response timeout, return does not confirm UDS delivery
-                alt Valid correlated response can be delivered
+                alt Valid response and callback claim wins before close cutoff
                     G-->>Z: RpcResponse, possibly much later
                     Z-->>IO: Receive response through DEALER
-                    IO->>IO: Validate, allocate response, retire record and release locks
+                    IO->>IO: Validate, allocate response, claim callback before close cutoff, retire record and release locks
                     IO-->>A: handler(Client, owned response, size)
                     A->>API: Later client_free_response(response)
                 else Matched response allocation fails
@@ -1549,7 +1703,7 @@ sequenceDiagram
                     Note over A,IO: No response callback and no revision of CLIENT_OK
                 else Connection closes or response validation fails
                     IO->>IO: Retire record without a response callback
-                    Note over A,IO: Connection failure uses connection handler, local response failure uses diagnostics
+                    Note over A,IO: Unexpected loss uses connection handler, explicit close creates no event, local response failure uses diagnostics
                 end
             end
         end
@@ -1567,6 +1721,11 @@ send failure or connection loss before acceptance returns CLIENT_COMMUNICATION_E
 Send-deadline expiry returns CLIENT_TIMEOUT. Queue insertion or pending-map
 allocation failure returns CLIENT_OUT_OF_MEMORY. Every failed submission returns
 without a response callback.
+
+An explicit disconnect that wins before send acceptance returns
+CLIENT_NOT_CONNECTED through the retained send waiter. If the in-progress send
+was accepted, preserve CLIENT_OK and retire the response record without a
+synthetic callback. Section 5.13 defines the close/acceptance race.
 
 After acceptance, invoke the supplied ClientResponseHandler only for a validated,
 deliverable response, including a Gateway error response. No local response
@@ -1600,10 +1759,11 @@ sequenceDiagram
     participant A as Application
     participant API as client_send_request_string
     participant TEXT as Text/service mapping
-    participant B as Shared binary request core
+    participant B as Shared request core / synchronous waiter
     participant IO as Client I/O owner
     participant G as Gateway ROUTER
     A->>API: NUL-terminated request text and out response
+    Note over API,IO: Validate Client pointer, retain a scoped live-call guard through input and response preparation, release it on every return
     API->>API: Clear supplied output, validate caller thread and pointers, scan to first NUL within bound
     opt Arguments valid
         API->>API: Copy request text into owned storage with known length
@@ -1616,7 +1776,7 @@ sequenceDiagram
         API->>API: Release partial input and wire-request storage
         API-->>A: CLIENT_OUT_OF_MEMORY, NULL response
     else Request prepared
-        API->>B: Submit through synchronous binary core with one 15-second budget
+        API->>B: Submit prepared envelope with string result target and one 15-second budget
         B->>B: Check connection, initialize owned record/waiter/deadline, then push under queue mutex
         alt No usable connection
             B-->>API: CLIENT_NOT_CONNECTED, no response
@@ -1631,46 +1791,64 @@ sequenceDiagram
                 IO-->>B: CLIENT_OUT_OF_MEMORY
             else Prepared and eligible to send
                 IO->>G: zmq_send(DEALER, one binary frame, DONTWAIT) over UDS
-                alt Valid correlated response can be allocated
+                alt Correlated response is received
                     G-->>IO: RpcResponse via zmq_msg_recv
-                    IO->>IO: Validate, correlate ID, copy response and retire record
-                    IO-->>B: CLIENT_OK and owned response bytes
+                    IO->>IO: Validate ID, service, schema and RpcStatus
+                    alt Matched envelope metadata is invalid
+                        IO->>IO: Free temporary storage, retire record once
+                        IO-->>B: CLIENT_COMMUNICATION_ERROR if failure wins completion, NULL response
+                    else Envelope is valid
+                        IO->>TEXT: Prepare response text preserving Gateway/service errors
+                        TEXT->>TEXT: Check representation and bound, allocate length plus one and append NUL
+                        alt Response-text allocation fails
+                            IO->>IO: Free temporary storage, retire record once
+                            IO-->>B: CLIENT_OUT_OF_MEMORY if failure wins completion, NULL response
+                        else Response text cannot satisfy the contract
+                            IO->>IO: Free temporary storage, retire record once
+                            IO-->>B: CLIENT_COMMUNICATION_ERROR if failure wins completion, NULL response
+                        else Final response text is ready
+                            TEXT-->>IO: Owned NUL-terminated response
+                            IO->>IO: Claim final result against deadline, loss and explicit close
+                            alt Response wins before deadline and close cutoff
+                                IO->>IO: Retire record and release temporary wire storage
+                                IO-->>B: CLIENT_OK and owned response string
+                            else Another terminal result already won
+                                IO->>IO: Free uncommitted string and retire record once
+                                Note over B,IO: Preserve the winning error, return no response
+                            end
+                        end
+                    end
                 else Detected send or receive allocation failure
                     IO->>IO: Retire affected state per common pipeline
                     IO-->>B: CLIENT_OUT_OF_MEMORY, no response
+                else Explicit disconnect wins before result completion
+                    IO-->>B: CLIENT_NOT_CONNECTED, no response
                 else Deadline, connection loss or other processing failure
                     IO-->>B: CLIENT_TIMEOUT or CLIENT_COMMUNICATION_ERROR
                 end
+            else Explicit disconnect wins before sending
+                IO-->>B: CLIENT_NOT_CONNECTED, no response
             else Deadline or generation no longer permits sending
                 IO-->>B: CLIENT_TIMEOUT or CLIENT_COMMUNICATION_ERROR
             end
-            B-->>API: One binary result and any owned response
+            B-->>API: One final ClientResult and response string only on CLIENT_OK
         end
-        alt Common request returns a local error
-            API->>API: Free temporary request and response storage
-            API-->>A: Same ClientResult, NULL response
-        else Binary result is CLIENT_OK
-            API->>TEXT: Map validated RpcResponse to response text, preserving Gateway/service errors
-            TEXT->>TEXT: Check text length and representation, allocate length plus one and append NUL
-            alt Response-text allocation fails
-                TEXT-->>API: CLIENT_OUT_OF_MEMORY
-                API->>API: Free binary response and temporary text storage
-                API-->>A: CLIENT_OUT_OF_MEMORY, NULL response
-                Note over A,G: Remote execution may be complete, do not replay
-            else Response cannot satisfy the text contract or exceeds the bound
-                TEXT-->>API: CLIENT_COMMUNICATION_ERROR
-                API->>API: Free binary response and temporary text storage
-                API-->>A: CLIENT_COMMUNICATION_ERROR, NULL response
-            else Response text ready
-                TEXT-->>API: Owned NUL-terminated response text
-                API->>API: Free temporary binary response and request storage
-                API-->>A: CLIENT_OK and owned response string
-                A->>A: Consume response text according to the service contract
-                A->>A: Release returned string with client_free_response
-            end
+        API->>API: Release input temporaries and scoped live-call guard
+        API-->>A: Final ClientResult, owned string on success or NULL on local error
+        opt Final result is CLIENT_OK
+            A->>A: Consume response text according to the service contract
+            A->>A: Release returned string with client_free_response
         end
     end
 ```
+
+Final text preparation belongs to the shared I/O receive/completion path, just
+as it does for the asynchronous string method. Complete the synchronous waiter
+only after the returned string is ready. The same 15-second deadline and
+explicit-close cutoff cover that preparation; they are not restarted after
+receiving the binary envelope. If timeout or close wins while text is being
+prepared, free the uncommitted string and preserve the winning result. A text
+allocation failure may occur after remote execution and does not permit replay.
 
 #### Plain-string input, length and ownership
 
@@ -1777,6 +1955,7 @@ sequenceDiagram
     participant Z as Client libzmq / DEALER
     participant G as Gateway
     A->>API: Client, NUL-terminated request text and string response handler
+    Note over API,IO: Validate Client pointer, retain a scoped live-call guard before input work, release it on every return
     API->>API: Validate caller thread, arguments and connection, scan to first NUL within bound
     opt Arguments valid and connection usable
         API->>API: Copy request text into owned storage with known length
@@ -1809,6 +1988,9 @@ sequenceDiagram
                 alt Detected allocation failure before acceptance
                     IO->>IO: Retire unsent record
                     IO->>W: Publish CLIENT_OUT_OF_MEMORY
+                else Explicit disconnect wins before send acceptance
+                    IO->>IO: Retire unsent record
+                    IO->>W: Publish CLIENT_NOT_CONNECTED
                 else Other send error, connection loss or send expiry
                     IO->>IO: Retire unsent record
                     IO->>W: Publish CLIENT_COMMUNICATION_ERROR or CLIENT_TIMEOUT
@@ -1817,6 +1999,9 @@ sequenceDiagram
                     IO->>W: Publish immutable CLIENT_OK
                     Z->>G: Transport queued RpcRequest over UDS
                 end
+            else Explicit disconnect wins before sending
+                IO->>IO: Retire unsent record
+                IO->>W: Publish CLIENT_NOT_CONNECTED
             else Deadline expires or connection is lost before sending
                 IO->>IO: Retire unsent record
                 IO->>W: Publish CLIENT_TIMEOUT or CLIENT_COMMUNICATION_ERROR
@@ -1838,14 +2023,19 @@ sequenceDiagram
                         IO->>IO: Retire record with diagnostics, no callback
                     else Response string ready
                         TEXT-->>IO: Owned NUL-terminated response text
-                        IO->>IO: Retire record, release internal locks
-                        IO-->>A: handler(Client, owned response string)
-                        A->>A: Consume response text or hand off heavy work
-                        A->>API: Later client_free_response(response)
+                        IO->>IO: Try claiming callback against explicit close
+                        alt Callback claim succeeds before cutoff
+                            IO->>IO: Retire record, release internal locks
+                            IO-->>A: handler(Client, owned response string)
+                            A->>A: Consume response text or hand off heavy work
+                            A->>API: Later client_free_response(response)
+                        else Explicit close already won
+                            IO->>IO: Free uncommitted string and retire record, no callback
+                        end
                     end
-                else Connection loss
+                else Connection loss or explicit disconnect
                     IO->>IO: Retire record, free temporary storage, no response callback
-                    Note over A,IO: Report connection event through connection handler
+                    Note over A,IO: Unexpected loss may report an event, explicit close creates no event
                 end
             end
         end
@@ -1935,29 +2125,71 @@ Neither notification function allocates, so neither has an out-of-memory path.
 
 Coverage: **AC2.1–AC2.3**, leading to **AC1.10** when the Gateway detects closure.
 
+client_disconnect is a synchronous local cleanup barrier. The app may call it
+while requests are queued or awaiting responses; it need not wait for those
+responses first. The function closes new admission, cancels unsent actions,
+retires pending response IDs and closes the connection. It returns only after
+the old runtime is quiescent and the handle is destroyed. It does not wait for
+a Gateway acknowledgement or certify that remote operations have finished.
+
+#### Results and callback behavior during explicit close
+
+| State when local close wins | Outcome |
+| --- | --- |
+| Synchronous request still waiting | Return CLIENT_NOT_CONNECTED with NULL response and size 0 for bytes, or NULL for strings |
+| Async submission not yet accepted by libzmq | Return CLIENT_NOT_CONNECTED through its send waiter; cancel the unsent action and invoke no response callback |
+| Async send already accepted | Preserve CLIENT_OK, remove its pending response ID and release library-owned storage without a response callback |
+| Uncommitted response or unclaimed callback | Discard its storage and pending record; do not start delivery after the close cutoff |
+| Result or callback already claimed | Preserve the winning result/ownership, let the call or callback finish and wait for its live reference to be released |
+| Already LOST handle | Finish teardown without changing the loss result or closing an already closed socket again |
+
+Serialize local-close admission with request publication and callback claims.
+Use the same retained completion state for close, response, timeout and transport
+failure: only one terminal result wins. If a nonblocking send is already in
+progress, let the owner resolve it before completing its send waiter. Successful
+libzmq acceptance remains CLIENT_OK even if local close was requested while
+that attempt ran; it must not become a reported failure for a message that was
+accepted. Unsent actions cancelled by close can never execute later.
+
+An intentional close generates no connection callback. Suppress monitor events
+caused by shutting down the socket. A connection callback already claimed for an
+earlier unexpected loss may finish; no new callback is claimed after callback
+admission closes.
+Response and connection callbacks run without internal locks, and no callback
+can execute for that Client after client_disconnect returns.
+
 ```mermaid
 sequenceDiagram
-    participant A as Application
+    participant A as Application lifecycle thread
     participant API as client_disconnect
     participant C as Coordinator
-    participant IO as Serving thread
+    participant W as In-progress API calls and waiters
+    participant IO as Serving thread and callbacks
     participant Z as libzmq / DEALER and monitor
     participant G as Gateway monitor
+    A->>A: Stop new API entry and coordinate ownership of the handle
     A->>API: Client
-    API->>C: Stop new API admissions and set existing shutdown flag
+    API->>C: Mark CLOSING, close request/callback admission, set existing stop flag
     Note over API,IO: No allocation or queued shutdown action required
     C->>IO: Signal existing wakeup
-    IO->>IO: Resolve retained sync/send-result waiters and retire async records
-    Note over C,IO: No async error callbacks, local-close status/order for waiters is TODO
-    IO->>Z: Disable monitoring, close owned sockets with finite linger
+    opt Callback or nonblocking send already claimed before cutoff
+        IO->>IO: Finish callback or resolve send result, preserve any accepted send
+    end
+    IO->>W: Complete unresolved sync/send waiters with CLIENT_NOT_CONNECTED
+    IO->>IO: Cancel unsent actions, retire pending IDs and discard uncommitted responses
+    Note over C,IO: No synthetic response callback or intentional-close connection event
+    IO->>Z: Disable monitoring, close owned sockets with LINGER=0
     Z-->>G: Peer closure eventually becomes monitor event
     IO-->>C: Serving loop exits
+    W->>C: Return mapped or already-committed results, release live-call guards
     API->>IO: Join thread, also join separate monitor worker if used
+    API->>C: Wait for remaining live calls and claimed callbacks without holding their locks
     API->>Z: Terminate owned context after all its sockets close
-    API->>C: Quiesce callbacks/callers, free queues, pending records and state
+    API->>C: Clear handler, release queues/records and destroy handle
     API-->>A: Void return, handle is invalid, no ClientResult
     A->>A: Reset caller's handle slot to NULL before reuse
-    Note over API,G: No disconnect protobuf and no guarantee of remote completion
+    Note over A,IO: No old Client callback or state access survives the cleanup barrier
+    Note over API,G: Gateway drains accepted work and retains buffers until backend access ends
 ```
 
 Disconnect must remain possible after allocation failure. Set a stop flag
@@ -1967,11 +2199,49 @@ completion objects and erase/free records without constructing a temporary
 container. The function is void; it cannot report CLIENT_OUT_OF_MEMORY and
 must not depend on allocating an error object to clean up.
 
-Do not call disconnect from its own callback thread or race destruction against
-uncoordinated application calls. A proposed implementation closes admission and
-waits for retained in-progress API references; the public concurrency contract
-must describe what the application must serialize. Never detach a serving
-thread and free its state.
+Wake and resolve pending callers before waiting for their live-call references
+to drain. Never wait while holding the queue, state or callback locks they need
+to return. Joining the I/O owner also waits for its active callback. Callbacks
+must return promptly; safe cleanup cannot forcefully terminate application code
+running on that thread. Preserve results already committed to a caller,
+including a fully prepared string owned by a completed waiter. Response-text
+preparation precedes the final completion claim, as specified in section 5.8.
+Free only uncommitted library-owned response storage.
+
+The same function destroys a handle whose connection already reached LOST.
+Reuse completed cleanup safely: close each socket once, join started threads
+and terminate the old owned ZMQ context before releasing the handle. Free only
+library-owned undelivered response storage; results already transferred to the
+caller remain available for client_free_response. Explicit reconnect starts
+from a NULL handle slot with no old runtime state, as specified in section 5.14.
+
+#### Concurrent callers and handle lifetime
+
+- Call disconnect from an application lifecycle thread, never from a Client
+  response/connection callback or the I/O thread it must join. A callback can
+  schedule cleanup on an application thread and return.
+- The application serializes connect/disconnect and destruction of the same
+  handle. Stop new call entry and coordinate threads that could still enter
+  using a copied raw pointer. A call not yet holding an internal live reference
+  must not race handle destruction; neither the internal queue lock nor a raw
+  Client pointer makes that race safe.
+- Calls already holding live references may remain blocked in the library while
+  disconnect runs. Close wakes their waiters. An entered call that has not yet
+  submitted work checks CLOSING before publication and returns
+  CLIENT_NOT_CONNECTED instead of publishing a new action. Every return path
+  releases its guard, including validation and allocation failures.
+- Serialize callback admission with CLOSING. Claims made before the cutoff
+  retain the Client until return; later responses/events are discarded. Keep
+  the registered handler and its application dependencies valid until the
+  disconnect barrier completes, then clear the registration.
+- Once disconnect returns, do not use the old handle again, including a second
+  disconnect. Clear the application's slot and use a new Client for reconnect.
+  Already-transferred response allocations remain app-owned and may still be
+  released through client_free_response.
+
+The library never detaches a live thread and destroys its state. Explicit local
+close cleans transport and request bookkeeping; Gateway's accepted jobs and
+shared-buffer leases follow their existing drain and completion rules.
 
 ### 5.14 Deadlines, callbacks, reconnect and library unloading
 
@@ -1980,8 +2250,8 @@ thread and free its state.
 | Setting | Initial value | Meaning |
 | --- | --- | --- |
 | Common timed-wait duration | 15,000 ms | Shared by connect, synchronous requests and async send submission; no public timeout setter is required initially |
-| Connect deadline | Connect-attempt start plus 15 seconds | Covers setup/handshake waiting; retries cannot restart it and safe rollback must finish before return |
-| Synchronous request deadline | Admission time plus 15 seconds | One budget across queueing, serialization, send attempts and receiving/validating the response |
+| Connect deadline | Connect-attempt start plus 15 seconds | Covers setup/handshake waiting for one explicit attempt; events cannot restart it and safe rollback must finish before return |
+| Synchronous request deadline | Admission time plus 15 seconds | One budget across queueing, serialization, send attempts, response validation and preparation of the final byte/string result |
 | Async send-submission deadline | Admission time plus 15 seconds | Covers queueing, serialization and send attempts until libzmq accepts the request; return its result through the API |
 | Async response deadline | None | Disarm the send deadline after acceptance and retain the response record until delivery or local retirement/teardown |
 | Submission queue and pending map | Dynamic, no fixed request-count cap | std::queue<Action> grows under a mutex; detected allocation failure returns CLIENT_OUT_OF_MEMORY while an API result is still pending |
@@ -2017,6 +2287,101 @@ waiting requests at 1,024 and expires a request that cannot start dispatch withi
 separate. The client queue remains dynamic without a fixed request-count cap.
 Already-delivered response allocations belong to the application until freed.
 
+#### Terminal connection loss and explicit reconnect
+
+**Decision:** loss of an established connection ends that connection generation.
+The I/O owner closes admission and transitions READY to LOST once. It stops
+submissions, retires pending work and closes the old transport; it does not
+reconnect the socket, restore the handle to READY or replay an operation. A new
+request on the still-allocated lost handle returns CLIENT_NOT_CONNECTED.
+
+| State at detected transport loss | Required cleanup/result |
+| --- | --- |
+| Unsent client submission actions | Cancel and erase them; they must never be sent later |
+| Synchronous result or async send-result waiter still pending | Complete once with CLIENT_COMMUNICATION_ERROR; clear response outputs and invoke no async response callback |
+| Async send already accepted by libzmq | Preserve its CLIENT_OK submission result, retire its response record without a callback and release library-owned request state |
+| Queued, received or prepared response not committed to a caller | Discard it and release its library-owned storage and accounting |
+| Result already committed to a waiter or callback | Preserve the winning completion and ownership transfer; do not overwrite it or free the caller's response |
+| Old libzmq queues | Disable monitoring and close owner-held sockets with LINGER=0; discard unread input, release received message objects and do not reuse the sockets |
+
+Use the retained completion objects, stop flags and wakeups so cleanup remains
+possible after allocation failure. A response, timeout or send acceptance that
+already won its terminal transition keeps its result. For connection-wide
+local allocation/validation failures, use the existing error mappings from
+section 5.6 with the same teardown discipline. No synthetic async error response
+is introduced.
+
+Report CLIENT_CONNECTION_LOST once for the established connection, without held
+internal locks, if its callback is claimed before explicit close shuts callback
+admission. Local close does not create a new loss event. Stop or wake any separate
+monitor collector so all sockets close
+on their owners. The old serving loop exits and the lost handle remains valid
+only for rejected requests and orderly destruction. client_disconnect joins the
+started threads and terminates the old owned ZMQ context; none of that runtime
+is reused. A callback already executing must return before destruction completes.
+The application schedules disconnect/reconnect from an application thread, not
+from the connection callback.
+
+Neither CLIENT_CONNECTION_RESTORED nor CLIENT_CONNECTION_TERMINATED is emitted.
+The new explicit connection reports its startup outcome only through the
+client_connect return value, just like the first connection. It cannot restore
+the old handle or session.
+
+The explicit API sequence is:
+
+```c
+client_disconnect(client);
+client = NULL;
+ClientResult result = client_connect(&client, connection_handler);
+```
+
+The application first coordinates its callers and the old handle's lifetime.
+A successful new connect has a new Client runtime, owned ZMQ context, DEALER,
+monitor endpoint and connection generation. Gateway authenticates a new
+User-Id/session and performs CONNECTED again. Matching UID/PID or future
+authoritative app identity does not restore an old connection. Pending maps,
+queues and response records start empty; old buffer IDs and session key handles
+cannot be used in the new session.
+
+```mermaid
+sequenceDiagram
+    participant A as Application thread
+    participant IO as Old client I/O owner
+    participant H as Connection handler on old I/O thread
+    participant W as Pending waiters and records
+    participant Z as Old DEALER and monitor
+    participant API as Client lifecycle API
+    participant N as New client runtime
+    participant G as Gateway
+    Z-->>IO: Established connection disconnects
+    IO->>IO: READY to LOST, close admission for old generation
+    IO->>W: Fail unresolved API waiters, cancel unsent actions, retire async records
+    IO->>IO: Free uncommitted response storage, preserve transferred results
+    IO->>Z: Disable monitor and close owned sockets with LINGER=0
+    IO->>H: Invoke handler with CLIENT_CONNECTION_LOST
+    H-->>A: Schedule recovery on an application thread
+    H-->>IO: Return promptly
+    IO->>IO: Exit serving loop, no automatic reconnect
+    A->>API: client_disconnect(old Client), then clear handle slot
+    API->>API: Quiesce callers/callbacks, join threads, terminate old context and free handle
+    A->>API: client_connect(empty handle slot, connection handler)
+    API->>N: Create fresh runtime, empty queues and pending map
+    N->>G: New UDS connection and authentication
+    G->>G: New connection/session identity, scoped ICrypto CONNECTED
+    G-->>N: Successful handshake
+    N-->>API: READY for new generation
+    API-->>A: CLIENT_OK and new handle, no connection callback
+    Note over A,G: No old requests, replies or session resources move to the new connection
+```
+
+Client cleanup is not a remote cancellation acknowledgement. Gateway separately
+closes the old context's admission and drops its undeliverable responses. Accepted
+Gateway jobs follow the existing drain/deadline contract; active backend access
+must finish before DISCONNECTED and buffer destruction. A new session can be
+admitted while the old one retains private cleanup references, without sharing
+its resources or accepting its late completions. A missing response does not
+make automatic operation replay safe.
+
 #### Freeze and runtime behavior
 
 The application owns preparation for freezing its process: stop new submissions,
@@ -2049,18 +2414,21 @@ The following constraints apply to all request APIs:
   success. Retire async records without a callback on connection loss or local
   response-processing failure. Late replies cannot trigger a duplicate callback
   or satisfy another request; this does not guarantee exactly-once execution.
+- Explicit local close resolves still-pending sync/send results with
+  CLIENT_NOT_CONNECTED, retires pending IDs without synthetic callbacks and
+  waits for live calls/claimed callbacks before destroying the handle. Preserve
+  an earlier response, send acceptance, timeout or unexpected-loss result.
 - Do not retry automatically after a timeout or reconnect. A crypto operation
   may already have changed backend state.
-- A transport reconnect is not a promise of the same Gateway context. Buffer IDs
-  and key handles from the old session cannot simply be reused.
-- Choose libzmq automatic-reconnect and queued-send behavior explicitly. Avoid
-  silently carrying old-session work onto a newly authenticated connection.
-  Application-level "no retry" alone does not settle what libzmq does with its
-  internal send queues. This remains part of TODO(CONNECTION-LIFETIME).
+- Disable automatic transport reconnect and discard old pending requests and
+  undelivered responses on connection loss. Explicit reconnect creates a fresh
+  context with no reused buffer IDs, session key handles or queued work.
+- Apply RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0 to each new DEALER. Close the
+  old socket rather than reconnecting it or carrying its libzmq queues forward.
 - Keep transport heartbeats disabled on DEALER and ROUTER, including after
   socket recreation. Actual connection loss still invalidates assumptions about
-  the old Gateway context, buffers and key handles; reconnect remains a separate
-  lifecycle contract.
+  the old Gateway context, buffers and key handles. The explicit new-connection
+  flow above applies after any actual loss, including one observed after thaw.
 - Connection callbacks are specified by the header to run on
   an internal thread without calling other client APIs. Request callbacks use
   the execution rules in section 5.4: run on the I/O owner without held
@@ -2093,11 +2461,16 @@ Application / Firebolt Crypto
         Allocation fails -> CLIENT_OUT_OF_MEMORY, roll back, output NULL
       IoLoop::Run
         Configure DEALER options with heartbeat IVL/TIMEOUT/TTL set to 0
+        Set RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0 before connect
         Enable monitor and connect PAIR receiver -> zmq_connect
-        Poll PAIR -> handshake result -> complete startup waiter
+        Poll PAIR -> handshake result -> complete startup waiter, no callback
+      On startup success, publish handle and enable loss-callback delivery
+      Return CLIENT_OK with published handle or exact error with NULL
 
   client_send_request[_async]
   client_send_request_string[_async]
+    Validate Client pointer and retain a scoped live-call guard
+      Release guard on every return, including errors
     Validate caller thread and arguments
       Byte API: parse the supplied binary RpcRequest using its explicit length
       String API: scan to first NUL within bound, copy text, prepare wire request
@@ -2128,6 +2501,8 @@ Application / Firebolt Crypto
                 TEXT-SERVICE-CONTRACT preserves Gateway/service error meaning
                 Allocation fails -> sync CLIENT_OUT_OF_MEMORY and NULL/0
                                     async diagnostics and retirement, no callback
+                claim final result/callback against close and any sync deadline
+                losing preparation frees its uncommitted result
                 retire pending record once
                   sync: return ClientResult and response to waiter
                   async: handler(Client, response[, size]), no held locks
@@ -2138,18 +2513,27 @@ Application / Firebolt Crypto
 
   Monitor processing on the same I/O owner
     Poll PAIR -> decode transport event -> connection-state transition
-      resolve unresolved API waiters
-      retire accepted async response records, no synthetic error callback
-      notify connection handler
+      established loss -> close admission, mark old generation LOST
+      resolve unresolved API waiters, cancel unsent actions
+      retire accepted async records and discard uncommitted responses
+      close sockets with LINGER=0, no automatic reconnect
+      CLIENT_CONNECTION_LOST once if callback admission remains open
+      exit serving loop, no RESTORED or TERMINATED callback
+      app thread: disconnect old handle -> connect fresh runtime/session
 
   client_register_notifications -> CLIENT_NOT_IMPLEMENTED, future support
   client_unregister_notifications -> return without changing state
 
   client_free_response -> free
   client_disconnect
-    CloseAdmission -> existing stop flag and wakeup, no queue allocation
-      resolve retained waiters / retire async records
-      owner closes sockets -> join threads -> terminate context -> release handle
+    App coordinates handle lifetime and stops new call entry
+    CloseRequestAndCallbackAdmission -> existing stop flag and wakeup, no queue allocation
+      resolve in-progress send, preserve accepted CLIENT_OK
+      unresolved sync/send waiters -> CLIENT_NOT_CONNECTED
+      cancel unsent work, retire pending IDs and discard uncommitted responses
+      owner closes sockets -> join threads -> wait for live calls/claimed callbacks
+      clear handler -> terminate context -> release handle
+      no intentional-close connection callback and no callback after return
 ```
 
 The call hierarchy contains no application heartbeat producer, heartbeat
@@ -2287,6 +2671,64 @@ After execution starts, an error response does not undo backend effects or
 authorize early release of leased buffers. Client-local allocation failures
 continue to use CLIENT_OUT_OF_MEMORY; these are separate error layers.
 
+#### Proposed initial resource sizing
+
+The following values are **proposals for target-device validation**, not adopted
+production defaults or changes to runtime configuration. Rows marked **Agreed**
+record the existing limits; the additional byte budgets and transport/worker
+settings remain subject to product sizing under TODO(RESOURCE-LIMITS).
+
+| Resource | Initial value / policy | Status |
+| --- | --- | --- |
+| Maximum complete request / response | 1 MiB each, including the outer RPC envelope; bulk Crypto data uses shared memory | Proposed |
+| Gateway waiting requests | 1,024 globally, with at most 10 seconds from admission to the start of Dispatch | Agreed |
+| Queued request data | 16 MiB globally, alongside the waiting-entry limit | Proposed |
+| Reserved/completed response slots | 128 per connection / 1,024 globally, including reservations for running jobs | Agreed |
+| Reserved/completed response data | 4 MiB per connection / 16 MiB globally, alongside the response-slot limits | Proposed |
+| ZeroMQ send/receive high-water marks | ZMQ_SNDHWM = 32 and ZMQ_RCVHWM = 32 messages per peer on ROUTER and DEALER; tune through burst/load tests | Proposed |
+| Private request workers | 4, configured independently of Thunder's global pool | Proposed |
+| Worker stack size | Keep the Thunder/platform default initially; measure before reducing it, including when Crypto executes in process | Proposed |
+| Shared memory | 16 MiB per buffer, up to 4 buffers / 64 MiB per connection, and 128 MiB globally | Proposed |
+| Kernel socket buffers | Keep OS defaults with ZMQ_SNDBUF = -1 and ZMQ_RCVBUF = -1 | Proposed |
+
+All applicable count and byte limits apply together. A 1,024-entry queue holding
+1 MiB requests would otherwise consume 1 GiB for payloads alone. Fast dequeueing
+does not prevent accumulation while backend workers are occupied. Inline
+results, including GenerateRandom and ExportKey, must fit the complete response
+limit with Protobuf overhead; the maximum payload is therefore smaller than
+the maximum envelope.
+
+System limits are a final boundary, not a per-plugin or per-connection budget.
+Gateway initially shares Thunder's process, so exhausting memory can affect
+other plugins. Keep OS socket-buffer and platform stack defaults where suitable,
+but explicitly account for Gateway-owned queues, responses and shared memory.
+libzmq 4.3.4 defaults to high-water marks of 1,000 messages per peer and an
+unlimited maximum inbound message size. These settings alone do not define a
+predictable Gateway memory budget.
+[ZeroMQ 4.3.4 socket options](https://github.com/zeromq/libzmq/blob/v4.3.4/doc/zmq_setsockopt.txt)
+
+The proposed budgets are not a total-process RAM limit. Protobuf copies,
+bookkeeping, stacks, kernel buffers and libzmq queues add storage. In particular,
+libzmq's queues are per peer and separate from Gateway's completion handoff;
+validate sizing against simultaneous connections, peak message sizes and
+backend latency. Apply the shared-memory global quota across all connections.
+
+Expose adopted values through product configuration supplied by CMake/BitBake;
+no public client API change is needed. Keep the existing error and delivery
+contracts: Gateway resource rejection emits an explicit ERROR log and returns
+RPC_STATUS_INTERNAL when a correlated reply is possible. Each response has one
+send attempt. The client's C++ submission queue remains dynamic with no fixed
+count cap; local allocation failures use CLIENT_OUT_OF_MEMORY. Finite transport
+high-water marks do not introduce a new client submission-queue limit.
+
+Apply message bounds at the client API and Gateway validation boundaries as
+well as in transport configuration. A libzmq ZMQ_MAXMSGSIZE rejection disconnects
+the oversized sender before an RPC error can be constructed; it follows normal
+connection-loss handling. It must not be described as a guaranteed
+RPC_STATUS_INTERNAL reply. The configured complete-message and text bounds must
+also allow for envelope overhead and the local string terminator.
+[ZeroMQ maximum message size](https://github.com/zeromq/libzmq/blob/v4.3.4/doc/zmq_setsockopt.txt)
+
 ### 6.3 Runtime records and synchronization
 
 Each connection context contains:
@@ -2324,12 +2766,17 @@ Required synchronization rules:
 - CONNECTED runs once during authentication before a context becomes ACTIVE
   and ZAP returns success. RPC workers never perform lazy session creation.
   Keep notification bookkeeping, not internal Crypto key state or health data.
-- Closing new admission does not cancel accepted jobs. During deactivation,
-  queued jobs either start within their original 10-second worker-wait deadline
+- Closing new admission does not cancel accepted jobs. During deactivation or
+  a correlated peer disconnect, queued jobs either start within their original
+  10-second worker-wait deadline
   or expire with an error; started jobs complete before resources are released.
-- A session removed from public lookup may remain privately retained by active
-  jobs. Purge entitlement/admission visibility immediately; retain only what
-  those jobs and cleanup need.
+- Accepted jobs use their retained context and original generation during drain;
+  removal from new-request lookup must not make them resolve a replacement
+  context or fail solely because admission is now closed. Buffer dependencies
+  and validation still apply. A disconnected route cannot receive a completion.
+- A session removed from public lookup may remain privately retained by accepted
+  jobs and lifecycle tasks. Purge entitlement/admission visibility immediately;
+  retain only what those jobs and cleanup need.
 
 These rules define invariants. The exact locking/owner-thread implementation
 and dependency ordering remain **Gap 2**, not an assertion that arbitrary
@@ -2436,11 +2883,15 @@ sequenceDiagram
         Z->>REG: Bind transport lifetime to User-Id, create AUTHENTICATING context
         Z->>W: Schedule CONNECTED, no registry lock held
         W->>T: Query ICrypto using configured callsign
-        T-->>W: Scoped interface reference
-        W->>CP: NotifyAppState(context, CONNECTED)
-        CP-->>W: Invocation and service result
-        W->>CP: Release reference
-        W-->>Z: Retained initialization result
+        T-->>W: Scoped interface reference or nullptr
+        alt Lookup returns nullptr
+            W-->>Z: Initialization failure, no notification dispatched
+        else Interface acquired
+            W->>CP: NotifyAppState(context, CONNECTED)
+            CP-->>W: Invocation and service result
+            W->>CP: Release reference on every completed call path
+            W-->>Z: Retained initialization result
+        end
         alt Success, same transport live and admission still open
             Z->>REG: Publish ACTIVE context
             Z-->>L: ZAP success with unique User-Id
@@ -2498,14 +2949,20 @@ sequenceDiagram
     R->>REG: Resolve ACTIVE context, transport binding and runtime admission
     REG-->>R: Retained context or rejection
     R->>R: Validate framing, envelope, schema, service and request ID
-    alt Invalid request or admission closed
+    alt Request ID already belongs to an accepted request
+        R->>R: Log ERROR with duplicate ID and original state, reject duplicate
+        Note over R,C: Keep original completion, no competing reply under the same ID
+    else Invalid request or admission closed
+        R->>R: Log ERROR with exact rejection reason and available request context
         R-->>C: Mapped RpcStatus error when safely correlatable
     else Waiting-request count is already 1024
+        R->>R: Log ERROR with waiting count and limit
         R-->>C: RPC_STATUS_INTERNAL, no accepted job
     else Admission available
         R->>Q: Atomically reserve slot and publish owned job with deadline now plus 10 seconds
         alt Allocation/publication fails
             Q->>Q: Roll back slot and partial state
+            Q->>Q: Log ERROR with allocation/publication failure and request context
             Q-->>R: RPC_STATUS_INTERNAL
             R-->>C: Error response when deliverable
         else Queued
@@ -2513,13 +2970,19 @@ sequenceDiagram
             Note over Q,P: Waiting count/deadline continue until Dispatch actually starts
             alt Original deadline expires before Dispatch
                 R->>Q: Atomically mark WAITING as EXPIRED
+                R->>R: Log ERROR with dispatch deadline and request context
                 Q-->>R: One RPC_STATUS_INTERNAL completion
                 R-->>C: Error response when deliverable
                 Note over Q,J: Remove staged job or retain submitted no-op marker, never execute service
             else Worker claims RUNNING before deadline
                 P->>J: Dispatch distinct job, release waiting slot
-                J->>J: Validate payload/dependencies and reserve bounded response slot/bytes
-                alt Response capacity unavailable
+                J->>J: Validate payload/dependencies, then reserve bounded response slot/bytes
+                alt Invalid service payload or rejected buffer state
+                    J->>J: Log ERROR with exact reason, request context and buffer state
+                    J->>OUT: RPC_STATUS_INTERNAL with empty payload if bounded error storage is available
+                    Note over J,S: Otherwise drop, no service execution or invalidation of existing leases
+                else Response capacity unavailable
+                    J->>J: Log ERROR with response usage and limit
                     J->>OUT: RPC_STATUS_INTERNAL if bounded error storage is available
                     Note over J,OUT: Otherwise local resource error and drop, no service execution
                 else Response capacity reserved
@@ -2530,12 +2993,12 @@ sequenceDiagram
                 OUT-->>R: Wake response drain
                 R->>REG: Verify original authenticated transport lifetime at send handoff
                 alt Original connection still safely routable
-                    R->>R: Attempt complete multipart response once with DONTWAIT
+                    R->>R: Set expected original transport lifetime, attempt multipart response once with DONTWAIT
                     alt libzmq accepts the complete response
                         R-->>C: Queued transport delivery, client receipt is not guaranteed
                         R->>R: Release completion storage/accounting
                     else EAGAIN, EHOSTUNREACH or another send failure
-                        R->>R: Record local send error and drop response, no retry
+                        R->>R: Record send error, drop response and release capacity, no retry
                         Note over R,C: No second error response, client may receive nothing
                     end
                 else Closed or replaced connection
@@ -2559,9 +3022,10 @@ separate. Process ingress, completions and deadlines fairly in bounded batches.
 
 Validate at least: frame count, message size, trusted metadata, live context,
 schema 1, supported service, request-ID rules, service parse, operation/oneof
-agreement, enum/range validity and allocation ownership. Unknown/duplicate IDs
-need an explicit policy. Independent requests can finish in any order;
-dependent operations must follow the resource-ordering contract.
+agreement, enum/range validity and allocation ownership. Apply the generic
+rejection and ERROR-log contract in section 4.2, including preservation of an
+original request when its ID is duplicated. Independent requests can finish in
+any order; dependent operations must follow the resource-ordering contract.
 
 The same binary-envelope validation applies when a caller used a string API.
 For CRYPTO, the payload must still satisfy CryptoRequest. Plain text support
@@ -2587,7 +3051,9 @@ byte allowance atomically against the connection/global budgets. Use a finite
 configured maximum serialized response size and finite per-connection/global
 byte budgets; counts alone do not bound variable-size output. Validate the
 configuration and size arithmetic before opening admission. Product sizing is
-a resource configuration task, not a choice of delivery policy.
+a resource configuration task, not a choice of delivery policy. Section 6.2
+lists [proposed initial byte budgets](#proposed-initial-resource-sizing) for
+target-device validation.
 
 If reservation is unavailable, do not execute the operation or block a worker.
 Publish RPC_STATUS_INTERNAL through the owner if bounded error storage is
@@ -2723,10 +3189,10 @@ request queue, waiting for a session-initialization barrier or delivering a resp
 
 No ICrypto pointer is cached in GatewayRuntime, CryptoServiceAdapter, a
 connection context or a queued job. Concurrent invocations own independent
-references, even if Thunder returns the same underlying object. Backend
-thread-safety remains a separate contract; reference counting does not serialize
-Crypto calls. Use the same query/invoke/release scope for NotifyAppState as for
-all operation methods.
+references, even if Thunder returns the same underlying object. Crypto owns
+its internal synchronization under the ICrypto contract; reference counting
+does not serialize calls. Use the same query/invoke/release scope for
+NotifyAppState as for all operation methods.
 
 This is a short-lived interface reference. Thunder owns the plugin and its
 COM-RPC transport; Release is not an instruction to destroy Crypto, close a
@@ -2826,6 +3292,27 @@ absent field with the enum's zero value. Validate repeated usages, algorithm
 parameter variants, sizes and numeric conversions before constructing backend
 types. Use explicit mappings rather than assuming enum ordinals always match.
 
+#### Client and Gateway boundaries in the Crypto sequences
+
+The Crypto sequences in sections 6.9–6.13 use the **byte request APIs**.
+The consumer constructs the operation-specific message inside CryptoRequest,
+serializes it into RpcRequest.payload, selects RPC_SERVICE_CRYPTO and supplies
+that serialized outer request to client_send_request or
+client_send_request_async. EyilClient replaces request_id/schema_version and
+handles the outer response only. The consumer checks RpcStatus, then decodes
+CryptoResponse and checks CryptoError before using operation outputs.
+
+An operation name in a diagram identifies its payload; it is not another public
+EyilClient function. Shared-buffer allocation returns response bytes containing
+buffer_id, name and size, never a mapped pointer from EyilClient. String APIs
+need TEXT-SERVICE-CONTRACT and are not implicitly usable for these Crypto flows.
+
+Every dispatch follows the waiting-deadline, resource-reservation and accepted
+work-drain rules in section 6.6. Response arrows show the successful delivery
+path: the ROUTER owner makes one guarded nonblocking attempt, and a failed send
+is logged/dropped without replay or a guaranteed client callback. Rejections
+and allocation/invocation failures use section 4.2, including an ERROR log.
+
 ### 6.9 Non-shared-memory operations
 
 Coverage: **AC1.8; AC3.1–AC3.2**. This flow applies to the eleven key/random
@@ -2840,8 +3327,8 @@ sequenceDiagram
     participant J as Private request job / adapter
     participant T as Thunder IShell
     participant C as Crypto plugin / ICrypto
-    F->>F: Serialize operation-specific CryptoRequest
-    F->>L: Send through selected sync/async C API
+    F->>F: Serialize CryptoRequest inside RpcRequest with service CRYPTO
+    F->>L: client_send_request or client_send_request_async with envelope bytes
     L->>R: RpcRequest(service=CRYPTO, schema=1)
     R->>J: Submit retained context and request
     J->>J: Validate operation, parameters and entitlement, satisfy context ordering
@@ -2885,6 +3372,8 @@ Each buffer record retains the owner token/generation, peer evidence, opaque ID,
 client name, backend path, actual capacity, FD, reserved/active use count and
 release state. Per-connection count/byte quotas and a global byte budget require
 atomic reservation and rollback on every failure path.
+Quota rejection returns RPC_STATUS_INTERNAL and emits an ERROR log containing
+the requested allocation, usage and limit, as specified in section 4.2.
 
 Use exclusive creation, generated names, close-on-exec descriptors and deliberate
 ownership/mode settings. The shared-memory proposal sets the peer UID/GID and
@@ -2919,7 +3408,9 @@ Required invariants:
 
 Configure maximum shared-buffer size, buffer count and aggregate byte quotas
 per connection and globally. Their values must match platform memory and
-concurrency budgets; selecting those values remains TODO(RESOURCE-LIMITS).
+concurrency budgets. Section 6.2 lists
+[proposed initial quotas](#proposed-initial-resource-sizing); final product
+values remain subject to validation under TODO(RESOURCE-LIMITS).
 
 ### 6.11 AllocateSharedBuffer and client mapping
 
@@ -2933,22 +3424,32 @@ sequenceDiagram
     participant J as Private request job
     participant B as SharedBufferManager
     participant K as Linux / peer private dev-shm
-    A->>L: AllocateSharedBufferRequest(requested_size)
+    A->>A: Put AllocateSharedBufferRequest in CryptoRequest, serialize into RpcRequest
+    A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest through DEALER IPC
     R->>J: Dispatch with retained connection context
     J->>B: Allocate(owner, requested_size)
     B->>B: Validate nonzero size, reserve count/byte quotas
-    B->>K: Safely open peer shm directory, exclusive object creation
-    B->>K: ftruncate, set approved ownership and permissions
-    K-->>B: Retained FD and verified capacity
-    B->>B: Publish buffer_id, client name, host path and owner
-    B-->>J: AllocateSharedBufferResponse
-    J-->>R: Completion carrying original context/generation
-    R-->>L: RpcResponse
-    L-->>A: buffer_id, POSIX name and size
-    A->>K: shm_open(name, O_RDWR), inspect size, mmap(MAP_SHARED)
-    K-->>A: Application mapping
-    Note over B,K: Roll back object, FD and quota on any partial failure
+    alt Invalid size or quota unavailable
+        B->>B: Roll back partial reservation, log ERROR with exact cause and request context
+        B-->>J: RPC_STATUS_INTERNAL, no allocation
+        J-->>R: Error completion with empty service payload
+        R-->>L: Single response attempt through original connection
+        L-->>A: RpcResponse error, no buffer to map
+    else Validation and quota reservation succeed
+        B->>K: Safely open peer shm directory, exclusive object creation
+        B->>K: ftruncate, set approved ownership and permissions
+        K-->>B: Retained FD and verified capacity
+        B->>B: Publish buffer_id, client name, host path and owner
+        B-->>J: AllocateSharedBufferResponse
+        J-->>R: Completion carrying original context/generation
+        R-->>L: RpcResponse
+        L-->>A: Complete serialized RpcResponse
+        A->>A: Check RpcStatus and CryptoError, decode buffer_id, name and size
+        A->>K: shm_open(name, O_RDWR), inspect size, mmap(MAP_SHARED)
+        K-->>A: Application mapping
+        Note over B,K: On creation failure roll back object, FD and quota, log ERROR and return RPC_STATUS_INTERNAL
+    end
 ```
 
 The mapping helper is outside the current EyilClient transport API. Decide
@@ -2995,7 +3496,8 @@ sequenceDiagram
     participant T as Thunder IShell
     participant C as Crypto plugin / ICrypto
     A->>A: Write init_data and plaintext input_data
-    A->>L: EncryptRequest(buffer_id, algorithm, key_id, regions)
+    A->>A: Wrap EncryptRequest(buffer_id, algorithm, key_id, regions) in CryptoRequest and RpcRequest
+    A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
     J->>B: Acquire owner-checked lease, validate regions
@@ -3023,7 +3525,8 @@ sequenceDiagram
         end
     end
     R-->>L: RpcResponse
-    L-->>A: Matching completion, read ciphertext only on success
+    L-->>A: Matched RpcResponse bytes through waiter or callback
+    A->>A: Check RpcStatus and CryptoError, decode region, read ciphertext only on success
 ```
 
 #### Decrypt
@@ -3040,7 +3543,8 @@ sequenceDiagram
     participant T as Thunder IShell
     participant C as Crypto plugin / ICrypto
     A->>A: Write init_data and encrypted_data
-    A->>L: DecryptRequest(buffer_id, algorithm, key_id, regions)
+    A->>A: Wrap DecryptRequest(buffer_id, algorithm, key_id, regions) in CryptoRequest and RpcRequest
+    A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
     J->>B: Acquire owner-checked lease, validate input regions
@@ -3068,7 +3572,8 @@ sequenceDiagram
         end
     end
     R-->>L: RpcResponse
-    L-->>A: Matching completion, read plaintext only on success
+    L-->>A: Matched RpcResponse bytes through waiter or callback
+    A->>A: Check RpcStatus and CryptoError, decode region, read plaintext only on success
 ```
 
 #### Sign
@@ -3085,7 +3590,8 @@ sequenceDiagram
     participant T as Thunder IShell
     participant C as Crypto plugin / ICrypto
     A->>A: Write input_data
-    A->>L: SignRequest(buffer_id, algorithm, key_id, digest, input)
+    A->>A: Wrap SignRequest(buffer_id, algorithm, key_id, digest, input) in CryptoRequest and RpcRequest
+    A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
     J->>B: Acquire owner-checked lease, validate input region
@@ -3113,7 +3619,8 @@ sequenceDiagram
         end
     end
     R-->>L: RpcResponse
-    L-->>A: Matching completion, read signature only on success
+    L-->>A: Matched RpcResponse bytes through waiter or callback
+    A->>A: Check RpcStatus and CryptoError, decode region, read signature only on success
 ```
 
 #### Verify
@@ -3130,7 +3637,8 @@ sequenceDiagram
     participant T as Thunder IShell
     participant C as Crypto plugin / ICrypto
     A->>A: Write input_data and expected_signature
-    A->>L: VerifyRequest(buffer_id, algorithms, key_id, two regions)
+    A->>A: Wrap VerifyRequest(buffer_id, algorithms, key_id, regions) in CryptoRequest and RpcRequest
+    A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
     J->>B: Acquire owner-checked lease, validate both input regions
@@ -3157,7 +3665,8 @@ sequenceDiagram
         end
     end
     R-->>L: RpcResponse
-    L-->>A: Matching completion with boolean result
+    L-->>A: Matched RpcResponse bytes through waiter or callback
+    A->>A: Check RpcStatus and CryptoError, decode verification_status
     Note over A,C: Verify returns no binary output region
 ```
 
@@ -3180,28 +3689,40 @@ sequenceDiagram
     participant K as Linux
     A->>A: Wait for definitive completion of all uses
     A->>K: munmap and close own mapping/FD
-    A->>L: ReleaseSharedBufferRequest(buffer_id)
+    A->>A: Wrap ReleaseSharedBufferRequest in CryptoRequest and RpcRequest
+    A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over IPC
     R->>J: Dispatch release job with owner context
     J->>B: Release(owner, buffer_id)
-    B->>B: Check owner, reject future use atomically
-    alt No reserved or active operation
-        B->>K: Unlink owned object and close retained FD
-        B->>B: Remove record, release quota
-        B-->>J: Released
-    else Operation still has a lease
-        B->>B: Mark release pending, retain object and quota
-        Note over J,B: TODO: defer response or acknowledge pending release?
-        B-->>J: Outcome according to agreed release contract
+    B->>B: Check owner, buffer reference and release admission
+    alt Invalid buffer reference or rejection due to busy or release-pending state
+        B->>B: Log ERROR with exact cause, request context and buffer state
+        B-->>J: RPC_STATUS_INTERNAL, preserve existing leases and release ownership
+    else Release admitted
+        B->>B: Reject future use atomically
+        alt No reserved or active operation
+            B->>K: Unlink owned object and close retained FD
+            B->>B: Remove record, release quota
+            B-->>J: Released
+        else Accepted release still has an outstanding lease
+            B->>B: Mark release pending, retain object and quota
+            Note over J,B: Lifecycle TODO in Gaps 1 and 2 defines admission and release-completion timing
+            B-->>J: Completion when the agreed lifecycle contract permits
+        end
     end
     J-->>R: Completion
     R-->>L: RpcResponse
-    L-->>A: Matching release result
+    L-->>A: Matched RpcResponse bytes through waiter or callback
+    A->>A: Check RpcStatus and CryptoError before treating release as successful
 ```
 
 When the last definitive lease ends, the manager can finish a pending release
-exactly once. Unknown IDs, duplicate release and release pending acknowledgements
-need precise error/idempotency rules.
+exactly once. Rejected unknown/unowned buffer references, duplicate release and
+busy/release-pending requests use RPC_STATUS_INTERNAL with an explicit ERROR log.
+They do not create a second release operation or invalidate existing leases.
+The resource-lifecycle contract still determines when a release is admitted,
+whether it waits for leases, and when successful completion is acknowledged.
+Those timing/ownership decisions are separate from the settled error mapping.
 
 Do not rely on the order requests arrived at ROUTER: a queued Encrypt can run
 after a Release job unless its dependency was reserved or ordered earlier.
@@ -3225,8 +3746,8 @@ Close is asynchronous and does not acknowledge remote cleanup.
 | Gateway input | Information to associate |
 | --- | --- |
 | Monitor ACCEPTED | Gateway-side accepted transport FD and its lifetime |
-| ZAP authentication | Trusted peer credentials; Gateway assigns a unique User-Id |
-| ROUTER request | User-Id metadata and binary routing ID |
+| ZAP authentication | Trusted peer credentials and transport FD/lifetime metadata; Gateway assigns a unique User-Id |
+| ROUTER request | User-Id, transport FD/lifetime metadata and binary routing ID |
 | Monitor DISCONNECTED | Transport FD/lifetime and versioned peer credentials |
 
 **Bind the Gateway-side FD and its connection lifetime to User-Id before ZAP
@@ -3270,11 +3791,236 @@ Required rules:
    unbound connection; if reliable runtime accounting is lost, use controlled
    teardown rather than guessing ownership.
 
-Agree the exact local metadata and monitor frame encoding with the platform
-libzmq build. Version-2 events must carry peer credentials and the binding
-information required above; a version number alone is insufficient evidence.
-Validate FD reuse, rapid reconnect, interleaved handshakes and closure before
-the first request on each target.
+Use the local metadata and monitor encoding below. A version-2 monitor alone
+does not establish support for this extension. Validate FD reuse, rapid
+reconnect, interleaved handshakes and closure before the first request on each
+target.
+
+#### Rationale: authentication succeeds before the first message
+
+Coverage: **AC1.4, AC1.6, AC1.10**. The source extension supplies the common
+connection identity needed for cleanup under the selected authentication-time
+session lifecycle. It is not needed merely to obtain an accepted FD.
+
+Unmodified libzmq 4.3.4 already reports the accepted transport FD through
+ZMQ_EVENT_ACCEPTED. Its ZAP request exposes the peer credentials, but neither
+that FD nor a shared connection-lifetime identifier. A received application
+message can provide User-Id and FD together, using message metadata and the
+existing ZMQ_SRCFD accessor. That last association exists only if a message
+actually reaches the Gateway receiver.
+[Monitor events](https://libzmq.readthedocs.io/en/latest/zmq_socket_monitor.html),
+[4.3.4 message metadata](https://github.com/zeromq/libzmq/blob/v4.3.4/src/stream_engine_base.cpp),
+[4.3.4 ZAP request construction](https://github.com/zeromq/libzmq/blob/v4.3.4/src/zap_client.cpp).
+
+The distinction between connection readiness and first-message delivery is
+essential. The transport handshake and ZAP exchange happen during connection
+setup. client_connect returns CLIENT_OK after handshake success; this does not
+require the application to submit a Crypto RPC or confirm that Gateway has
+received any application message. The application may immediately disconnect
+one of its Clients while keeping its other connections open. A transport failure
+can also occur before its first queued message reaches Gateway.
+
+Gateway already creates an independent ApplicationContext and completes
+NotifyAppState(CONNECTED) during authentication, before ZAP success. That context
+needs matching cleanup even if no RPC follows. This failure does not require a
+shared-memory allocation to exist: the authenticated context and Crypto session
+are enough to make targeted disconnect handling necessary.
+
+##### Failure sequence without a shared transport identity
+
+Clients A and B below are two DEALER sockets in the same application process,
+with identical UID/GID/PID. The diagram shows B's authentication being processed
+first to illustrate independent scheduling. The A/B labels describe the actual
+connections for the reader; they are not extra information available to the ZAP
+handler. Neither connection sends an application message in this sequence.
+
+```mermaid
+sequenceDiagram
+    participant A as Client A
+    participant B as Client B - same process
+    participant T as Gateway libzmq
+    participant M as Gateway monitor PAIR
+    participant Z as Gateway ZAP handler
+    participant R as Gateway registry
+    participant C as Private lifecycle worker / ICrypto
+    A->>T: Open UDS connection A
+    T-->>M: ACCEPTED with FD 42
+    M->>R: Record accepted FD 42
+    B->>T: Open UDS connection B
+    T-->>M: ACCEPTED with FD 43
+    M->>R: Record accepted FD 43
+    Note over T,R: Monitor and ZAP processing have no shared per-connection key
+    T->>Z: ZAP for B, shared peer credentials, no FD or lifetime
+    Z->>R: Create context U1 from trusted credentials
+    R->>C: Scoped NotifyAppState(context for U1, CONNECTED)
+    C-->>R: Completed successfully
+    R-->>Z: Context published
+    Z-->>T: ZAP 200 with User-Id U1
+    T-->>B: Handshake succeeds, client_connect returns CLIENT_OK
+    T->>Z: ZAP for A, identical peer credentials, no FD or lifetime
+    Z->>R: Create context U2 from trusted credentials
+    R->>C: Scoped NotifyAppState(context for U2, CONNECTED)
+    C-->>R: Completed successfully
+    R-->>Z: Context published
+    Z-->>T: ZAP 200 with User-Id U2
+    T-->>A: Handshake succeeds, client_connect returns CLIENT_OK
+    Note over A,R: No received RPC or probe has associated either User-Id with an FD
+    B->>T: Close only connection B before its first message arrives
+    T-->>M: DISCONNECTED with FD 43
+    M->>R: Resolve FD 43 to its authenticated context
+    Note over R,C: U1 and U2 share credentials, so the registry cannot safely choose one
+    Note over A,R: Closing both would invalidate live A<br/>Retaining both would leave B's session unreclaimed
+```
+
+Adding UID/GID/PID to the disconnect event identifies the process but still
+does not distinguish U1 from U2. Pairing the first ACCEPTED event with the first
+ZAP request is also insufficient: independent queues and I/O threads do not
+provide that ordering contract. The FD can identify the disconnected transport
+while the application still lacks its association with the authenticated session.
+
+##### Why an immediate request or automatic probe does not close the gap
+
+ZMQ_PROBE_ROUTER=1 can make DEALER automatically send an empty message when a
+connection is established. It defaults to 0. This is a one-time probe, not a
+periodic heartbeat; Gateway would have to recognize it separately from an RPC.
+If received, it can help associate routing identity, User-Id and FD. It is not
+enabled by the current client design.
+[ZMQ_PROBE_ROUTER](https://libzmq.readthedocs.io/en/latest/zmq_setsockopt.html#zmq-probe-router-bootstrap-connections-to-router-sockets).
+
+Neither a probe nor an application HELLO is guaranteed to reach Gateway before
+the connection fails. Successful zmq_send only establishes local queue
+acceptance. A successful transport handshake is not an acknowledgement that
+Gateway's application loop has consumed the probe. The failure sequence above
+therefore also applies when a first message was queued but never received.
+[Send completion contract](https://libzmq.readthedocs.io/en/latest/zmq_send.html).
+
+An explicit HELLO/ACK protocol could define a different session-activation
+boundary and defer Crypto CONNECTED until Gateway receives HELLO. That would
+require a new bootstrap contract and rules for all pre-HELLO state. It would
+change the selected requirement to bind the context and notify Crypto during
+ZAP. The source extension satisfies that existing requirement without depending
+on a new application message. FD and outgoing-route reuse also require lifetime
+checks independently of when the first message arrives.
+
+##### Selected sequence with the connection-lifetime extension
+
+The extension assigns the lifetime before authentication and carries it through
+local ZAP metadata, received messages and monitor events. The registry can bind
+the FD to User-Id before acknowledging ZAP. The sequence below shows B closing
+without an RPC while A remains live.
+
+```mermaid
+sequenceDiagram
+    participant B as Client B
+    participant T as Gateway libzmq
+    participant M as Gateway monitor PAIR
+    participant Z as Gateway ZAP handler
+    participant R as Gateway registry
+    participant C as Private lifecycle worker / ICrypto
+    Note over R,C: Client A already has independent context U2, FD 42, lifetime 101
+    B->>T: Open UDS connection B
+    T->>T: Capture credentials, assign FD 43 and lifetime 102
+    T-->>M: ACCEPTED with FD 43 and lifetime 102
+    M->>R: Record transport lifetime 102 in the current activation
+    T->>Z: ZAP credentials plus local FD 43 and lifetime 102 metadata
+    Z->>R: Bind User-Id U1 to FD 43 and lifetime 102
+    R->>C: Scoped NotifyAppState(context for U1, CONNECTED)
+    C-->>R: Completed successfully
+    R-->>Z: Context ready, binding established
+    Z-->>T: ZAP 200 with User-Id U1
+    T-->>B: Handshake succeeds, client_connect returns CLIENT_OK
+    Note over B,R: No application RPC or probe is required to establish this binding
+    B->>T: Close connection B before sending any RPC
+    T-->>M: DISCONNECTED with FD 43, peer credentials and lifetime 102
+    M->>R: Resolve current activation and lifetime 102, verify stored FD
+    R->>R: Mark only U1 closing, finish its accepted work if any
+    R->>C: Scoped NotifyAppState(context for U1, DISCONNECTED)
+    C-->>R: Completed successfully
+    R->>R: Retire U1 and its releasable resources
+    Note over R,C: Client A and context U2 remain active
+    opt A later connection reuses the numeric FD
+        T->>T: Reuse FD 43 with a new lifetime 103
+        T-->>M: ACCEPTED with FD 43 and lifetime 103
+        M->>R: Track the new lifetime independently
+        Note over M,R: Old lifetime 102 events or cleanup work cannot select lifetime 103
+    end
+```
+
+The shown ordering is one valid execution, not a requirement that monitor
+events arrive before ZAP. Both paths use the same lifetime, so the registry can
+merge their evidence without guessing. If disconnect overtakes an in-progress
+authentication or CONNECTED job, retain a CLOSING record for that lifetime.
+After the job settles, send matching DISCONNECTED if CONNECTED succeeded;
+late authentication completion must not reactivate the closed context.
+
+The non-reused lifetime is also necessary after the initial binding: a delayed
+event, retained job or cleanup action keyed only by FD could otherwise select
+a replacement connection. Carry the activation/lifetime tuple through every
+such record. For outgoing responses, check the original lifetime against the
+currently selected ROUTER pipe before sending, as specified below. The patch
+provides the transport evidence and send guard; Gateway must implement the
+registry transitions and resource cleanup that consume them.
+
+#### Required libzmq extension and platform integration
+
+The reviewed RDK manifest selects `meta-openembedded` tag `rdk-4.0.0`, whose
+[ZeroMQ recipe](https://github.com/rdkcentral/meta-openembedded/blob/4ad41baed6236d499804cbfc4f174042d84fce97/meta-oe/recipes-connectivity/zeromq/zeromq_4.3.4.bb)
+uses **libzmq 4.3.4**. Build that library with the connection-lifetime source
+extension and `-DENABLE_DRAFTS=ON`. Gateway uses the matching headers with
+`ZMQ_BUILD_DRAFT_API` defined. Stock libzmq 4.3.4 does not supply this complete
+binding; the properties and guarded-send option below are downstream additions.
+
+| Boundary | Required extension contract |
+| --- | --- |
+| ZAP request body frames | `zmq_msg_gets()` exposes `Transport-Connection-Id` and `Transport-FD` as decimal uint64 strings; Peer-Address retains kernel-derived UDS credentials |
+| Received ROUTER request | The same transport properties accompany User-Id on the body and routing frames; copy them before closing the messages |
+| Monitor ACCEPTED, version 2 | Two values: `[FD, connection_id]` |
+| Monitor DISCONNECTED, version 2 | Five values: `[FD, UID, GID, PID, connection_id]` |
+| Monitor version 1 | Existing framing and single FD value remain unchanged; it cannot provide the required lifetime binding |
+| Outgoing ROUTER reply | Set `ZMQ_ROUTER_EXPECTED_CONNECTION_ID` to the original request's uint64 transport identity before its routing frame; libzmq verifies the selected pipe on the ROUTER owner thread |
+
+The stream engine allocates a nonzero identity before authentication and does
+not reuse it within the loaded library instance. Pair it with Gateway's own
+activation generation; the identity is not persistent across process restart
+or library unloading. Capture UID/GID/PID while the accepted UDS FD is valid;
+disconnect reporting uses the retained snapshot. An unavailable credential is
+represented by UINT64_MAX and must not be accepted as a valid UDS identity.
+
+ZAP keeps its standard multipart body. The added properties are local message
+metadata, not extra wire frames or application-supplied credentials. The ZAP
+request-ID field is not the connection lifetime. Native transport properties
+take precedence over metadata from ZAP replies or remote peers. This contract
+uses a direct inproc ZAP handler; rebuilding ZAP messages from their byte strings
+alone would lose the local properties.
+
+The ROUTER guard uses downstream option number 10001 and a native uint64
+argument. Its value persists until changed; zero disables it. Gateway must
+successfully set the original connection ID for every response, then attempt
+the routing frame and body under the single-attempt policy in section 6.6.
+A missing or replaced route fails with EHOSTUNREACH before entering multipart
+send state, even if the same routing-ID bytes now identify a different peer.
+Do not send the body after routing-frame failure. The guard does not promise
+peer receipt after local send acceptance.
+
+Keep ROUTER_MANDATORY enabled and ROUTER_HANDOVER disabled. The guard supports
+the binding ROUTER and accepted ZMTP TCP/IPC stream path; unsupported routes
+fail closed. Check option results, metadata presence and monitor frame counts.
+Do not silently fall back to PID matching, an unguarded send or assumed event
+ordering when the installed library lacks the extension. The version number
+reported by zmq_version() alone cannot identify this downstream capability.
+
+The extension's native Linux/GCC 9 regression covers independent connections
+from one process, no-request disconnects, rejected/in-progress authentication,
+closure before ZAP, actual FD reuse, context recreation, monitor-v1 compatibility
+and stale reply rejection after forced route reuse. It also checks that ZAP
+metadata cannot replace native transport identity. This validates the source
+extension, not the EyilGateway implementation or the deployed device binary.
+
+**TODO(ZMQ-PLATFORM):** integrate the extension into the product recipe, consume
+its properties/events and guarded-send option in Gateway, and verify the
+matching headers, library and behavior on the target rootfs. Gateway must still
+serialize authentication/disconnect state, retain closing records for late
+events and explicitly retire its contexts during local shutdown.
 
 #### Event-driven connection cleanup
 
@@ -3284,13 +4030,20 @@ for accepted work. Queued requests start within their original worker deadline
 or expire; started operations finish before destructive cleanup. There is no
 reconnect grace period or idle/process-responsiveness timeout.
 
+Discard completed responses waiting for the closed route and release their
+response capacity. Later completions from retained old jobs are discarded on
+the same generation check. An explicit client reconnect authenticates a new
+context; never transfer the old queue, response storage or buffer ownership to
+it. Old resources remain retained only as needed for safe backend completion
+and cleanup, independently of the new context.
+
 ```mermaid
 sequenceDiagram
     participant P as Peer / kernel
     participant Z as libzmq monitor producer
     participant M as Gateway PAIR monitor worker
     participant REG as Registry / Gateway ROUTER I/O owner
-    participant J as Accepted jobs / private pool
+    participant J as Accepted request and initialization jobs / private pool
     participant C as Crypto adapter
     participant T as Thunder IShell
     participant CP as Crypto plugin / ICrypto
@@ -3303,20 +4056,31 @@ sequenceDiagram
         REG->>REG: Ignore duplicate/stale event without touching a reused FD
     else Original context found
         REG->>REG: Mark CLOSING, remove admission and route visibility
-        REG->>J: Retain accepted work, settle queued deadlines and active calls
-        J-->>REG: All work settled and backend access ended
-        opt CONNECTED succeeded
-            REG->>C: Schedule one DISCONNECTED lifecycle job
-            C->>T: Query ICrypto using configured callsign
-            T-->>C: Scoped reference
-            C->>CP: NotifyAppState(context, DISCONNECTED)
-            CP-->>C: Invocation and service result
-            C->>CP: Release reference
-            C-->>REG: Notification result
+        REG->>REG: Drop completed undeliverable responses and release their capacity
+        REG->>J: Retain accepted work, settle queued deadlines, active calls and CONNECTED
+        J-->>REG: Jobs settled, including any uncertain buffer-access outcome
+        alt Backend access is definitively over
+            opt CONNECTED succeeded
+                REG->>C: Schedule one DISCONNECTED lifecycle job
+                C->>T: Query ICrypto using configured callsign
+                T-->>C: Scoped reference or nullptr
+                alt Interface acquired
+                    C->>CP: NotifyAppState(context, DISCONNECTED)
+                    CP-->>C: Invocation and service result
+                    C->>CP: Release reference on every completed call path
+                    C-->>REG: Notification outcome, log any failure
+                else Lookup failed
+                    C-->>REG: Log cleanup notification failure, no background retry
+                end
+            end
+            REG->>B: Finalize allocations whose backend access ended
+            B-->>REG: Releasable resources reclaimed
+            REG->>REG: Retire private context and binding when retained cleanup references end
+        else Backend buffer access remains uncertain
+            REG->>B: Preserve affected allocations and leases
+            REG->>REG: Retain private cleanup state, keep admission and routes closed
+            Note over REG,B: Gap 1 defines the completion evidence needed to finish cleanup
         end
-        REG->>B: Finalize allocations whose backend access ended
-        B-->>REG: Released, or retained if access remains uncertain
-        REG->>REG: Retire context and binding once
     end
 ```
 
@@ -3324,6 +4088,11 @@ CONNECTED occurs during authentication, so an authenticated connection that
 sends no RPC still receives matching cleanup. If closure races CONNECTED, await
 its outcome and retire the provisional context without admitting requests.
 Do not infer that a failed notification cancelled an outstanding backend call.
+Public admission/route removal is immediate; physical destruction waits for
+retained jobs and leases. A returned invocation error does not, by itself,
+establish that a remote operation stopped. Keeping private cleanup state for
+that uncertainty does not re-enable the old connection or introduce Crypto
+health polling.
 
 A confirmed exit of an exact process instance can identify all its associated
 contexts if process-exit integration is adopted. It needs PID-reuse protection.
@@ -3397,7 +4166,7 @@ sequenceDiagram
     else Actual transport or Gateway failure occurred during pause
         C->>C: Process connection failure through the normal monitor/I/O path
         C-->>A: Report connection/request failure without replaying old work
-        Note over A,G: Reconnect and resource recovery follow the separate lifecycle contract
+        Note over A,G: Retire old pending state, explicitly close and connect a fresh session
     end
 ```
 
@@ -3476,7 +4245,9 @@ Coverage: **AC1.8–AC1.10**.
 There is no Crypto health-monitoring component or plugin-availability
 subscription. A request or lifecycle job resolves the configured interface
 when it needs to call it. A failed lookup is an invocation-time condition;
-it does not stop Gateway transport or prevent Gateway-local buffer operations.
+it does not stop Gateway transport or prevent Gateway-local buffer operations
+on an already authenticated context. A failure of CONNECTED during a new
+authentication rejects that setup as specified in section 6.5.
 
 ```mermaid
 sequenceDiagram
@@ -3621,6 +4392,7 @@ sequenceDiagram
     T->>P: Deinitialize
     P->>P: Suppress new callbacks, retain implementation and IShell
     P->>I: StopAndWait()
+    Note over I,B: Normal drain path below requires definitive backend completion<br/>Unresolved leases keep cleanup pending under Gap 1
     I->>I: RUNNING to DRAINING under admission lock
     I->>R: Reject new RPCs, keep replies/control processing
     I->>Z: Reject new authentication, resolve in-progress setup
@@ -3738,8 +4510,9 @@ Actual UDS closure is detected by the client monitor without heartbeats. A
 frozen client processes it after resuming. Pending sync/send waiters fail;
 accepted async records retire without synthetic response callbacks. The app may
 close the old Client from an application thread and call client_connect again.
-Automatic reconnect/queued-send settings remain a separate client decision;
-old-session operations must not be replayed.
+Automatic reconnect is disabled. Close with zero linger, discard old pending
+requests and undelivered responses, and establish a fresh session as specified
+in section 5.14. Old-session operations must not be replayed.
 
 Use fresh buffer names after restart. Do not adopt old objects or blindly
 unlink allocations from a previous runtime. Persistent leftover storage and
@@ -3753,17 +4526,21 @@ as part of this delivery. The following order separates transport, operation
 routing and lifecycle work without deferring the ICrypto dependency:
 
 1. Implement the FD/lifetime binding and fresh-runtime stop/reactivation
-   contract. Resolve remaining client callback/shutdown API choices and apply
-   the selected 15-second
+   contract. Apply the agreed client callback and synchronous local-close
+   contracts, together with the selected 15-second
    connect/sync-request/async-send deadlines, dynamic client queues and
    CLIENT_OUT_OF_MEMORY handling, with no async response timeout. Disable ZeroMQ
-   heartbeats on both ends. Keep app-owned freeze preparation and actual
-   disconnect/reconnect behavior distinct; destructive lifecycle and platform
+   heartbeats on both ends. Implement terminal client loss, zero-linger queue
+   disposal and explicit fresh reconnect. Keep app-owned freeze preparation and
+   actual disconnect/reconnect behavior distinct; destructive lifecycle and platform
    integration decisions remain separate.
 2. Implement the agreed RPC envelope, local error behavior and selected async
    completion contract. Document that contract in the public API. Add EyilClient's
    owner loop, mutex-protected dynamic queue, pending map and shutdown. Prove
-   two callers can use one connection without touching its socket.
+   two callers can use one connection without touching its socket. Resolve
+   TEXT-SERVICE-CONTRACT before implementing string service routing and response
+   interpretation; both string request methods retain their required plain-text
+   public boundary.
 3. Implement startup, ZAP/interim identities, authentication-time CONNECTED,
    the registry and monitor binding. Prove multiple connections from one PID
    remain independent, including closure before the first request.
@@ -3786,25 +4563,35 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 async send | API cannot return CLIENT_OK before zmq_send accepts the message; EAGAIN keeps the send waiter pending; timeout/error cancels unsent work with no callback; race acceptance against deadline and disconnect |
 | L1 async response | A response later than 15 seconds is delivered; no response timer exists; original callback signatures carry valid Gateway error responses; connection loss or local response-processing failure retires the record without an error callback |
 | L1 callback execution | Request calls from the I/O-owner callback return CLIENT_INVALID_ARGUMENT; freeing a response is allowed; callback runs without internal locks and may precede submitting-thread resumption |
-| L1 dynamic client queue | More than 64 requests can be queued/pending when allocations succeed; producers push under the mutex and the owner processes outside it; no local count-limit rejection |
+| L1 connection callbacks | Initial success and every startup failure produce no callback; later unexpected loss produces CLIENT_CONNECTION_LOST at most once; explicit close suppresses new callback claims; RESTORED and TERMINATED are never emitted, including after an explicit fresh connect |
+| L1 dynamic client queue | Grow submission/pending state independently of finite socket high-water marks when allocations succeed; producers push under the mutex and the owner processes outside it; no fixed client queue-count rejection |
 | L1 client startup allocation failures | Fail runtime, thread-start and owner-side setup allocation; CLIENT_OUT_OF_MEMORY leaves output NULL, closes partial resources and joins only started threads |
 | L1 client submission allocation failures | Inject failure during input copy, request/waiter creation, queue push, serialization and pending-map insertion; all four request APIs return CLIENT_OUT_OF_MEMORY before send acceptance, release partial state and cannot send later or invoke a callback |
 | L1 client response allocation failures | Sync returns CLIENT_OUT_OF_MEMORY and NULL/0; matched async responses retire without a callback or revision of accepted CLIENT_OK, even before the submitter resumes; uncorrelatable decode failure follows connection-wide cleanup |
 | L1 client cleanup under allocation failure | Free/disconnect complete without allocating a queue action or temporary cleanup container; notification register/unregister allocate nothing and retain their specified outcomes |
-| L1 client deadlines | Sync uses one 15-second total budget and async only a 15-second send budget; queue cancellation cannot send work after returning failure |
+| L1 client deadlines | Sync uses one 15-second total budget through final byte/string result preparation and async only a 15-second send budget; queue cancellation cannot send work after returning failure |
+| L1 terminal client loss | Retire unsent/pending work and uncommitted responses once; unresolved waiters get CLIENT_COMMUNICATION_ERROR, accepted async submissions retain CLIENT_OK without error callbacks; preserve committed/app-owned responses and reject new requests on the lost handle |
+| L1 explicit client disconnect | Close with queued sync/async/string calls; unresolved waiters return CLIENT_NOT_CONNECTED with cleared outputs, accepted async sends retain CLIENT_OK, pending IDs and undelivered responses retire once; cancelled actions never send later |
+| L1 disconnect races and callbacks | Race close against send acceptance, timeout, response claim and transport loss; preserve one result, suppress intentional-close events, release every live-call guard and wait for claimed callbacks; no callback or state access after return |
 | L1 plain-string APIs | Both string methods copy to the first NUL with no size argument or caller encoding; exercise empty strings, whitespace and line breaks as data, text bounds, caller input reuse and allocation failures; append one response terminator and reject unrepresentable response text without truncation |
+| L1 string completion races | Race response-text preparation with the synchronous deadline, explicit close and transport loss; no intermediate binary success escapes, the winning result is preserved, and any losing prepared string is freed |
 | L2 text/service mapping | Once TEXT-SERVICE-CONTRACT is defined, verify routing, request interpretation and text responses including Gateway/service errors over binary Protobuf IPC; never parse arbitrary text as a CryptoRequest |
 | L1 Gateway | Envelope/oneof validation; context lookup; queued/in-flight ownership; enum/presence mapping; allocation rollback |
+| L1 Gateway rejection logging | Invalid service payload, buffer quota and rejected busy/release-pending operations produce RPC_STATUS_INTERNAL with empty payload and an ERROR log identifying the exact cause and known request/connection context; duplicate IDs cannot dispatch twice or replace the original completion; unsafe correlation logs/drops without a fabricated reply; logs contain no payload or key material |
 | L1 Gateway queue | 1,024 global waiting slots include staged/pool-queued jobs; saturation rejects with RPC_STATUS_INTERNAL; allocation failure rolls back credit; control cleanup remains possible |
 | L1 Gateway dispatch deadline | Expire after 10,000 ms without starting; include pool queue time; race expiry against Dispatch; exactly one result and no backend execution after expiry; do not time out running calls |
 | L1 Gateway drain | Atomic admission cutoff; queued work starts or expires under original deadline; active work finishes; callbacks and stop state require no new shutdown queue allocation |
 | L1 Gateway response capacity | Reserve at most 128 slots per connection and 1,024 globally plus configured byte allowances before execution; reject without service execution on exhaustion; no blocking/overflow queue; release each reservation once |
+| L1 resource configuration | Exercise the selected product message/byte/quota bounds and arithmetic; reject before side effects where possible, log exact resource failures and release reservations once; section 6.2's proposed numeric values are not hard-coded acceptance requirements |
 | L1 Gateway response send | At most one logical response attempt; EAGAIN/EHOSTUNREACH/EINTR cause local error and drop; no requeue, second error response or backend replay; storage released once; multipart frames never cross responses |
 | L1 concurrency | Queued/active leases, disconnect during dispatch, independent connections and dependency barriers |
 | L2 transport | Real DEALER/ROUTER IPC, ZAP metadata, reverse-order completion and simultaneous sync/async callers |
-| L2 connect readiness | CONNECTED alone cannot complete connect; HANDSHAKE_SUCCEEDED returns CLIENT_OK; explicit rejection returns CLIENT_AUTH_FAILED; absent/stalled endpoint reaches CLIENT_TIMEOUT; each failure wakes the waiter and rolls back resources |
+| L2 connect readiness | CONNECTED alone cannot complete connect; HANDSHAKE_SUCCEEDED returns CLIENT_OK; explicit rejection returns CLIENT_AUTH_FAILED; unresolved/stalled attempt reaches CLIENT_TIMEOUT; each failure wakes the waiter and rolls back resources; no startup outcome invokes a callback, and immediate subsequent loss cannot expose an unpublished handle |
+| L2 explicit reconnect | Verify RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0; after loss and Gateway return, no automatic handshake or old queued send occurs; explicit close/new connect creates an empty client runtime and new Gateway session, rejects old buffer IDs and never delivers old replies to new requests |
+| L2 client disconnect barrier | Disconnect with pending calls and an active short callback; wake callers before waiting, join socket owners without lock deadlocks, discard transport queues, preserve app-owned responses and verify zero callbacks after return |
 | L2 disabled heartbeats | Verify IVL/TIMEOUT/TTL are 0 on DEALER and ROUTER before connect/bind and after socket recreation; confirm monitor-driven cleanup still occurs on actual socket closure |
 | L2 disconnect | Trusted FD/lifetime-to-User-Id binding; close one of multiple connections from a PID; delayed/duplicate events and FD/route reuse; disconnect before first request; no unrelated cleanup |
+| L2 guarded responses | Apply the expected transport lifetime to successful and error replies; force route reuse and verify no old response reaches a replacement connection, including before monitor cleanup catches up |
 | L2 buffers | Container-private mapping, cross-connection rejection, release during work, size/region failures and lost replies |
 | L2 lifecycle | Fail every startup stage; stop idle/busy/full-queue runtimes; CONNECTED-in-progress and disconnect races; accepted work settles before DISCONNECTED and buffer release |
 | L2 socket teardown | ROUTER closes on its owner after drain; slow/frozen reader cannot block; REP/PAIR close on stop/ETERM; no final monitor-event dependency; all threads/context retire |
@@ -3853,13 +4640,22 @@ requires the behavior tests described above.
 #### Build, install and validation
 
 Required tools: CMake 3.21+, Ninja, a C/C++ compiler, Protobuf 3.15+ development
-files and protoc, ZeroMQ 4.3+ development files, and Python 3.9+. Building the
-plugin additionally requires Thunder Core/COM/Plugins, ThunderTools and the
+files and a host-runnable protoc, ZeroMQ development files, and Python 3.9+.
+Building the plugin additionally requires Thunder Core/COM/Plugins, ThunderTools and the
 matching IConfiguration and ICrypto headers in the SDK. Obtain ICrypto from
 entservices-apis branch topic/crypto as specified in section 6.7. Out-of-process
 use requires compatible proxy/stubs for every crossed interface, including
 ICrypto when Crypto is remote, and IConfiguration plus the private lifecycle
-control interface when Gateway implementation mode is Local. Do not mix headers and bindings from incompatible releases.
+control interface when Gateway implementation mode is Local. Do not mix headers
+and bindings from incompatible releases.
+
+For Gateway runtime builds and transport L2 tests, use **libzmq 4.3.4 with the
+connection-lifetime extension**, ENABLE_DRAFTS=ON and matching consumer headers
+with ZMQ_BUILD_DRAFT_API. Section 6.14 defines the required metadata, monitor and
+guarded-send contract. Finding an arbitrary ZeroMQ 4.3+ package is insufficient
+to establish Gateway compatibility. Client/protocol-only builds can use a
+supported stock ZeroMQ 4.3+ package; those builds do not validate the Gateway
+extension. Product builds must link and load the same compatible dependency.
 
 With PLUGIN_EYILGATEWAY enabled, ICrypto headers are a required build input:
 configuration must report a missing SDK/API dependency instead of silently
@@ -3872,6 +4668,7 @@ For a native SDK build, install the host development prerequisites, then run:
 ```sh
 bash build_dependencies.sh
 bash build.sh
+source scripts/environment.sh
 python3 scripts/run-tests.py --build-dir build --label L1
 python3 scripts/run-tests.py --build-dir build --label L2
 bash scripts/check-install.sh build rootfs/all
@@ -3924,6 +4721,7 @@ contract. Runtime tests validate the client and Gateway flows described above.
 
 ```sh
 EYIL_BUILD_DIR=build-coverage bash build.sh -DENABLE_COVERAGE=ON
+source scripts/environment.sh
 python3 scripts/coverage.py --build-dir build-coverage
 ```
 
@@ -3956,6 +4754,12 @@ and licensing checks run together with JSON checks in `json_validator.yml`.
 The scripts directory supplies the build and validation commands used locally
 and in CI; GitHub Actions itself does not require that directory layout.
 
+Gateway transport acceptance tests require the extended libzmq and selected
+ICrypto SDK/bindings described above. Installing a distribution libzmq3-dev
+package alone does not establish those runtime prerequisites. Record the
+dependency revision/capabilities with test results and validate the installed
+device binary separately under ZMQ-PLATFORM.
+
 Jobs use GitHub-hosted `ubuntu-24.04` runners. This release supplies Protobuf
 3.21, which meets the project's 3.15 minimum for proto3 optional fields.
 The native SDK cache includes the runner release.
@@ -3968,10 +4772,6 @@ on pull requests from branches in this repository. It requires the four FOSSID
 secrets referenced in the workflow and skips fork pull requests. CLA uses
 `rdkcentral/cmf-actions` and requires CLA_ASSISTANT. Build, test, coverage and
 repository-validation jobs require no organization credentials.
-
-TODO(CI): add Coverity when an accessible rdkcentral workflow and its credential
-contract are available. No private Coverity workflow is referenced in this
-repository.
 
 The scripts directory, formatting configuration and CHANGELOG.md must be
 committed with the workflows so a fresh checkout contains their dependencies.
@@ -3991,6 +4791,9 @@ request ordering. FD/lifetime binding, graceful plugin stop/reactivation, fresh
 startup after a crash, authentication-time CONNECTED and bounded response
 handoff with one send attempt are defined requirements. Crypto owns its
 internal session, key and recovery implementation; those are not Gateway gaps.
+Section 7.3 lists the remaining API/product choices and future platform
+requirements. Section 7.4 separates integration and verification of selected
+contracts from questions about their design.
 
 ### 7.1 Gap 1: Stable shared-memory object identity and lifetime
 
@@ -4022,8 +4825,10 @@ Answers required:
   Are input snapshots or a different protected mapping arrangement required?
 - After a client timeout, disconnect or uncertain COM-RPC result, what proves
   backend completion? How does the app learn that reuse is safe?
-- What are the release acknowledgement and BUFFER_OVERFLOW/required-capacity
-  contracts?
+- When does ReleaseSharedBuffer acknowledge completed release, and how does
+  the app coordinate reuse while a release or earlier access is still pending?
+  The rejection status is already defined. Crypto's BUFFER_OVERFLOW output
+  follows the selected ICrypto contract described in section 6.12.
 
 **Implementation constraint:** retain leases and quarantine uncertain use.
 Gateway ownership is allocation ownership; it is not immutability, revocation
@@ -4051,7 +4856,8 @@ Answers required:
 - Does a job acquire/reserve its buffer dependency before enqueueing or when
   execution begins? How is a queued use protected from a later Release?
 - Are dependent operations client-ordered, server-serialized, rejected while
-  busy or represented by continuations? Which errors express rejection?
+  busy or represented by continuations? A rejection uses the agreed
+  RPC_STATUS_INTERNAL and ERROR-log contract from section 4.2.
 - How do buffer reservations and completion publication stay consistent when
   closing admission races an already accepted request or release?
 
@@ -4075,24 +4881,33 @@ ordering while keeping unrelated requests concurrent on the private worker pool.
 ### 7.3 Remaining API and platform decisions
 
 These items complement the two lifecycle-related gaps and cover client API
-or platform integration decisions.
+and product decisions. Future platform lifecycle requirements do not block
+the selected initial explicit-close/fresh-connect and plugin-drain contracts.
 
 | TODO | Answer needed / integration boundary |
 | --- | --- |
 | AUTH-APPMANAGER | Formal UID lookup via AppManager/RuntimeManager, authoritative app/app-instance identity, UID reuse guarantees and lookup failure behavior |
 | API-AUTHORIZATION | Exact entitlement format and mapping from service/operation to allowed APIs; currently all supported APIs are allowed |
 | LIFECYCLE-EVENTS | Whether/how to integrate stop, destruction or platform hibernation events; application-owned freeze preparation is agreed, and transport heartbeats remain disabled independently of future observers |
-| CONNECTION-LIFETIME | Client automatic-reconnect/queued-send settings and destructive checkpoint/restore behavior; Gateway restart creates fresh state and explicit client close/new connect is supported |
-| CLIENT-CALLBACKS | Initial connection-callback timing and connection-handler lifetime/quiescence; public response-only async signatures, send acceptance, I/O-thread execution and reentrancy rules are defined in section 5.4 |
-| CLIENT-SHUTDOWN | Explicit local-close result code for active sync/send-result waiters, shutdown callback ordering and concurrent-caller quiescence; accepted async response records are retired without synthetic error callbacks |
+| RECONNECT-LIFECYCLE | Future platform requirements, absent from the supplied ACs, for automatic reconnect, retry, reauthentication or session restoration and any use of RESTORED/TERMINATED. The initial delivery is already defined: cleanup and explicit fresh connect, no automatic reconnect, and only later unexpected loss emits CLIENT_CONNECTION_LOST |
+| CHECKPOINT-RESTORE | Platform-specific behavior when hibernation replaces a process or descriptors; ordinary connection loss already requires cleanup and explicit fresh reconnect, while an idle freeze preserving the connection does not |
 | CLIENT-MONITOR | Confirm the monitor-responsibility checklist in section 5.2 and whether PAIR plus the I/O owner satisfies the AC, or a distinct OS thread is mandatory |
 | TEXT-SERVICE-CONTRACT | Service selection for plain-string calls, Gateway payload identification/interpretation and response text including RpcStatus/service errors; NUL-terminated input/output and no caller encoding are already agreed |
-| ERROR-MAPPING | Invalid service payload, duplicate/malformed IDs, busy/release-pending and quota errors; null ICrypto lookup and invocation failure already map to RPC_STATUS_INTERNAL |
 | BUFFER-HELPER | Ownership of app-side shm_open/mmap helpers, output validation and release coordination |
-| DEPLOYMENT | UDS mount/recreation, permissions, procfs/user-namespace access, private /dev/shm and blocked direct Crypto communicator access |
-| RESOURCE-LIMITS | Platform sizing for finite message/response byte limits, libzmq high-water marks, worker count/stacks and shared-buffer quotas; selected Gateway waiting limit is 1,024/10 seconds and response slots are 128 per connection/1,024 globally; client queue has no fixed count cap |
-| ZMQ-PLATFORM | Implement/verify trusted FD/lifetime metadata at authentication and monitor events, peer credentials and route binding on each supported target as required in section 6.14 |
-| CI | Add Coverity only when the usable public workflow and credential contract are available; real L1/L2 coverage follows real tests |
+| RESOURCE-LIMITS | Validate and select product values from the [resource-sizing proposals in section 6.2](#proposed-initial-resource-sizing): message/response byte limits, queue byte budgets, libzmq high-water marks, worker count/stacks and shared-buffer quotas; the agreed Gateway waiting limit remains 1,024/10 seconds and response slots remain 128 per connection/1,024 globally; client queue has no fixed count cap |
+
+### 7.4 Integration and validation work
+
+These items implement or verify selected contracts. They are not additional
+unresolved Gateway architecture gaps.
+
+| Work item | Required integration / evidence |
+| --- | --- |
+| ZMQ-PLATFORM | Integrate the libzmq 4.3.4 connection-lifetime extension into the product build and Gateway consumers; enable draft APIs, use ZAP/request metadata, version-2 FD/lifetime events and guarded ROUTER sends, then validate the exact rootfs binary; section 6.14 defines the contract |
+| DEPLOYMENT | Configure and verify UDS mounts across endpoint recreation, permissions, procfs/user-namespace access, private /dev/shm and blocked direct Crypto communicator access. Confirm platform ownership of leftover storage after a crash; Gateway starts fresh and does not reconstruct or blindly unlink old allocations |
+| Private Thunder pool | Validate nonblocking job handoff, ownership transfer, capacity wakeups and drain against the target Thunder API; keep application jobs off the global pool and preserve the 1,024-entry/10-second waiting contract |
+| SDK and runtime dependencies | Supply the selected topic/crypto ICrypto headers/bindings, configured Crypto callsign and matching Thunder interfaces; validate per-call references, authentication-time CONNECTED and ordered DISCONNECTED without a Crypto health observer |
+| Runtime acceptance | Exercise the L1/L2 scenarios in section 6.17 on the intended dependency set and device, including concurrent requests, response drops, stop/reactivation and prepared process freeze |
 
 **Integration boundary:** Gateway has a required dependency on the topic/crypto
 ICrypto API and uses the deployed Crypto plugin through the CMake-configured
@@ -4104,5 +4919,7 @@ idle process-freeze preparation, 15-second connect/sync-request/async-send
 deadlines, no async response
 timeout and dynamic client queues with allocation-failure reporting are selected.
 ZeroMQ transport heartbeats are disabled on both ends; application heartbeat and inactivity-watchdog
-logic are excluded. Actual reconnect, destructive hibernation/checkpoint behavior
-and external lifecycle integration remain explicit architecture questions.
+logic are excluded. Connection loss retires old pending work and transport queues;
+automatic reconnect is disabled and explicit reconnect creates fresh state.
+Destructive hibernation/checkpoint behavior and external lifecycle integration
+remain explicit architecture questions.
