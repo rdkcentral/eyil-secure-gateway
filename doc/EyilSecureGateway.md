@@ -97,6 +97,11 @@ fresh runtime state; old connections and requests are not restored. Section
 | AC2.3 | Receive socket monitor events on a monitor thread through a `ZMQ_PAIR` at `inproc://app-eyil-client-monitor-<unique-client-id>`. Consolidating this work into the I/O owner requires the confirmation described in section 5.2. |
 | AC2.4 | Implement all four binary/string request methods, including client_send_request_async and client_send_request_string_async. Support multiple outstanding requests on one connection and responses arriving out of order. Async calls return CLIENT_OK after the I/O owner successfully submits the message to libzmq, then deliver a validated response through the supplied response callback with no response timeout. Section 5.4 defines send failures and cleanup when no response can be delivered. |
 
+Both string methods accept ordinary NUL-terminated text without a caller-supplied
+length or encoding step. EyilClient owns input copying and wire serialization.
+The byte methods retain explicit sizes for binary Protobuf. Section 5.8 defines
+the string boundary and the remaining text/service interpretation contract.
+
 Notification APIs are retained for future support. In this version,
 client_register_notifications returns CLIENT_NOT_IMPLEMENTED and
 client_unregister_notifications has no effect. No notification handler is stored
@@ -333,6 +338,13 @@ serialized response to that caller. The service is carried in the envelope;
 no separate service argument is needed. Crypto payload bytes remain opaque to
 EyilClient and are interpreted by the service-specific consumer.
 
+Both string request APIs accept ordinary NUL-terminated request text and return
+ordinary NUL-terminated response text. EyilClient measures and copies input up
+to the first NUL; the caller supplies no size or text encoding. Wire envelope
+construction and serialization belong inside the library. Protobuf bytes fields
+and ZMQ can carry text bytes directly. The service route and interpretation of
+that text are a separate contract, described in section 5.8.
+
 ### 4.2 Status and error layers
 
 | Layer | Meaning and handling |
@@ -358,7 +370,7 @@ carry local ClientResult errors.
 
 | Situation | ClientResult | Response handling |
 | --- | --- | --- |
-| Invalid arguments or invalid caller-supplied request envelope | CLIENT_INVALID_ARGUMENT | No response |
+| Invalid arguments, oversized string input or invalid caller-supplied binary request envelope | CLIENT_INVALID_ARGUMENT | No response |
 | client_register_notifications is called | CLIENT_NOT_IMPLEMENTED | Reserved for future support; no handler is stored or invoked |
 | client_connect receives a valid, already allocated Client handle in the caller's slot | CLIENT_ALREADY_CONNECTED | Preserve the existing handle and connection state; create no new connection and invoke no callback |
 | Submission without a usable connection | CLIENT_NOT_CONNECTED | No response |
@@ -373,6 +385,12 @@ For synchronous byte responses, every local error produces `response_data == NUL
 A valid Gateway error response, including RPC_STATUS_INTERNAL, is still a
 received RPC response: return CLIENT_OK with its bytes and preserve RpcStatus.
 Do not turn a local failure into a fabricated Gateway RpcResponse or CryptoError.
+
+Byte APIs expose the complete RpcResponse for the caller to inspect. String
+APIs expose text; TEXT-SERVICE-CONTRACT must define how Gateway and service
+errors are represented in that text. A valid Gateway error response must remain
+an error visible to the consumer, without being fabricated as successful text
+or confused with a local allocation/transport failure.
 
 Connect, synchronous request and async send-submission timeouts are **15,000 ms**
 in the initial version, using one common internal duration constant. Async
@@ -432,7 +450,7 @@ Transport/authentication failures can occur before any RpcResponse is possible.
 | No deadline/cancel message | A local timeout cannot cancel backend work or prove buffer reuse is safe |
 | No notification envelope | Notification support is reserved for the future; registration returns CLIENT_NOT_IMPLEMENTED and creates no subscription |
 | No retry/deduplication contract | Do not replay key generation, import or other operations automatically |
-| No text encoding definition | String API cannot carry arbitrary binary Protobuf via strlen(); its codec remains TODO |
+| NUL-terminated string API boundary | Copy input up to the first NUL without caller encoding; service selection and text interpretation require TEXT-SERVICE-CONTRACT |
 | No lifecycle/heartbeat messages | Do not invent idle expiry, hibernation commands or heartbeat services |
 
 The protocol permits concurrent requests; it does not define ordering for
@@ -455,6 +473,11 @@ ROUTER receives `[routing_id][RpcRequest bytes]` and replies with
 There is no empty REQ delimiter.
 Validate the frame count and consume/reject an entire malformed multipart
 message before accepting another. Define size and frame limits explicitly.
+
+String API input does not change this framing: EyilClient constructs the binary
+RpcRequest internally and sends it with its serialized length. Gateway still
+receives a binary envelope. The local C-string terminator is not a transport
+frame delimiter and is not included in a directly carried text payload.
 
 The ROUTER I/O owner copies `zmq_msg_gets(message, "User-Id")` before closing
 the received message. The routing frame is a delivery address, not authenticated
@@ -508,7 +531,7 @@ The library does not:
 
 | Component | Responsibility | Owner / synchronization |
 | --- | --- | --- |
-| C API facade | Validate arguments, clear outputs, parse the outer request into owned storage and hold a live call reference | Calling application thread; never touches DEALER |
+| C API facade | Validate arguments, clear outputs, prepare owned input by parsing a binary envelope or copying a NUL-terminated string, and hold a live call reference | Calling application thread; never touches DEALER |
 | Per-Client coordinator | State, generation, submission queue and shutdown coordination | Short protected state transitions; no fixed client request-count cap |
 | Submission queue | Dynamically growing std::queue<Action> of owned request actions; shutdown uses a separate stop flag | Mutex protects push/front/pop; process work after releasing it |
 | Request record | Copied request, assigned ID, waiter or response handler, generation and state; sync total deadline or async send deadline | Retained until response delivery or local retirement; accepted async response waiting has no deadline |
@@ -789,8 +812,8 @@ public functionality under AC2.4, alongside their synchronous counterparts.
 | client_connect | Return a handle after successful handshake; reject an occupied handle slot with CLIENT_ALREADY_CONNECTED; report exact startup/authentication/timeout errors | AC2.1–AC2.3; AC1.3, AC1.5–AC1.6 |
 | client_send_request | Binary request with a per-call synchronous waiter | AC2.1, AC2.2, AC2.4 |
 | client_send_request_async | Wait for libzmq send acceptance; deliver a later binary response through the supplied callback with no response timeout | AC2.1, AC2.2, AC2.4 |
-| client_send_request_string | Defined text codec plus synchronous request core | AC2.1, AC2.4 |
-| client_send_request_string_async | Selected text codec plus the same send-acceptance contract and response-only callback | AC2.1, AC2.4 |
+| client_send_request_string | Copy NUL-terminated request text, use shared RPC coordination and return owned NUL-terminated response text | AC2.1, AC2.4 |
+| client_send_request_string_async | Same plain-text boundary with the send-acceptance contract and response-only callback | AC2.1, AC2.4 |
 | client_free_response | Release a library-allocated result | AC2.1 |
 | client_register_notifications | Return CLIENT_NOT_IMPLEMENTED; reserved for future support | AC2.1 and the public header |
 | client_unregister_notifications | Return without changing state; reserved for future support | AC2.1 and the public header |
@@ -810,8 +833,8 @@ allocation. Diagnostics are best effort and must not prevent retirement.
 | client_connect | CLIENT_OUT_OF_MEMORY for handle/runtime/setup allocation failure; roll back only this attempt, join any started threads, leave the output NULL |
 | client_send_request | CLIENT_OUT_OF_MEMORY for input/envelope/request/waiter/queue/pending-map/send storage or correlated response allocation failure; NULL output and size 0 |
 | client_send_request_async | Before send acceptance, return CLIENT_OUT_OF_MEMORY with no response callback; after acceptance, retire a matched response that cannot be allocated with diagnostics and no callback |
-| client_send_request_string | Same synchronous rules, including input decoding and final response-string allocation; return CLIENT_OUT_OF_MEMORY and NULL, releasing temporary binary/text storage |
-| client_send_request_string_async | Same async rules, including input decoding before acceptance and response text encoding afterward |
+| client_send_request_string | Same synchronous rules, including copying input text, constructing the wire request and allocating the response string; return CLIENT_OUT_OF_MEMORY and NULL, releasing temporary storage |
+| client_send_request_string_async | Same async rules, including input copying and wire-request preparation before acceptance, and response-string allocation afterward |
 | client_free_response | Void, releases storage without allocating; NULL is accepted; no ClientResult is returned |
 | client_register_notifications | Always CLIENT_NOT_IMPLEMENTED in this version; no state is allocated or handler retained |
 | client_unregister_notifications | Void, no effect or allocation in this version |
@@ -857,8 +880,9 @@ execution, even with a blocking send. No receipt ACK or Protobuf extension is
 required by this contract. See the
 [ZeroMQ send contract](https://libzmq.readthedocs.io/en/latest/zmq_send.html).
 
-The string method uses the same selected text codec as its synchronous
-counterpart. The codec decision does not make asynchronous support optional.
+The string method accepts the same NUL-terminated text as its synchronous
+counterpart. Both asynchronous request methods are required; callers do not
+encode either input or callback output.
 
 #### Async signatures and response ownership
 
@@ -888,10 +912,12 @@ ClientResult client_send_request_string_async(
 
 The pending map associates the library-assigned request_id with the handler
 supplied for that request. Callback arguments carry the actual response only.
-The app inspects RpcStatus and service status, then releases the owned response
-through client_free_response(). A valid Gateway error response is delivered
-through the same callback. ClientNotificationHandler is reserved for future
-support and is not used to deliver request results or local errors.
+For byte responses, the app inspects RpcStatus and service status. String
+responses carry ordinary text, with Gateway/service error representation defined
+under TEXT-SERVICE-CONTRACT. The caller releases either result through
+client_free_response(). A valid Gateway error response follows the same response
+delivery path. ClientNotificationHandler is reserved for future support and is
+not used to deliver request results or local errors.
 
 Copy input before returning so the caller may reuse its request storage.
 Keep pending bookkeeping and callback code valid until response delivery or
@@ -1322,7 +1348,7 @@ sequenceDiagram
                 IO->>IO: Discard without invoking another request's handler
             else Matching request
                 IO->>IO: Validate service, schema and RpcStatus, prepare owned response
-                alt Response allocation or text conversion allocation fails
+                alt Response allocation or response-text preparation allocation fails
                     IO->>P: Retire record once and free temporary storage
                     alt Synchronous request
                         IO-->>W: CLIENT_OUT_OF_MEMORY, NULL response and size 0
@@ -1330,7 +1356,7 @@ sequenceDiagram
                         IO->>IO: Record diagnostics, no response callback
                         Note over IO,H: Already-published send result remains CLIENT_OK
                     end
-                else Matched metadata or non-memory conversion error
+                else Matched metadata or non-memory response-text error
                     IO->>P: Retire record once
                     Note over IO,H: Sync gets CLIENT_COMMUNICATION_ERROR, async records diagnostics without callback
                 else Valid response ready before any applicable deadline
@@ -1388,8 +1414,10 @@ Implementation rules:
   response callback. Its send result remains CLIENT_OK, even if its submitting
   thread has not resumed yet. These signatures have no post-send error channel.
 - Returned response storage must be compatible with client_free_response.
-  String wrappers encode the validated envelope before delivery. If conversion
-  fails, apply the same sync-error/async-retirement distinction.
+  String methods prepare NUL-terminated response text according to the service
+  contract; they do not return the serialized binary envelope as a C string.
+  If response-text preparation fails, apply the same sync-error/async-retirement
+  distinction. Never truncate binary data at an embedded NUL to report success.
 - Retire request accounting once and free temporary Protobuf/ZMQ storage on
   every terminal path. Late replies cannot revive a retired request.
 
@@ -1555,28 +1583,37 @@ even an async API waits for this same I/O owner to submit its send.
 
 Coverage: **AC2.1, AC2.4**.
 
-The string API requires a lossless text representation of the outer RPC
-envelope. It is a conversion wrapper around the same binary
-request core. The diagrams below show that complete flow; selection of the text
-format is a genuine contract question, described after the first diagram.
+The string API accepts an ordinary NUL-terminated request string and returns an
+owned NUL-terminated response string. EyilClient determines the input length,
+copies the text and handles wire serialization internally. It shares request
+coordination, IDs, schema version 1, deadlines and socket ownership with the
+byte APIs. It does not parse the caller's raw string as a serialized Protobuf
+envelope.
+
+The sequence includes a text/service mapping boundary. Its service route,
+request interpretation and response/error representation remain
+TODO(TEXT-SERVICE-CONTRACT); copying a C string does not resolve those choices.
+The input/ownership behavior below is agreed independently of that mapping.
 
 ```mermaid
 sequenceDiagram
     participant A as Application
     participant API as client_send_request_string
-    participant CODEC as String/envelope conversion
+    participant TEXT as Text/service mapping
     participant B as Shared binary request core
     participant IO as Client I/O owner
     participant G as Gateway ROUTER
-    A->>API: NUL-terminated request and out response
-    API->>API: Clear supplied output, validate caller thread, pointers and text length
+    A->>API: NUL-terminated request text and out response
+    API->>API: Clear supplied output, validate caller thread and pointers, scan to first NUL within bound
     opt Arguments valid
-        API->>CODEC: Decode text to owned RpcRequest with explicit byte length
+        API->>API: Copy request text into owned storage with known length
+        API->>TEXT: Resolve service and prepare owned RpcRequest from text
+        Note over API,TEXT: TEXT-SERVICE-CONTRACT defines routing and interpretation
     end
-    alt Invalid arguments, text, envelope or caller thread
+    alt Invalid arguments, excessive text length, service input or caller thread
         API-->>A: CLIENT_INVALID_ARGUMENT, NULL response
-    else Input decoding or preparation allocation fails
-        API->>API: Release partial conversion storage
+    else Input copying or request preparation allocation fails
+        API->>API: Release partial input and wire-request storage
         API-->>A: CLIENT_OUT_OF_MEMORY, NULL response
     else Request prepared
         API->>B: Submit through synchronous binary core with one 15-second budget
@@ -1613,64 +1650,117 @@ sequenceDiagram
             API->>API: Free temporary request and response storage
             API-->>A: Same ClientResult, NULL response
         else Binary result is CLIENT_OK
-            API->>CODEC: Encode whole response to NUL-terminated text within bound
-            alt Response encoding allocation fails
-                CODEC-->>API: CLIENT_OUT_OF_MEMORY
-                API->>API: Free binary response and all conversion storage
+            API->>TEXT: Map validated RpcResponse to response text, preserving Gateway/service errors
+            TEXT->>TEXT: Check text length and representation, allocate length plus one and append NUL
+            alt Response-text allocation fails
+                TEXT-->>API: CLIENT_OUT_OF_MEMORY
+                API->>API: Free binary response and temporary text storage
                 API-->>A: CLIENT_OUT_OF_MEMORY, NULL response
                 Note over A,G: Remote execution may be complete, do not replay
-            else Encoded response cannot satisfy the selected text contract
-                CODEC-->>API: CLIENT_COMMUNICATION_ERROR
-                API->>API: Free binary response and all conversion storage
+            else Response cannot satisfy the text contract or exceeds the bound
+                TEXT-->>API: CLIENT_COMMUNICATION_ERROR
+                API->>API: Free binary response and temporary text storage
                 API-->>A: CLIENT_COMMUNICATION_ERROR, NULL response
-            else Encoding succeeds
-                CODEC-->>API: Owned response string
+            else Response text ready
+                TEXT-->>API: Owned NUL-terminated response text
                 API->>API: Free temporary binary response and request storage
                 API-->>A: CLIENT_OK and owned response string
+                A->>A: Consume response text according to the service contract
+                A->>A: Release returned string with client_free_response
             end
         end
     end
 ```
 
-#### String representation: codec decision
+#### Plain-string input, length and ownership
 
-The string methods accept and return NUL-terminated text representing the
-complete RPC envelope. The text codec must preserve every Protobuf byte,
-including zero bytes in the opaque payload. Do not use strlen() to measure
-binary Protobuf or treat a binary response with an appended NUL as encoded
-text. See the [Protobuf wire format](https://protobuf.dev/programming-guides/encoding/).
+Both string methods take a valid NUL-terminated C string. There is no request
+size argument because the first `\0` determines its length. The library scans
+within the configured text bound and copies the bytes before that terminator
+into owned storage. It records the length internally for serialization and
+transport. The caller must keep the source valid and unchanged until the API
+returns; subsequent I/O must not reference the caller's storage.
 
-The codec is an explicit API decision. The two options below remain under
-TODO(STRING-CODEC); their ownership and error behavior is already defined.
+No Base64 encoding or decoding is needed, either by the caller or inside the
+transport. Protobuf's bytes field and ZMQ already carry the text bytes. The
+caller does not supply a serialized RPC envelope through this API. EyilClient
+constructs and serializes that envelope internally once the service mapping is
+defined. Serialized wire messages always retain their explicit binary length;
+never measure them with strlen(). See the
+[Protobuf wire format](https://protobuf.dev/programming-guides/encoding/).
 
-| Candidate string contract | Input/output conversion | Consequence |
-| --- | --- | --- |
-| Base64 of the complete serialized RpcRequest/RpcResponse | Decode to binary before the shared core; encode validated response bytes afterward | Simple lossless binary wrapper, including unknown wire fields; text is not field-readable |
-| Protobuf JSON mapping of the outer RpcRequest/RpcResponse | Parse/print using the Protobuf JSON mapping; retain service payload as bytes | Field-readable outer envelope; bytes fields use base64, with ProtoJSON's compatibility/unknown-field limits |
+The first NUL ends the request. A pointer to `"abc\0def"` supplies only `"abc"`;
+the library cannot infer that the caller intended additional bytes. Use the
+byte API with its explicit size for arbitrary binary Protobuf. An empty string
+is valid at the C-string boundary; whether it is a meaningful service request
+is determined by the service contract. A NULL input pointer is invalid.
 
-The [ProtoJSON specification](https://protobuf.dev/programming-guides/json/)
-defines the second option. Keep **both options as proposals for a later
-decision**; neither is selected. Base64 is the smaller implementation around the
-byte API, while ProtoJSON makes the outer fields readable. Confirm the format
-with the API consumer under **TODO(STRING-CODEC)**, including text and
-decoded-message limits. Do not select a format by guessing from the input. Both
-alternatives keep binary Protobuf over ZMQ and keep service payload interpretation
-outside EyilClient.
+On response delivery, the library uses the known response-text length,
+allocates length plus one bytes, copies the text and appends `\0`. The caller
+receives ordinary text and frees it with client_free_response. An empty text
+response is an allocated string containing only the terminator, not a NULL
+success result. Do not truncate an unrepresentable binary response at its first
+NUL or automatically expose it in a different encoding.
 
-Conversion ownership and failures are already defined: validate and decode input
-before submission, own all intermediate storage, and return a separately owned
-NUL-terminated response for client_free_response. Check size arithmetic and the
-configured decoded/encoded limits before allocation. Invalid/oversized input
-returns CLIENT_INVALID_ARGUMENT; allocation failure returns CLIENT_OUT_OF_MEMORY.
+#### Text interpretation and service routing
+
+Transporting text and interpreting it as an operation are separate contracts.
+RpcRequest.payload can hold text bytes directly when the selected service
+accepts text. The current CRYPTO adapter expects a serialized CryptoRequest,
+so arbitrary text is not automatically a valid Crypto operation.
+
+**TODO(TEXT-SERVICE-CONTRACT):** define the service route for string calls, how
+Gateway distinguishes/interprets their payload, and the response text contract,
+including representation of RpcStatus and service errors. The public string
+method has no service argument and the current schema defines only CRYPTO.
+Do not silently infer a service, add an implicit text operation to Crypto or
+change the binary Crypto payload contract. Any service-specific translation
+belongs at the service integration boundary; EyilClient transport remains
+independent of Crypto policy.
+
+This question concerns service semantics, not input length or caller encoding.
+The UML mapping participant marks that integration boundary; it does not select
+a new text format or claim that arbitrary text is already a Crypto request.
+
+#### Application impact and tradeoffs
+
+The effect on callers depends on which API they use:
+
+| Consumer | Effect of the plain-string contract |
+| --- | --- |
+| Application using a high-level Firebolt Crypto API | The Crypto library continues to own service request construction; choosing the string transport does not change the app's high-level function signatures |
+| Application or binding calling the string APIs directly | Pass NUL-terminated text and consume returned text; no caller-side wire serialization or encoding, but the service must understand the request |
+| Consumer calling the byte APIs | Continue passing serialized Protobuf with explicit request/response lengths |
+
+| Advantage | Cost or limitation |
+| --- | --- |
+| No size argument or caller encoding is required | Input must be valid NUL-terminated storage; embedded NUL ends the string |
+| No text-encoding expansion or extra encoding pass | The library still scans/copies text and serializes the binary wire envelope |
+| Existing C signatures and callbacks remain usable | Service routing and request/response meaning still need a defined contract |
+| Uses the same request coordinator, IDs and transport | The string API cannot expose arbitrary binary response data as ordinary text |
+
+Check length-plus-one arithmetic for overflow and enforce configured text and
+wire-message bounds before allocation. Product-specific values remain under
+RESOURCE-LIMITS. No new public size parameter is required. The string API hides
+wire representation from its caller; it cannot hide the service's required
+operation arguments or make an undefined command meaningful.
+
+Ownership and failures are defined: validate and copy input before submission,
+own all intermediate wire storage, and return a separately owned NUL-terminated
+response for client_free_response. Check size arithmetic and configured text
+and wire-message limits before allocation. Invalid arguments or oversized input
+return CLIENT_INVALID_ARGUMENT; allocation failure returns CLIENT_OUT_OF_MEMORY.
 All temporary storage is released on every success/rejection/error path. A valid
-received response must fit the agreed encoded-response bound; a response that
-cannot be represented within that bound is a local CLIENT_COMMUNICATION_ERROR.
+received response must satisfy the response-text contract and its size bound;
+an unrepresentable response, including unexpected embedded NUL in response text,
+is a local CLIENT_COMMUNICATION_ERROR rather than a silently truncated success.
 
 CLIENT_TIMEOUT and transport errors propagate unchanged from the shared binary
 core. Failure to allocate the final text can occur after remote execution and
 successful receipt of its response: return CLIENT_OUT_OF_MEMORY and NULL, and
-do not replay the operation. Format-independent error/ownership behavior is not
-an outstanding design question; choosing the string format remains separate.
+do not replay the operation. Before send acceptance, local failures return
+through the API with no async response callback. NUL-terminated string handling
+does not change the agreed timeout or ownership behavior.
 
 ### 5.9 client_send_request_string_async()
 
@@ -1680,23 +1770,25 @@ Coverage: **AC2.1, AC2.4**.
 sequenceDiagram
     participant A as Application thread
     participant API as client_send_request_string_async
-    participant CODEC as Selected text codec
+    participant TEXT as Text/service mapping
     participant Q as Dynamic submission queue
     participant W as Retained send-result waiter
     participant IO as Shared I/O owner / pending map
     participant Z as Client libzmq / DEALER
     participant G as Gateway
-    A->>API: Client, NUL-terminated request and string response handler
-    API->>API: Validate caller thread, arguments, text length and connection
+    A->>API: Client, NUL-terminated request text and string response handler
+    API->>API: Validate caller thread, arguments and connection, scan to first NUL within bound
     opt Arguments valid and connection usable
-        API->>CODEC: Decode text to owned RpcRequest
+        API->>API: Copy request text into owned storage with known length
+        API->>TEXT: Resolve service and prepare owned RpcRequest from text
+        Note over API,TEXT: Same TEXT-SERVICE-CONTRACT as synchronous strings
     end
-    alt Invalid arguments, text, envelope, handler or caller thread
+    alt Invalid arguments, excessive text length, service input, handler or caller thread
         API-->>A: CLIENT_INVALID_ARGUMENT, no callback
     else No usable connection
         API-->>A: CLIENT_NOT_CONNECTED, no callback
-    else Input decoding allocation fails
-        API->>API: Free partial conversion storage
+    else Input copying or wire-request preparation allocation fails
+        API->>API: Free partial input and wire-request storage
         API-->>A: CLIENT_OUT_OF_MEMORY, no callback
     else Envelope prepared
         API->>API: Allocate and initialize request, string response target, send waiter and deadline
@@ -1730,23 +1822,25 @@ sequenceDiagram
                 IO->>W: Publish CLIENT_TIMEOUT or CLIENT_COMMUNICATION_ERROR
             end
             W-->>API: One send result
-            API->>API: Release input conversion temporaries
+            API->>API: Release input preparation temporaries
             API-->>A: ClientResult, no response wait
             opt Send accepted with CLIENT_OK
                 Note over A,G: Response waiting has no timeout
                 alt Response arrives
                     G-->>Z: RpcResponse
                     Z-->>IO: Receive and correlate response
-                    IO->>CODEC: Validate envelope and encode within text bound
-                    alt Matched response copying or text encoding allocation fails
+                    IO->>TEXT: Map validated RpcResponse to response text, preserving Gateway/service errors
+                    TEXT->>TEXT: Check representation and bound, allocate length plus one and append NUL
+                    alt Matched response copying or text allocation fails
                         IO->>IO: Retire record, free temporaries, record diagnostics
                         Note over A,IO: No response callback, send result remains CLIENT_OK
-                    else Other matched validation or encoding failure
+                    else Other matched validation or text-representation failure
                         IO->>IO: Retire record with diagnostics, no callback
                     else Response string ready
-                        CODEC-->>IO: Owned NUL-terminated response
+                        TEXT-->>IO: Owned NUL-terminated response text
                         IO->>IO: Retire record, release internal locks
                         IO-->>A: handler(Client, owned response string)
+                        A->>A: Consume response text or hand off heavy work
                         A->>API: Later client_free_response(response)
                     end
                 else Connection loss
@@ -1760,14 +1854,14 @@ sequenceDiagram
 
 Both string APIs share the byte APIs' coordinator, pending map and DEALER.
 The async string method uses the public ClientStringResponseHandler signature,
-with no size argument. Local input conversion and send errors return from the
-API using the same ClientResult mappings as section 5.7.
+with no size argument. Local input copying, wire preparation and send errors
+return from the API using the same ClientResult mappings as section 5.7.
 
-After successful send acceptance there is no response timeout. Encoding or
+After successful send acceptance there is no response timeout. Preparing or
 allocating the returned string may fail after remote execution; in that case,
 retire the record with diagnostics and do not invoke a synthetic error callback.
-Connection failures use the connection-event path. The selected text codec is
-the same STRING-CODEC decision as for synchronous strings.
+Connection failures use the connection-event path. Input and callback output
+use the same NUL-terminated text contract as synchronous strings in section 5.8.
 
 ### 5.10 client_free_response()
 
@@ -2004,8 +2098,11 @@ Application / Firebolt Crypto
 
   client_send_request[_async]
   client_send_request_string[_async]
-    Validate caller thread and arguments -> optional text decoding
-      EnvelopeCodec::ParseRequest -> owned RpcRequest and opaque payload
+    Validate caller thread and arguments
+      Byte API: parse the supplied binary RpcRequest using its explicit length
+      String API: scan to first NUL within bound, copy text, prepare wire request
+        TEXT-SERVICE-CONTRACT defines service routing and text interpretation
+      Retain owned RpcRequest and payload
       Allocate owned request and sync result / async send-result waiter
       Initialize mode, generation and original deadline before publication
       ClientCoordinator::Submit -> mutex-protected dynamic queue -> wakeup
@@ -2026,7 +2123,9 @@ Application / Firebolt Crypto
               still-pending API results get CLIENT_OUT_OF_MEMORY
               accepted async records retire without response callbacks
             match ID/generation -> validate service/schema/status
-              optional text encoding -> owned response
+              Byte API: owned serialized RpcResponse and explicit length
+              String API: prepare response text, allocate length plus one, append NUL
+                TEXT-SERVICE-CONTRACT preserves Gateway/service error meaning
                 Allocation fails -> sync CLIENT_OUT_OF_MEMORY and NULL/0
                                     async diagnostics and retirement, no callback
                 retire pending record once
@@ -2463,6 +2562,11 @@ schema 1, supported service, request-ID rules, service parse, operation/oneof
 agreement, enum/range validity and allocation ownership. Unknown/duplicate IDs
 need an explicit policy. Independent requests can finish in any order;
 dependent operations must follow the resource-ordering contract.
+
+The same binary-envelope validation applies when a caller used a string API.
+For CRYPTO, the payload must still satisfy CryptoRequest. Plain text support
+needs the explicit routing and payload interpretation in TEXT-SERVICE-CONTRACT;
+do not bypass service validation or parse arbitrary text as a Crypto message.
 
 A job publishes completion rather than touching ROUTER. The handoff queue exists
 to transfer the result to its socket owner; it is not a retry queue. Process
@@ -3684,10 +3788,12 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 callback execution | Request calls from the I/O-owner callback return CLIENT_INVALID_ARGUMENT; freeing a response is allowed; callback runs without internal locks and may precede submitting-thread resumption |
 | L1 dynamic client queue | More than 64 requests can be queued/pending when allocations succeed; producers push under the mutex and the owner processes outside it; no local count-limit rejection |
 | L1 client startup allocation failures | Fail runtime, thread-start and owner-side setup allocation; CLIENT_OUT_OF_MEMORY leaves output NULL, closes partial resources and joins only started threads |
-| L1 client submission allocation failures | Inject failure during request/codec/waiter creation, queue push, serialization and pending-map insertion; all four request APIs return CLIENT_OUT_OF_MEMORY before send acceptance, release partial state and cannot send later or invoke a callback |
+| L1 client submission allocation failures | Inject failure during input copy, request/waiter creation, queue push, serialization and pending-map insertion; all four request APIs return CLIENT_OUT_OF_MEMORY before send acceptance, release partial state and cannot send later or invoke a callback |
 | L1 client response allocation failures | Sync returns CLIENT_OUT_OF_MEMORY and NULL/0; matched async responses retire without a callback or revision of accepted CLIENT_OK, even before the submitter resumes; uncorrelatable decode failure follows connection-wide cleanup |
 | L1 client cleanup under allocation failure | Free/disconnect complete without allocating a queue action or temporary cleanup container; notification register/unregister allocate nothing and retain their specified outcomes |
 | L1 client deadlines | Sync uses one 15-second total budget and async only a 15-second send budget; queue cancellation cannot send work after returning failure |
+| L1 plain-string APIs | Both string methods copy to the first NUL with no size argument or caller encoding; exercise empty strings, whitespace and line breaks as data, text bounds, caller input reuse and allocation failures; append one response terminator and reject unrepresentable response text without truncation |
+| L2 text/service mapping | Once TEXT-SERVICE-CONTRACT is defined, verify routing, request interpretation and text responses including Gateway/service errors over binary Protobuf IPC; never parse arbitrary text as a CryptoRequest |
 | L1 Gateway | Envelope/oneof validation; context lookup; queued/in-flight ownership; enum/presence mapping; allocation rollback |
 | L1 Gateway queue | 1,024 global waiting slots include staged/pool-queued jobs; saturation rejects with RPC_STATUS_INTERNAL; allocation failure rolls back credit; control cleanup remains possible |
 | L1 Gateway dispatch deadline | Expire after 10,000 ms without starting; include pool queue time; race expiry against Dispatch; exactly one result and no backend execution after expiry; do not time out running calls |
@@ -3980,7 +4086,7 @@ or platform integration decisions.
 | CLIENT-CALLBACKS | Initial connection-callback timing and connection-handler lifetime/quiescence; public response-only async signatures, send acceptance, I/O-thread execution and reentrancy rules are defined in section 5.4 |
 | CLIENT-SHUTDOWN | Explicit local-close result code for active sync/send-result waiters, shutdown callback ordering and concurrent-caller quiescence; accepted async response records are retired without synthetic error callbacks |
 | CLIENT-MONITOR | Confirm the monitor-responsibility checklist in section 5.2 and whether PAIR plus the I/O owner satisfies the AC, or a distinct OS thread is mandatory |
-| STRING-CODEC | Choose later between Base64 of the entire binary envelope and ProtoJSON, including text/binary size limits |
+| TEXT-SERVICE-CONTRACT | Service selection for plain-string calls, Gateway payload identification/interpretation and response text including RpcStatus/service errors; NUL-terminated input/output and no caller encoding are already agreed |
 | ERROR-MAPPING | Invalid service payload, duplicate/malformed IDs, busy/release-pending and quota errors; null ICrypto lookup and invocation failure already map to RPC_STATUS_INTERNAL |
 | BUFFER-HELPER | Ownership of app-side shm_open/mmap helpers, output validation and release coordination |
 | DEPLOYMENT | UDS mount/recreation, permissions, procfs/user-namespace access, private /dev/shm and blocked direct Crypto communicator access |
