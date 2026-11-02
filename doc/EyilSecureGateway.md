@@ -479,9 +479,11 @@ the operation automatically or claim that its shared buffer is safe to reuse.
 #### Generic Gateway rejection and explicit error logging
 
 Use the existing **RPC_STATUS_INTERNAL** for duplicate request IDs, invalid
-service payloads, shared-buffer quota failures and rejected operations involving
-a busy, releasing or already released buffer. No additional wire error codes
-are needed.
+service payloads, shared-buffer quota failures and rejected buffer uses involving
+a busy, release-pending or already released buffer. A first valid
+ReleaseSharedBuffer request is accepted even while the buffer is in use;
+physical cleanup is deferred as specified in section 6.13. No additional wire
+error codes are needed.
 The Gateway must log the specific cause at **ERROR** severity where the
 rejection is detected, independently of whether an error response can be sent.
 
@@ -490,8 +492,9 @@ rejection is detected, independently of whether an error response can be sent.
 | Duplicate request ID | RPC_STATUS_INTERNAL | Duplicate ID and the original request's state |
 | Invalid service payload | RPC_STATUS_INTERNAL | Decode failure, operation/oneof mismatch, invalid field, enum, range or buffer reference, as applicable |
 | Shared-buffer quota exceeded | RPC_STATUS_INTERNAL | Requested size/count, current usage, applicable limit and whether the quota is per connection or global |
-| Operation rejected because a buffer is releasing or already released | RPC_STATUS_INTERNAL | Buffer ID and release state or failed lookup |
-| Operation or release rejected because a buffer is busy | RPC_STATUS_INTERNAL | Buffer ID and active-use state |
+| New use rejected because a buffer is release-pending, being destroyed or already released | RPC_STATUS_INTERNAL | Buffer ID and release state or failed lookup |
+| Competing use rejected because a buffer is busy | RPC_STATUS_INTERNAL | Buffer ID and active-use state |
+| Release rejected because the ID is unknown, belongs to another connection or already has an accepted release | RPC_STATUS_INTERNAL | Requested ID and exact validation/state failure; preserve the original release and any active use |
 
 Include the connection token/generation, request_id, service and operation when
 known. Record a specific reason such as `duplicate_request_id`,
@@ -518,8 +521,17 @@ Error replies follow the same single nonblocking send-attempt rule as successful
 responses. Log any delivery failure separately and drop the reply without a
 retry. A generic failure does not acknowledge buffer release or prove that an
 earlier operation finished. Sections 6.10–6.13 define execution-time buffer
-checks and immediate rejection of conflicts. Gateway does not preserve queued
-buffer operations through a release, defer a rejected request or replay it.
+checks, rejection of competing uses and deferred destruction after an accepted
+release. Gateway does not preserve queued buffer operations through a release
+or replay rejected work.
+
+An accepted release returns RPC_STATUS_OK with CRYPTO_ERROR_NONE and the empty
+ReleaseSharedBufferResponse. This acknowledges that the ID is closed to further
+use and Gateway owns cleanup; it does not certify physical destruction or backend
+completion. Cleanup errors after acceptance are logged at ERROR, retain private
+cleanup state and quota, and do not change that release result or generate a
+second response. Response-allocation or delivery failure after acceptance does
+not undo the release. The full failure and ownership rules are in section 6.13.
 
 ### 4.3 Protocol capabilities and limitations
 
@@ -529,6 +541,7 @@ buffer operations through a release, defer a rejected request or replay it.
 | Explicit service enum | A new service needs a schema/adapter addition; only CRYPTO is currently defined |
 | Opaque service payload | Transport does not implement Crypto key policy |
 | Buffer ID plus regions | Four bulk-data operations avoid embedding their input/output in the RPC message |
+| Empty ReleaseSharedBufferResponse | Successful response acknowledges accepted release; destruction may wait for active access to end, with no later completion notification |
 | uint32 buffer fields | Validate size/ranges with overflow-safe arithmetic and stricter configured quotas |
 | No app identity fields | Derive context from trusted transport metadata |
 | No deadline/cancel message | A local timeout cannot cancel backend work or prove buffer reuse is safe |
@@ -2596,7 +2609,7 @@ are no framework/backend interfaces internally.
 | RequestJob | One retained dispatch object per accepted request | Immutable input plus explicit context/resource references |
 | PrivateRequestPool | Own a Core::ThreadPool with a configured worker count | No replacement of Thunder's global worker singleton; internal capacity must not block ROUTER |
 | CryptoServiceAdapter | Decode Crypto operations and query/invoke/release ICrypto per call | No cached ICrypto pointer, global Crypto session, health observer or duplicated key policy |
-| SharedBufferManager | Create/track allocations, quotas, leases and release | Gateway-local; no dependency on ICrypto types |
+| SharedBufferManager | Create/track allocations, quotas, active-use leases and deferred release; finalize once access ends | Gateway-local; no dependency on ICrypto types |
 | CompletionQueue | Bounded worker-to-ROUTER handoff for newly completed responses | At most one send attempt; release on success/failure, no per-connection retry queue and no delivery to a replacement route |
 | MonitorCollector | Own PAIR and post normalized transport events | Correlation is a prerequisite for targeted cleanup |
 | Optional lifecycle observer | Future app lifecycle events | TODO(LIFECYCLE-EVENTS), no current platform subscription |
@@ -2765,7 +2778,7 @@ Each connection context contains:
 | Routing | Binary ROUTER routing ID plus a proven binding to this connection generation |
 | Admission | AUTHENTICATING, ACTIVE, DRAINING, CLOSING or RETIRED; admission policy and accepted/queued/in-flight bookkeeping |
 | Crypto context | Per-connection initialization/drain state and last observed call outcome; no ICrypto pointer or background plugin-health state |
-| Resources | Owned buffer IDs, execution-time active-use leases, completion accounting; queued jobs do not reserve buffers |
+| Resources | Owned buffer IDs, execution-time active-use leases, pending releases and cleanup accounting; queued jobs do not reserve buffers |
 | Lifecycle | Correlated closing reason and exactly-once cleanup/notification state |
 
 Preserve runtime app-instance identity separately when a future platform API
@@ -2789,9 +2802,13 @@ Required synchronization rules:
 - SharedBufferManager protects lookup, ownership, active-use state and quota
   accounting with short locks. A worker checks and acquires an idle buffer
   atomically when it executes; queuing a request reserves no buffer dependency.
-  Release atomically claims an idle allocation and prevents subsequent use.
-  A missing, busy or releasing buffer fails immediately with the error/logging
-  contract in section 4.2. No lock is held across ICrypto or transport calls.
+  Release atomically sets releasePending on a valid owned allocation, including
+  one in use, and prevents subsequent use. Competing uses of a busy buffer and
+  uses of an unavailable/release-pending buffer fail under section 4.2.
+  Last-use completion and release compete for one finalization claim; neither
+  can destroy the object while an active or unresolved access remains.
+  Section 6.13 also orders finalization against connection teardown. No lock is
+  held across ICrypto, filesystem or transport calls.
 - CONNECTED runs once during authentication before a context becomes ACTIVE
   and ZAP returns success. RPC workers never perform lazy session creation.
   Keep notification bookkeeping, not internal Crypto key state or health data.
@@ -3057,6 +3074,13 @@ rejection and ERROR-log contract in section 4.2, including preservation of an
 original request when its ID is duplicated. Independent requests can finish in
 any order; dependent operations must follow the resource-ordering contract.
 
+Complete validation and reserve response capacity before committing buffer
+release. A rejection before that point creates no releasePending transition.
+If execution has already acquired an active-use lease and a later check fails
+before calling Crypto, end that lease through FinishUse; a concurrently accepted
+release may then become eligible for cleanup. Once release is accepted, later
+response preparation/delivery failure cannot undo it, as defined in section 6.13.
+
 The same binary-envelope validation applies when a caller used a string API.
 For CRYPTO, the payload must still satisfy CryptoRequest. Plain text support
 needs the explicit routing and payload interpretation in TEXT-SERVICE-CONTRACT;
@@ -3315,7 +3339,7 @@ backend. Structure/limit checks apply even in the interim accept-all phase.
 | SIGN | ICrypto::Sign | buffer_id, algorithms, key_id, input region → signature region |
 | VERIFY | ICrypto::Verify | buffer_id, algorithms, key_id, input/signature regions → verification_status |
 | ALLOCATE_SHARED_BUFFER | SharedBufferManager::Allocate | requested_size → buffer_id, client name, size |
-| RELEASE_SHARED_BUFFER | SharedBufferManager::Release | buffer_id → release result |
+| RELEASE_SHARED_BUFFER | SharedBufferManager::RequestRelease | buffer_id → accepted release, immediate cleanup or destruction deferred until active access ends |
 
 Preserve optional presence for import_export_type rather than replacing an
 absent field with the enum's zero value. Validate repeated usages, algorithm
@@ -3383,8 +3407,9 @@ sequenceDiagram
 Key generation/import/derivation may change backend state. Loss of a response
 does not justify retrying automatically. Ordering UnloadKey or FlushKeys
 is handled by Crypto under its ICrypto contract. Gateway does not implement
-key-policy synchronization. Gateway buffer conflicts follow the immediate
-failure rules in sections 6.10–6.13.
+key-policy synchronization. Competing buffer uses fail at execution-time checks;
+a valid release is accepted with destruction deferred until active access ends,
+as specified in sections 6.10–6.13.
 
 ### 6.10 Shared-memory identity, records and invariants
 
@@ -3410,11 +3435,15 @@ ranges, states and quotas for every operation.
 
 Each buffer record retains the owner token/generation, peer evidence, opaque ID,
 client name, backend path, actual capacity, object FD, a retained directory
-reference, active-use state and release state. Directory references may be
+reference, active-use count, releasePending flag and finalization/cleanup state.
+The active-use count is initially limited to zero or one. A pending release may
+coexist with active or unresolved access. Directory references may be
 shared by the connection's allocations. Queued requests retain their context
 and buffer ID, but reserve no
 buffer use. Per-connection count/byte quotas and a global byte budget require
 atomic reservation and rollback on every failure path.
+Keep allocation count/byte charges until physical cleanup of Gateway's owned
+resources completes, including while release is pending or cleanup has failed.
 Quota rejection returns RPC_STATUS_INTERNAL and emits an ERROR log containing
 the requested allocation, usage and limit, as specified in section 4.2.
 
@@ -3442,17 +3471,21 @@ Required invariants:
 - Only the owner connection may resolve a buffer_id; same UID/PID is insufficient.
 - A connection may have multiple allocations. Allow at most one executing
   operation per allocation. A worker atomically checks ownership/state and
-  takes the active-use lease when execution begins. A competing use or release
-  fails with RPC_STATUS_INTERNAL and an ERROR log; it is not queued behind the
-  active operation. Other allocations and connections remain independent.
+  takes the active-use lease when execution begins. A competing use fails with
+  RPC_STATUS_INTERNAL and an ERROR log; it is not queued behind the active
+  operation. A valid release is accepted and closes admission to that buffer;
+  its destruction waits for the active use to end. Other allocations and
+  connections remain independent.
 - Check `offset <= size && length <= size - offset`; avoid unchecked
   `offset + length` arithmetic. Enforce per-operation region presence and
   overlap rules.
 - Keep the active-use lease through the ICrypto invocation. A completed
   synchronous invocation, including a defined CryptoError, ends that access
-  under the Crypto contract. Release/disconnect must not invalidate Gateway's
-  own live records. Queued operations have no lease: release may overtake them,
-  and their execution-time lookup then fails without calling Crypto.
+  under the Crypto contract. Every definitive lease-ending path checks for a
+  pending release and triggers eligible cleanup, including failure before a
+  backend invocation. Release/disconnect must not invalidate Gateway's own live
+  records. Queued operations have no lease: release may overtake them, and their
+  execution-time lookup then fails without calling Crypto.
 - The app must not resize, unlink or modify participating regions while an
   operation is outstanding. This is the selected cooperation contract; hard
   enforcement against a violating app is outside this version's scope.
@@ -3475,16 +3508,29 @@ values remain subject to validation under TODO(RESOURCE-LIMITS).
 When an allocation is no longer needed, including when abandoning it after an
 error, the app-side Crypto layer stops further use, unmaps/closes its local view
 and sends ReleaseSharedBufferRequest(buffer_id) through EyilClient. The response
-must be checked before treating Gateway release as successful. Freeing a message
-with client_free_response() does not release a shared allocation.
+must be checked for release acceptance. Success retires the ID from further
+use; it does not mean that active backend access or physical cleanup has already
+finished. Freeing a message with client_free_response() does not release a shared
+allocation. For an async release call, CLIENT_OK confirms only libzmq send
+acceptance; inspect the eventual RPC/service response for Gateway acceptance.
 
 This applies when the app knows the buffer ID and still has a usable connection.
 An error or the 15-second client timeout does not force an active Crypto call to
-finish. A release attempted while the allocation is IN_USE or has unresolved
-access fails with RPC_STATUS_INTERNAL and an ERROR log, as in section 6.13.
-That failed request creates no deferred release and no automatic retry. The app
-may explicitly request release later or close the connection; connection cleanup
-then owns eventual reclamation after accepted work and active access settle.
+finish. Gateway accepts a valid release while access is active or unresolved,
+marks releasePending and retains the object until access is known to have ended.
+The app does not need to resubmit merely because the buffer was busy. Accepted
+release does not cancel the original operation, authorize further reads/writes
+of that allocation or certify readiness to freeze a process with uncertain work.
+The app must not consume a later operation result's regions from a buffer it has
+abandoned. Ordinary completion, including a returned CryptoError, triggers
+eligible deferred cleanup without waiting for the app to receive the result.
+
+If the release response is lost or its client wait times out, the app cannot
+infer that release was rejected; it may already be pending or complete. Do not
+resume buffer use or automatically replay the release. Closing the connection
+transfers any remaining reclamation to Gateway's drain/cleanup path. A successful
+release reply also does not promise immediate quota availability for another
+allocation: pending resources still count against the limits.
 
 If allocation fails before an ID is published, Gateway rolls back its partial
 allocation. If the allocation succeeded but its response was lost, the app has
@@ -3541,6 +3587,13 @@ Both follow the single response-send attempt and delivery limits in section 6.6.
 
 Coverage: **AC1.9–AC1.11; AC2-Client.5; AC2-Firebolt.1–AC2-Firebolt.2**. No ICrypto call is involved.
 
+Prepare a retained allocation/cleanup record before creating the filesystem
+object. Failed creation rolls back resources and quota; if physical rollback
+itself fails, keep that private record and the unreclaimed resource charges for
+connection cleanup, log ERROR and return RPC_STATUS_INTERNAL without publishing
+a buffer ID. Failure reporting must not lose the only reference to a partially
+created object.
+
 ```mermaid
 sequenceDiagram
     participant A as App-side Crypto / buffer helper
@@ -3554,7 +3607,7 @@ sequenceDiagram
     L->>R: RpcRequest through DEALER IPC
     R->>J: Dispatch with retained connection context
     J->>B: Allocate(owner, requested_size)
-    B->>B: Validate nonzero size, reserve count/byte quotas
+    B->>B: Validate size, prepare retained record and reserve count/byte quotas
     alt Invalid size or quota unavailable
         B->>B: Roll back partial reservation, log ERROR with exact cause and request context
         B-->>J: RPC_STATUS_INTERNAL, no allocation
@@ -3573,7 +3626,7 @@ sequenceDiagram
         A->>A: Check RpcStatus and CryptoError, decode buffer_id, name and size
         A->>K: shm_open(name, O_RDWR), inspect size, mmap(MAP_SHARED)
         K-->>A: Application mapping
-        Note over B,K: On creation failure roll back object, owned FDs/references and quota, log ERROR and return RPC_STATUS_INTERNAL
+        Note over B,K: On creation failure log ERROR and roll back, return RPC_STATUS_INTERNAL<br/>If rollback fails, retain private cleanup record and unreclaimed quota
     end
 ```
 
@@ -3592,12 +3645,21 @@ quota accounting and eventual connection cleanup must still cover it.
 For all four operations, the app writes inputs before sending the request.
 When a worker executes the request, SharedBufferManager atomically resolves
 buffer_id, validates owner/ranges/state and claims the idle allocation. Missing,
-released or busy buffers fail with RPC_STATUS_INTERNAL and an ERROR log before
-any ICrypto call. Do not reserve buffers for queued jobs, wait for a conflict to
-clear or replay failed work. After a successful claim, Gateway passes the
+released, release-pending or busy buffers fail with RPC_STATUS_INTERNAL and an
+ERROR log before any ICrypto call. Do not reserve buffers for queued jobs, wait
+for a conflict to clear or replay failed work. After a successful claim, Gateway passes the
 trusted backend path and regions to the Crypto adapter. Crypto independently
 opens the object, checks its actual size, maps it, performs the operation and
-unmaps/closes it before a successful synchronous invocation returns.
+unmaps/closes it before a definitive synchronous return, including a returned
+CryptoError. An accepted release can retire the ID while that invocation runs;
+it preserves the existing active-use lease and backing object until access ends.
+
+FinishUse ends that lease exactly once and checks releasePending. It triggers
+eligible cleanup outside manager locks, or records readiness for connection
+cleanup if disconnect/deactivation owns finalization. Invoke it on every
+definitive path, including null lookup and failure before calling Crypto, a
+returned service error and later response-processing failure. It does not wait
+for reply delivery. Section 6.13 defines the finalization and error contract.
 
 The topic/crypto ICrypto contract selects output locations in Crypto. Gateway
 forwards the returned region only after validating the invocation and service
@@ -3605,6 +3667,11 @@ result. On success, output must be inside the allocation. A BUFFER_OVERFLOW
 result may describe required capacity rather than an accessible output range;
 the app must not read it as produced data. Exact required-size propagation must
 match the adopted interface revision.
+
+An invalid successful output region is a Gateway processing failure: log ERROR
+and return RPC_STATUS_INTERNAL without exposing that region as usable output.
+Definitive backend return still ends the lease and can complete pending release;
+response validation or serialization must not leave completed access active.
 
 The following diagrams expand the four operation-specific calls using the
 deployed Crypto plugin. Each invocation acquires its own scoped ICrypto
@@ -3630,7 +3697,7 @@ sequenceDiagram
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
     J->>B: TryUse(owner, buffer_id, regions) at execution time
-    alt Missing, released, releasing, busy or invalid buffer
+    alt Missing, released, release-pending, busy or invalid buffer
         B->>B: Log ERROR with exact cause, owner and request ID
         B-->>J: RPC_STATUS_INTERNAL, no active-use lease
         J-->>R: Error completion, no Crypto call and no retry
@@ -3639,7 +3706,8 @@ sequenceDiagram
         J->>T: Query ICrypto using configuration.cryptocallsign
         T-->>J: Scoped reference or nullptr
         alt Lookup returns nullptr
-            J->>B: End this job's unused lease
+            J->>B: FinishUse for unused lease, finalize pending release if eligible
+            J->>J: Log ERROR for unavailable ICrypto
             J-->>R: RPC_STATUS_INTERNAL
         else Scoped reference acquired
             J->>C: Encrypt(context, buffer, algorithm, keyId, initData, inputData)
@@ -3648,13 +3716,18 @@ sequenceDiagram
             C-->>J: Invocation result, CryptoError, encryptedData region
             alt Core invocation failed
                 J->>C: Release scoped reference after call returns
-                J->>B: Retain lease if backend completion is uncertain
+                alt Backend access remains uncertain
+                    J->>B: Retain lease and any pending release
+                else Access definitively ended or was never started
+                    J->>B: FinishUse, finalize pending release if eligible
+                end
+                J->>J: Log ERROR and ignore undefined outputs
                 J-->>R: RPC_STATUS_INTERNAL, no automatic replay
             else Invocation completed
                 J->>C: Release immediately after invocation
                 J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
                 J->>J: Validate successful output or preserve overflow result
-                J->>B: End lease only when backend access is known finished
+                J->>B: FinishUse after definitive completion, finalize pending release if eligible
                 J-->>R: Completion with EncryptResponse
             end
         end
@@ -3683,7 +3756,7 @@ sequenceDiagram
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
     J->>B: TryUse(owner, buffer_id, regions) at execution time
-    alt Missing, released, releasing, busy or invalid buffer
+    alt Missing, released, release-pending, busy or invalid buffer
         B->>B: Log ERROR with exact cause, owner and request ID
         B-->>J: RPC_STATUS_INTERNAL, no active-use lease
         J-->>R: Error completion, no Crypto call and no retry
@@ -3692,7 +3765,8 @@ sequenceDiagram
         J->>T: Query ICrypto using configuration.cryptocallsign
         T-->>J: Scoped reference or nullptr
         alt Lookup returns nullptr
-            J->>B: End this job's unused lease
+            J->>B: FinishUse for unused lease, finalize pending release if eligible
+            J->>J: Log ERROR for unavailable ICrypto
             J-->>R: RPC_STATUS_INTERNAL
         else Scoped reference acquired
             J->>C: Decrypt(context, buffer, algorithm, keyId, initData, encryptedData)
@@ -3701,13 +3775,18 @@ sequenceDiagram
             C-->>J: Invocation result, CryptoError, outputData region
             alt Core invocation failed
                 J->>C: Release scoped reference after call returns
-                J->>B: Retain lease if backend completion is uncertain
+                alt Backend access remains uncertain
+                    J->>B: Retain lease and any pending release
+                else Access definitively ended or was never started
+                    J->>B: FinishUse, finalize pending release if eligible
+                end
+                J->>J: Log ERROR and ignore undefined outputs
                 J-->>R: RPC_STATUS_INTERNAL, no automatic replay
             else Invocation completed
                 J->>C: Release immediately after invocation
                 J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
                 J->>J: Validate result and successful output bounds
-                J->>B: End lease after definitive backend completion
+                J->>B: FinishUse after definitive completion, finalize pending release if eligible
                 J-->>R: Completion with DecryptResponse
             end
         end
@@ -3736,7 +3815,7 @@ sequenceDiagram
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
     J->>B: TryUse(owner, buffer_id, regions) at execution time
-    alt Missing, released, releasing, busy or invalid buffer
+    alt Missing, released, release-pending, busy or invalid buffer
         B->>B: Log ERROR with exact cause, owner and request ID
         B-->>J: RPC_STATUS_INTERNAL, no active-use lease
         J-->>R: Error completion, no Crypto call and no retry
@@ -3745,7 +3824,8 @@ sequenceDiagram
         J->>T: Query ICrypto using configuration.cryptocallsign
         T-->>J: Scoped reference or nullptr
         alt Lookup returns nullptr
-            J->>B: End this job's unused lease
+            J->>B: FinishUse for unused lease, finalize pending release if eligible
+            J->>J: Log ERROR for unavailable ICrypto
             J-->>R: RPC_STATUS_INTERNAL
         else Scoped reference acquired
             J->>C: Sign(context, buffer, algorithm, keyId, digestAlgorithm, inputData)
@@ -3754,13 +3834,18 @@ sequenceDiagram
             C-->>J: Invocation result, CryptoError, signature region
             alt Core invocation failed
                 J->>C: Release scoped reference after call returns
-                J->>B: Retain lease if backend completion is uncertain
+                alt Backend access remains uncertain
+                    J->>B: Retain lease and any pending release
+                else Access definitively ended or was never started
+                    J->>B: FinishUse, finalize pending release if eligible
+                end
+                J->>J: Log ERROR and ignore undefined outputs
                 J-->>R: RPC_STATUS_INTERNAL, no automatic replay
             else Invocation completed
                 J->>C: Release immediately after invocation
                 J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
                 J->>J: Validate success region or overflow result
-                J->>B: End lease after definitive backend completion
+                J->>B: FinishUse after definitive completion, finalize pending release if eligible
                 J-->>R: Completion with SignResponse
             end
         end
@@ -3789,7 +3874,7 @@ sequenceDiagram
     L->>R: RpcRequest over DEALER IPC
     R->>J: Dispatch independent job
     J->>B: TryUse(owner, buffer_id, regions) at execution time
-    alt Missing, released, releasing, busy or invalid buffer
+    alt Missing, released, release-pending, busy or invalid buffer
         B->>B: Log ERROR with exact cause, owner and request ID
         B-->>J: RPC_STATUS_INTERNAL, no active-use lease
         J-->>R: Error completion, no Crypto call and no retry
@@ -3798,7 +3883,8 @@ sequenceDiagram
         J->>T: Query ICrypto using configuration.cryptocallsign
         T-->>J: Scoped reference or nullptr
         alt Lookup returns nullptr
-            J->>B: End this job's unused lease
+            J->>B: FinishUse for unused lease, finalize pending release if eligible
+            J->>J: Log ERROR for unavailable ICrypto
             J-->>R: RPC_STATUS_INTERNAL
         else Scoped reference acquired
             J->>C: Verify(context, buffer, algorithms, keyId, input, signature)
@@ -3807,12 +3893,17 @@ sequenceDiagram
             C-->>J: Invocation result, CryptoError, verificationStatus
             alt Core invocation failed
                 J->>C: Release scoped reference after call returns
-                J->>B: Retain lease if backend completion is uncertain
+                alt Backend access remains uncertain
+                    J->>B: Retain lease and any pending release
+                else Access definitively ended or was never started
+                    J->>B: FinishUse, finalize pending release if eligible
+                end
+                J->>J: Log ERROR and ignore undefined outputs
                 J-->>R: RPC_STATUS_INTERNAL, no automatic replay
             else Invocation completed
                 J->>C: Release immediately after invocation
                 J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
-                J->>B: End lease after definitive backend completion
+                J->>B: FinishUse after definitive completion, finalize pending release if eligible
                 J-->>R: Completion with VerifyResponse
             end
         end
@@ -3825,38 +3916,84 @@ sequenceDiagram
 
 A verification result of false and a failed invocation are different outcomes.
 For every operation, a transport failure after remote dispatch may leave
-completion uncertain. Do not take the normal lease-release arrow in that case;
-retain/quarantine the resource until an agreed recovery mechanism resolves it.
+completion uncertain. Do not take the normal FinishUse arrow in that case;
+retain the access obligation and any accepted pending release until backend
+completion is established. A definitive error result ends access and permits
+deferred cleanup just as a successful operation does.
 
 ### 6.13 ReleaseSharedBuffer and conflicting buffer operations
 
 Coverage: **AC1.9–AC1.12**. Release is a Gateway-local operation.
 
-**Failure policy:** check the buffer when a job executes. A queued operation
-has no reservation and may fail because another worker already released the
-allocation. Gateway does not promise request-arrival ordering, delay release to
-preserve queued work or automatically retry a failed operation.
+#### Release acceptance and deferred destruction
 
-SharedBufferManager makes lookup and state changes atomic. It holds its lock
-only for local bookkeeping, never across ICrypto, filesystem operations or
-response delivery. A use claims IDLE → IN_USE and retains its record; release
-claims IDLE → RELEASING and excludes new use. A request finding IN_USE,
-RELEASING, an unresolved previous use or an unavailable ID fails immediately
-with RPC_STATUS_INTERNAL and an ERROR log. Normal completion returns IN_USE
-→ IDLE under the same synchronization, including a completed Crypto invocation
-with a service error. No deferred release is created for a busy-buffer rejection.
+**Agreed release contract:** validate the buffer ID and owning connection, then
+atomically set releasePending. From that instant, no new operation may acquire
+the allocation. If no active access remains, Gateway cleans up immediately,
+subject to the connection-teardown ordering below. Otherwise, it retains the
+object, directory reference, record and quota until the last active use ends.
+The completion path then performs cleanup; no worker waits for another operation,
+no polling timer runs and no application retry is required.
+
+Return RPC_STATUS_OK with CRYPTO_ERROR_NONE and the empty
+ReleaseSharedBufferResponse once release has been accepted. Do not wait for an
+active operation to finish before producing this response. Success means **the
+ID is retired from further use and Gateway has accepted cleanup responsibility**.
+It does not certify that the object has already been unlinked, that backend
+execution ended or that kernel memory has been reclaimed. No pending status,
+additional response, notification or Protobuf/API extension is required.
+
+The deferred period has no fixed deadline. The 10-second worker-wait budget
+applies before the release job starts; expiry there rejects an unexecuted
+request and creates no pending release. The 15-second client wait does not
+cancel an accepted release or authorize destruction. Once accepted, the release
+remains pending until its cleanup prerequisites are satisfied, independently of
+whether the response reaches the client.
+
+#### Atomic state and execution-time conflicts
+
+SharedBufferManager protects lookup, ownership, active-use count,
+releasePending and finalization claims with short locks. It holds no such lock
+across ICrypto, filesystem operations or response delivery. Store these fields
+in the retained allocation record: recording releasePending and ending a use
+must not depend on allocating a separate pending-release job.
+
+| State / event | Atomic transition and outcome |
+| --- | --- |
+| Valid use of an idle allocation with releasePending false | Claim the sole active-use lease; activeOperations becomes 1 |
+| Competing use while activeOperations is 1 | RPC_STATUS_INTERNAL and ERROR log; no wait and no Crypto call |
+| First valid release, with activeOperations either 0 or 1 | Set releasePending, reject all later uses and accept release; retain any active lease |
+| New use after releasePending is set | RPC_STATUS_INTERNAL and ERROR log, even if the original operation has since ended |
+| Unknown/unowned ID or another release after release was already accepted | RPC_STATUS_INTERNAL and ERROR log; leave the original release and active use unchanged |
+| Definitive end of active access | Decrement activeOperations once; if releasePending is false the allocation becomes idle, otherwise trigger eligible finalization |
+| releasePending, activeOperations zero and lifecycle ordering permits cleanup | One worker claims finalization under the lock, then cleans up outside it; other paths cannot claim it again concurrently |
+| Physical cleanup succeeds | Remove the private cleanup record, release allocation quota and drop the retained directory reference exactly once |
+| Physical cleanup fails | Keep the ID unavailable, retain unresolved cleanup/accounting and log ERROR; never restore the allocation to use |
+
+Uncertain backend access retains its active-use obligation until completion is
+established; returning an invocation error or releasing ICrypto is not itself
+that evidence. It may coexist with releasePending. Section 7.1 describes this
+exceptional lifecycle boundary.
+
+**Queued operations have no buffer reservation.** Check the buffer when a job
+executes. Gateway does not promise request-arrival ordering, delay release to
+preserve queued work or replay a rejected operation.
 
 | Race at the buffer manager | Result |
 | --- | --- |
-| Release claims the idle buffer before a queued Encrypt executes | Release proceeds; Encrypt later fails its buffer lookup/state check with RPC_STATUS_INTERNAL, without calling Crypto |
-| Encrypt claims the buffer before Release executes | Encrypt proceeds; Release fails immediately with RPC_STATUS_INTERNAL because the allocation is in use |
-| Two operations try to claim the same idle buffer | One claims it; the other fails with RPC_STATUS_INTERNAL if it observes IN_USE; neither waits for the other to finish |
-| A later operation executes after the previous use has finished | It may claim the still-live buffer and proceed normally |
-| The app removes the object outside Gateway before Crypto opens it | Crypto handles an open/access failure if detected; Gateway logs and forwards the returned CryptoError, without retry |
+| Release is accepted before a queued Encrypt claims the buffer | The ID becomes unavailable; Encrypt fails with RPC_STATUS_INTERNAL without calling Crypto |
+| Encrypt claims the buffer before Release executes | Encrypt retains its lease; Release is accepted immediately, with destruction deferred until that use ends |
+| Two operations try to claim the same idle buffer | One claims it; the other fails with RPC_STATUS_INTERNAL if it observes active use |
+| A later operation executes after the previous use ends, without an accepted release | It may claim the still-live buffer and proceed normally |
+| Release races the last active-use completion | Either path may find the object ready for cleanup, but exactly one claims finalization; no lost release or double cleanup |
+| The app removes the object outside Gateway before Crypto opens it | Crypto handles an open/access failure if detected; Gateway logs and forwards the returned CryptoError and ends the lease after definitive completion |
 
-These are outcomes of execution-time checks, not a dependency scheduler. The
-application submits dependent operations sequentially when it needs a particular
-order. Different buffers and connections can still execute concurrently.
+The application submits dependent operations sequentially when it needs a
+particular order. Different buffers and connections can execute concurrently.
+Deferred destruction protects an existing active use; it does not add a buffer
+dependency queue or promise that queued operations will succeed.
+
+#### Release request sequence
 
 ```mermaid
 sequenceDiagram
@@ -3866,43 +4003,79 @@ sequenceDiagram
     participant J as Private release job
     participant B as SharedBufferManager
     participant K as Linux
-    A->>A: Stop intended uses of this buffer, unmap and close own view
+    A->>A: Stop further use, unmap and close own view
     A->>A: Wrap ReleaseSharedBufferRequest in CryptoRequest and RpcRequest
     A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over IPC
-    R->>J: Dispatch release job with owner context
-    J->>B: TryRelease(owner, buffer_id)
-    B->>B: Under lock, check owner/state and try IDLE to RELEASING
-    alt Invalid, busy, unresolved-use or already releasing buffer
+    R->>J: Dispatch release job within its worker-wait deadline
+    J->>B: RequestRelease(owner, buffer_id)
+    B->>B: Under lock, validate owner and release state
+    alt Unknown, unowned or previously released ID
         B->>B: Log ERROR with exact cause, request context and buffer state
-        B-->>J: RPC_STATUS_INTERNAL, existing use unchanged
-        Note over J,B: No wait, deferred release or automatic retry
-    else Idle allocation claimed for release
-        B->>B: Exclude subsequent use and release lock
-        B->>K: unlinkat retained directory and relative name, close Gateway-held object FD
-        alt Owned resources released
-            B->>B: Remove record, release quota and retained directory reference
-            B-->>J: Successful ReleaseSharedBufferResponse
-        else Cleanup fails
-            B->>B: Log ERROR, retain unresolved cleanup/accounting, keep ID unavailable
-            B-->>J: RPC_STATUS_INTERNAL, no successful release acknowledgement
+        B-->>J: RPC_STATUS_INTERNAL, existing use or release unchanged
+    else First valid release
+        B->>B: Set releasePending, exclude new uses, retain cleanup ownership
+        alt No active access and lifecycle ordering permits cleanup
+            B->>B: Claim finalization once, unlock
+            B->>K: unlinkat retained directory and name, close owned object FD
+            alt Cleanup succeeds
+                B->>B: Remove cleanup record, release quota and directory reference
+            else Cleanup fails
+                B->>B: Log ERROR, retain unresolved cleanup/accounting, keep ID unavailable
+            end
+        else Active or unresolved access, or lifecycle cleanup owns finalization
+            B->>B: Unlock, retain object, record, directory reference and quota
+            Note over J,B: No wait for active use and no cleanup timer
         end
+        B-->>J: Accepted, successful empty ReleaseSharedBufferResponse
     end
     J-->>R: Completion with original ID and generation
     R-->>L: Single RpcResponse attempt
-    L-->>A: Matched RpcResponse bytes if the request is still pending
-    A->>A: Check RpcStatus and CryptoError before treating release as successful
+    L-->>A: Matched RpcResponse bytes if still pending and delivered
+    A->>A: Check RpcStatus and CryptoError for acceptance, never reuse a released ID
+    Note over A,B: Response loss or timeout does not undo an accepted release
 ```
 
-Successful release acknowledges removal of Gateway's allocation record, name
-and retained FD, with quota accounting completed. It does not revoke an app's
-existing mapping or certify that the kernel has freed pages still referenced
-by another process. The backend must have finished its access before Gateway
-releases an allocation that it marked IN_USE. Filesystem cleanup failures retain
-private accounting for the normal cleanup path; they do not publish success or
-make the ID usable again.
+The following flow shows release during an active operation on a live connection:
 
-The release-before-use case is intentionally allowed:
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant R as Gateway ROUTER
+    participant W as Crypto request worker
+    participant F as Release worker
+    participant B as SharedBufferManager
+    participant C as Crypto plugin / ICrypto
+    participant K as Linux
+    W->>B: TryUse(B), claim sole active lease
+    B-->>W: Retained allocation
+    W->>C: Scoped ICrypto invocation using B
+    Note over W,C: Invocation remains in progress
+    A->>R: ReleaseSharedBuffer(B), separate request ID
+    R->>F: Dispatch release job
+    F->>B: RequestRelease(B)
+    B->>B: Set releasePending, keep active lease and quota
+    B-->>F: Accepted without waiting for Crypto
+    F-->>R: RPC_STATUS_OK, CRYPTO_ERROR_NONE, empty release response
+    R-->>A: Single response attempt acknowledging accepted release
+    Note over B,C: New uses are rejected, backing object remains valid
+    C-->>W: Definitive synchronous completion, success or CryptoError
+    W->>C: Release scoped interface
+    W->>B: FinishUse, activeOperations becomes zero
+    B->>B: Claim pending finalization once, unlock
+    B->>K: Unlink owned name and close owned object reference
+    alt Cleanup succeeds
+        B->>B: Remove cleanup record, release quota and directory reference
+    else Cleanup fails
+        B->>B: Log ERROR and retain private cleanup/accounting
+    end
+    B-->>W: Active-use obligation settled
+    W-->>R: Original operation result, independently of the release response
+    R-->>A: Single original-result attempt if route and pending ID still exist
+    Note over A,B: No second release response or notification, abandoned buffer regions must not be read
+```
+
+The release-before-use case is also intentionally allowed:
 
 ```mermaid
 sequenceDiagram
@@ -3916,9 +4089,9 @@ sequenceDiagram
     R->>E: Dispatch Encrypt, no queued buffer reservation
     R->>F: Dispatch Release
     Note over E,F: Worker scheduling does not guarantee arrival order
-    F->>B: TryRelease(B), claim idle allocation
-    B->>B: Remove name, close retained FD and retire allocation record
-    B-->>F: Released
+    F->>B: RequestRelease(B), mark idle allocation releasePending
+    B->>B: Claim immediate cleanup once, keep ID unavailable
+    B-->>F: Release accepted
     F-->>R: Successful release response, ID 11
     E->>B: TryUse(B) when Encrypt reaches its buffer check
     B->>B: Log ERROR for unavailable buffer
@@ -3927,17 +4100,67 @@ sequenceDiagram
     R-->>A: One send attempt for each response using its own request ID
 ```
 
-Gateway forwards a detected Crypto failure when the conflict is discovered
-inside ICrypto instead. It does not need to dispatch Crypto merely to rediscover
-an unavailable buffer it can already reject locally. A synchronous client that
-has timed out will discard a late error; there is no guarantee of delivery after
-its pending ID or connection has been retired.
+#### Completion, cleanup failures and response ownership
 
-Connection disconnect and plugin deactivation retain their agreed accepted-work
-drain. Each queued operation either executes its checks within the dispatch
-budget or expires; it need not succeed. After active calls end, lifecycle cleanup
-releases the remaining allocations. This policy does not add a buffer dependency
-queue or change Crypto's internal synchronization responsibilities.
+Finish the active-use obligation on every path that establishes no backend
+access remains: failure before invocation, null ICrypto lookup, or definitive
+synchronous return, including a CryptoError or verification result of false.
+A later output-validation, serialization or response-allocation failure must
+not strand that lease. Use retained/scoped ownership so it is ended once even
+on error paths. If releasePending is set, run eligible finalization on the
+current worker outside manager locks. Otherwise return the allocation to idle.
+No request worker waits for another worker to free the allocation.
+
+An ambiguous remote invocation failure keeps the access obligation and pending
+release intact. When backend/platform lifecycle handling establishes completion,
+the same finalization path becomes eligible. Neither a client timeout, connection
+loss nor the passage of a fixed interval provides that evidence.
+
+Unlink through the retained directory reference and generated relative name;
+then release Gateway's remaining object/reference ownership. A missing name
+(ENOENT) is already unlinked and does not by itself prevent closing retained
+references and completing accounting. A different filesystem cleanup failure
+keeps private state describing exactly what remains, and emits an ERROR log
+with the buffer ID, owning connection and failed step. Do not double-close a
+released descriptor, remove quota twice or make the ID usable again. The normal
+connection cleanup path can revisit retained failed cleanup; there is no
+periodic cleanup poller or client-driven replay requirement.
+
+| Failure / outcome | Response and resource handling |
+| --- | --- |
+| Release rejected before acceptance, including validation or dispatch-wait failure | RPC_STATUS_INTERNAL and ERROR log; no releasePending transition for this request |
+| Valid release accepted while idle, busy or awaiting definitive backend completion | Successful release response acknowledges acceptance; keep resources and quota until eligible physical cleanup completes |
+| Filesystem cleanup fails after acceptance, even during the immediate idle-buffer path | Log ERROR and retain private cleanup/accounting; the accepted-release result stays successful, with no second response |
+| Release response allocation/serialization fails after acceptance | Preserve pending cleanup; report RPC_STATUS_INTERNAL if a correlated fallback can be built before any send attempt, otherwise log/drop; no rollback or automatic replay |
+| Release response send fails, or client has already timed out/disconnected | Log/drop under the single-attempt rule; cleanup continues without an ACK from the client |
+| Original Crypto operation returns a defined error while release is pending | Forward its CryptoError through its own request; end active use and finalize when eligible |
+| Original Crypto invocation leaves remote access uncertain | RPC_STATUS_INTERNAL for that operation when deliverable; retain its access obligation and any pending release until completion is established |
+
+Cleanup failure does not overwrite an earlier accepted release or the original
+Crypto result. Success does not revoke an app mapping or certify that the kernel
+freed pages still referenced by another process. Quota is released only when
+Gateway's allocation cleanup completes, rather than on response creation or
+send acceptance.
+
+#### Coordination with disconnect and plugin drain
+
+Connection teardown retains the agreed ordering: settle accepted work and
+active access, notify Crypto with DISCONNECTED, then finalize the connection's
+remaining allocations. At the admission cutoff, SharedBufferManager records
+lifecycle ownership atomically against finalization claims. A finalizer already
+claimed by an earlier explicit release finishes as part of that earlier work.
+Still-unclaimed records, including accepted pending releases, are finalized by
+connection cleanup after the notification stage. Last-use completion records
+readiness and wakes that cleanup path without blocking a worker.
+
+Closing admission alone does not mark every buffer released: previously
+accepted queued operations may still use allocations without releasePending,
+subject to their execution-time checks and original dispatch budget. An accepted
+explicit release still rejects later uses of its ID. Release jobs admitted before
+the cutoff may record acceptance during drain without waiting for physical
+cleanup. After accepted work settles, connection cleanup marks all remaining
+allocations for release. App exit, a lost allocation reply or an omitted release
+RPC therefore leaves cleanup owned by Gateway, not by the vanished client.
 
 ### 6.14 Disconnect detection, PID observations and hibernation
 
@@ -4243,8 +4466,16 @@ events and explicitly retire its contexts during local shutdown.
 On correlated disconnect, mark that context CLOSING immediately, close its
 admission and remove public authentication/routing visibility. Retain resources
 for accepted work. Queued requests start within their original worker deadline
-or expire; started operations finish before destructive cleanup. There is no
-reconnect grace period or idle/process-responsiveness timeout.
+or expire; started operations finish before destructive connection cleanup.
+There is no reconnect grace period or idle/process-responsiveness timeout.
+
+At that cutoff, establish SharedBufferManager's lifecycle finalization gate as
+specified in section 6.13. It covers still-unclaimed pending releases and all
+remaining connection allocations; it does not invalidate unreleased buffers
+needed by accepted jobs. Finish any already-claimed explicit-release finalizer
+as part of draining that work. Last-use completion records cleanup readiness;
+remaining destruction follows the DISCONNECTED notification stage, without
+occupying a worker while waiting for another job.
 
 **App crash or unexpected disconnect:** the app need not send any release
 requests. When its connection closes, the monitor's FD/lifetime binding selects
@@ -4283,8 +4514,9 @@ sequenceDiagram
         REG->>REG: Ignore duplicate/stale event without touching a reused FD
     else Original context found
         REG->>REG: Mark CLOSING, remove admission and route visibility
+        REG->>B: Establish lifecycle finalization gate, retain pending releases and quota
         REG->>REG: Drop completed undeliverable responses and release their capacity
-        REG->>J: Retain accepted work, settle queued deadlines, active calls and CONNECTED
+        REG->>J: Drain accepted jobs, active uses, claimed finalizers and CONNECTED
         J-->>REG: Jobs settled, including any uncertain buffer-access outcome
         alt Backend access is definitively over
             opt CONNECTED succeeded
@@ -4300,13 +4532,18 @@ sequenceDiagram
                     C-->>REG: Log cleanup notification failure, no background retry
                 end
             end
-            REG->>B: Finalize allocations through retained directory/object references
-            B-->>REG: Releasable resources reclaimed
-            REG->>REG: Retire private context and binding when retained cleanup references end
+            REG->>B: Mark remaining allocations releasePending, finalize through retained references
+            alt Physical cleanup succeeds
+                B-->>REG: Resources reclaimed, quota and directory references released once
+                REG->>REG: Retire private context and binding when cleanup references end
+            else Physical cleanup fails
+                B-->>REG: ERROR logged, private cleanup records and unreclaimed quota retained
+                REG->>REG: Keep cleanup ownership, admission and routes remain closed
+            end
         else Backend buffer access remains uncertain
-            REG->>B: Preserve affected allocations and leases
+            REG->>B: Retain releasePending and affected allocations, leases and quota
             REG->>REG: Retain private cleanup state, keep admission and routes closed
-            Note over REG,B: Gap 1 defines the completion evidence needed to finish cleanup
+            Note over REG,B: Completion evidence makes deferred cleanup eligible under section 7.1
         end
     end
 ```
@@ -4316,7 +4553,10 @@ sends no RPC still receives matching cleanup. If closure races CONNECTED, await
 its outcome and retire the provisional context without admitting requests.
 Do not infer that a failed notification cancelled an outstanding backend call.
 Public admission/route removal is immediate; physical destruction waits for
-retained jobs and leases. A returned invocation error does not, by itself,
+retained jobs and leases, followed by the notification stage. Pending explicit
+releases remain owned throughout this path, even if their responses were lost;
+they do not require another app request or generate a later notification.
+A returned invocation error does not, by itself,
 establish that a remote operation stopped. Keeping private cleanup state for
 that uncertainty does not re-enable the old connection or introduce Crypto
 health polling.
@@ -4488,7 +4728,7 @@ sequenceDiagram
     A->>T: QueryInterfaceByCallsign using configured callsign
     T-->>A: Scoped reference or nullptr
     alt Lookup returns nullptr before invocation
-        A->>B: End this job's unused buffer lease if held
+        A->>B: FinishUse for unused lease if held, finalize pending release if eligible
         A-->>J: RPC_STATUS_INTERNAL, nothing dispatched to Crypto
     else Reference acquired
         A->>C: Invoke method
@@ -4496,12 +4736,17 @@ sequenceDiagram
             C-->>A: CryptoError and defined outputs
             A->>C: Release scoped reference immediately after invocation
             A->>A: Preserve service error or copy successful outputs
-            A->>B: End operation lease if held after confirmed synchronous return
+            A->>B: FinishUse after definitive return, finalize pending release if eligible
             A-->>J: Owned operation response or internal lifecycle result
-        else Invocation fails and completion may be uncertain
+        else Invocation fails
             C-->>A: Core failure, outputs not valid
             A->>C: Release scoped reference after call returns
-            A->>B: Retain or quarantine lease if backend access is unresolved
+            alt Backend access remains uncertain
+                A->>B: Retain unresolved lease and any pending release
+            else Access definitively ended or was never started
+                A->>B: FinishUse if held, finalize pending release if eligible
+            end
+            A->>A: Log ERROR with invocation failure and known completion state
             A-->>J: RPC_STATUS_INTERNAL, no automatic retry
         end
     end
@@ -4530,8 +4775,13 @@ treat an error as permission to reuse an old context or buffer.
 
 A scoped Release ends Gateway's interface ownership; it does not cancel a
 remote operation or prove that shared-memory access stopped. Preserve unresolved
-leases until a defined recovery path establishes completion. A blocked
-in-process call retains its reference until the call actually returns; it
+leases and any accepted pending release until backend/platform lifecycle
+handling establishes completion; then signal the same finalization path used
+by normal FinishUse. A null lookup before dispatch and a definitive synchronous
+return, including CryptoError, can end this job's lease immediately and trigger
+eligible cleanup. Later response-processing failure does not keep a completed
+use active or cancel release. A blocked in-process call retains its reference
+until the call actually returns; it
 cannot be safely cancelled by releasing that reference from another thread.
 Gateway retains its own buffer-lifetime obligations without implementing
 Crypto recovery or adding a Crypto health-monitoring worker.
@@ -4583,10 +4833,17 @@ callback that initiated teardown.
   deadline still applies: an expired waiting job produces RPC_STATUS_INTERNAL
   and never executes later. Started jobs are not cancelled by this deadline or
   by deactivation.
+- At the admission cutoff, establish each context's buffer-finalization gate.
+  Previously claimed explicit-release cleanup finishes with its job; other
+  pending releases retain their records and quota for cleanup after DISCONNECTED.
+  Do not wait for this gated destruction before scheduling DISCONNECTED: first
+  wait for accepted jobs and active-use obligations to settle, then notify and
+  finalize, as in section 6.13.
 - Keep ROUTER, ZAP, monitor processing, dispatcher and private pool running while
   draining. Do not unbind/close ROUTER or shut down its context at drain start.
   Queue empty is insufficient: account for submitted/active jobs, authentication
-  already in progress, lifecycle jobs, completions and buffer leases.
+  already in progress, lifecycle jobs, completions, buffer leases and claimed
+  finalizers. A release response being sent is not proof of completed cleanup.
 - Preserve routes for existing responses. If a peer disconnects, retire its
   route but finish its accepted work and cleanup obligations. A late ZAP result
   cannot publish a new ACTIVE context after the cutoff.
@@ -4599,8 +4856,11 @@ callback that initiated teardown.
   Never block a worker on delivery or retry a failed response. Retire any
   remaining unsent storage when entering STOPPING; no receipt ACK is required.
 - After accepted work ends, send DISCONNECTED once per initialized context and
-  release allocations whose backend access has ended. Include connections that
-  authenticated but never sent an RPC.
+  mark all remaining allocations releasePending. Finalize those whose backend
+  access has ended, including earlier accepted releases and failed-cleanup
+  records. Include connections that authenticated but never sent an RPC.
+  Release quota once physical cleanup completes. Unresolved access or cleanup
+  errors retain private ownership and must not be reported as completed teardown.
 
 #### Deactivation sequence
 
@@ -4619,8 +4879,9 @@ sequenceDiagram
     T->>P: Deinitialize
     P->>P: Suppress new callbacks, retain implementation and IShell
     P->>I: StopAndWait()
-    Note over I,B: Normal drain path below requires definitive backend completion<br/>Unresolved leases keep cleanup pending under Gap 1
+    Note over I,B: Normal path requires definitive backend completion and completed resource cleanup<br/>Unresolved access or cleanup errors keep teardown pending
     I->>I: RUNNING to DRAINING under admission lock
+    I->>B: Establish lifecycle finalization gates, retain pending releases and quota
     I->>R: Reject new RPCs, keep replies/control processing
     I->>Z: Reject new authentication, resolve in-progress setup
     I->>W: Drain accepted work within original dispatch deadlines
@@ -4629,7 +4890,8 @@ sequenceDiagram
             W->>CP: Scoped query, operation and Release
             CP-->>W: Definitive operation result
             W-->>R: Original-generation completion
-            W-->>I: Settle job and lease accounting
+            W->>B: FinishUse, record pending-release readiness without gated destruction
+            W-->>I: Settle job, lease and any already-claimed finalizer accounting
         else Waiting job reaches its original deadline
             R->>R: Atomically expire request, prepare RPC_STATUS_INTERNAL
             R->>I: Settle accounting after queued wrapper is reclaimed
@@ -4639,7 +4901,8 @@ sequenceDiagram
     I->>CP: Schedule per-context DISCONNECTED on private pool
     Note over I,CP: Each notification acquires/releases its own ICrypto reference
     CP-->>I: Lifecycle jobs finish
-    I->>B: Release buffers after backend access ends
+    I->>B: Mark remaining buffers releasePending, finalize after access and notification
+    B-->>I: Physical cleanup complete, quota and retained references released once
     I->>I: Mark all contexts CLOSING, enter STOPPING
     I->>R: Wake owner to retire egress and close transport
     R->>R: Disable monitor, zmq_close(ROUTER) with LINGER=0
@@ -4775,11 +5038,13 @@ routing and lifecycle work without deferring the ICrypto dependency:
    dispatch deadline and completion routing. Validate per-call ICrypto
    acquisition/release, errors and nonblocking pool handoff.
 5. Add Gateway-local allocations, atomic execution-time ownership/state
-   checks and active-use leases. Reject released or busy buffers without
-   reserving queued uses, deferring release or replaying an operation. Apply
-   the trusted-app cooperation contract and retain directory references for
-   cleanup after app exit. Validate the abnormal-completion boundary in Gap 1
-   with the platform/Crypto implementation.
+   checks and active-use leases. Reject competing uses and uses of retired IDs
+   without reserving queued uses or replaying an operation. Accept valid release
+   immediately, defer destruction until active access ends, and retain quota
+   through cleanup. Apply the trusted-app cooperation contract, retained directory
+   references and exactly-once finalization across release/disconnect/stop.
+   Validate the exceptional completion boundary in section 7.1 with the
+   platform/Crypto implementation.
 6. Integrate AppManager/RuntimeManager authentication only at the marked TODOs,
    once their formal API exists. Add lifecycle event behavior only after a
    separate policy decision.
@@ -4807,14 +5072,18 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 string completion races | Race response-text preparation with the synchronous deadline, explicit close and transport loss; no intermediate binary success escapes, the winning result is preserved, and any losing prepared string is freed |
 | L2 text/service mapping | Once TEXT-SERVICE-CONTRACT is defined, verify routing, request interpretation and text responses including Gateway/service errors over binary Protobuf IPC; never parse arbitrary text as a CryptoRequest |
 | L1 Gateway | Envelope/oneof validation; context lookup; queued/in-flight ownership; enum/presence mapping; allocation rollback |
-| L1 Gateway rejection logging | Invalid service payload, buffer quota and rejected busy/releasing/released-buffer operations produce RPC_STATUS_INTERNAL with empty payload and an ERROR log identifying the exact cause and known request/connection context; duplicate IDs cannot dispatch twice or replace the original completion; unsafe correlation logs/drops without a fabricated reply; logs contain no payload or key material |
+| L1 Gateway rejection logging | Invalid service payload, buffer quota, competing buffer uses, uses after releasePending and invalid/repeated releases produce RPC_STATUS_INTERNAL with empty payload and an ERROR log identifying the exact cause and known request/connection context; a first valid release of a busy buffer succeeds; duplicate request IDs cannot dispatch twice or replace the original completion; unsafe correlation logs/drops without a fabricated reply; logs contain no payload or key material |
 | L1 Gateway queue | 1,024 global waiting slots include staged/pool-queued jobs; saturation rejects with RPC_STATUS_INTERNAL; allocation failure rolls back credit; control cleanup remains possible |
 | L1 Gateway dispatch deadline | Expire after 10,000 ms without starting; include pool queue time; race expiry against Dispatch; exactly one result and no backend execution after expiry; do not time out running calls |
 | L1 Gateway drain | Atomic admission cutoff; queued work starts or expires under original deadline; active work finishes; callbacks and stop state require no new shutdown queue allocation |
 | L1 Gateway response capacity | Reserve at most 128 slots per connection and 1,024 globally plus configured byte allowances before execution; reject without service execution on exhaustion; no blocking/overflow queue; release each reservation once |
 | L1 resource configuration | Exercise the selected product message/byte/quota bounds and arithmetic; reject before side effects where possible, log exact resource failures and release reservations once; section 6.2's proposed numeric values are not hard-coded acceptance requirements |
 | L1 Gateway response send | At most one logical response attempt; EAGAIN/EHOSTUNREACH/EINTR cause local error and drop; no requeue, second error response or backend replay; storage released once; multipart frames never cross responses |
-| L1 buffer concurrency | Queued jobs reserve no buffer; release winning before TryUse makes the operation fail with RPC_STATUS_INTERNAL and no Crypto call; use winning makes a competing use/release fail immediately; atomic state/record lifetime and quota accounting survive concurrent workers and disconnect |
+| L1 buffer concurrency | Queued jobs reserve no buffer; release winning before TryUse makes the use fail with RPC_STATUS_INTERNAL and no Crypto call; use winning still rejects a competing use but permits release acceptance; race release with last-use completion and verify one finalization claim, no use after releasePending and no lost cleanup |
+| L1 deferred release | Release during active access returns RPC_STATUS_OK, CRYPTO_ERROR_NONE and the empty release response before that access ends; retain object, record, directory reference and quota; definitive completion triggers cleanup once; duplicate release cannot clear state or create another finalizer |
+| L1 buffer completion errors | Null lookup/pre-invocation failure, defined CryptoError and post-call validation/serialization/allocation failure end the lease exactly once when access is definitively over and trigger eligible pending cleanup; ambiguous remote failure retains access and releasePending until completion evidence arrives |
+| L1 release and cleanup failures | Idle and deferred cleanup failures log ERROR and keep the ID unavailable with retained cleanup/accounting; accepted release is not retroactively failed and produces no second response; ENOENT permits remaining cleanup; partial allocation rollback failure retains a private record without publishing an ID |
+| L1 release response loss and deadlines | Response-construction failure, the single-send drop policy and a 15-second client timeout do not undo accepted release; 10-second pre-dispatch expiry creates no releasePending state; active cleanup has no forced 10/15-second destruction deadline and does not depend on response delivery |
 | L2 transport | Real DEALER/ROUTER IPC, ZAP metadata, reverse-order completion and simultaneous sync/async callers |
 | L2 connect readiness | CONNECTED alone cannot complete connect; HANDSHAKE_SUCCEEDED returns CLIENT_OK; explicit rejection returns CLIENT_AUTH_FAILED; unresolved/stalled attempt reaches CLIENT_TIMEOUT; each failure wakes the waiter and rolls back resources; no startup outcome invokes a callback, and immediate subsequent loss cannot expose an unpublished handle |
 | L2 explicit reconnect | Verify RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0; after loss and Gateway return, no automatic handshake or old queued send occurs; explicit close/new connect creates an empty client runtime and new Gateway session, rejects old buffer IDs and never delivers old replies to new requests |
@@ -4822,10 +5091,10 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L2 disabled heartbeats | Verify IVL/TIMEOUT/TTL are 0 on DEALER and ROUTER before connect/bind and after socket recreation; confirm monitor-driven cleanup still occurs on actual socket closure |
 | L2 disconnect | Trusted FD/lifetime-to-User-Id binding; close one of multiple connections from a PID; delayed/duplicate events and FD/route reuse; disconnect before first request; no unrelated cleanup |
 | L2 guarded responses | Apply the expected transport lifetime to successful and error replies; force route reuse and verify no old response reaches a replacement connection, including before monitor cleanup catches up |
-| L2 buffers | Container-private mapping, cross-connection rejection, release before queued use and rejection during active use; returned Crypto access errors are forwarded; size/region failures and lost replies; a result after a synchronous timeout is discarded |
+| L2 buffers | Container-private mapping, cross-connection rejection, release before queued use and deferred release during active use; buffer remains accessible to the active backend until definitive completion, new uses fail, and quota becomes available only after cleanup; Crypto errors are forwarded; size/region failures and lost replies; a result after a synchronous timeout is discarded |
 | Shared-memory platform validation | Verify app permissions, directory/object reference lifetime and namespace/process reuse under the selected cooperation contract; cleanup does not reopen an exited or reused PID's path |
-| L2 app crash cleanup | Allocate buffers, then terminate the owning app without release RPCs; correlated disconnect settles accepted work, sends DISCONNECTED and reclaims all remaining objects/FDs/quotas through retained directory references; repeat with an active Crypto call and a lost allocation response, without early destruction |
-| L2 lifecycle | Fail every startup stage; stop idle/busy/full-queue runtimes; CONNECTED-in-progress and disconnect races; accepted work settles before DISCONNECTED and buffer release |
+| L2 app crash cleanup | Allocate buffers, then terminate the owning app without release RPCs; correlated disconnect settles accepted work, sends DISCONNECTED and reclaims all remaining objects/FDs/quotas through retained directory references; repeat with an active Crypto call, accepted pending release, lost allocation/release replies and notification failure, without early destruction or lost cleanup ownership |
+| L2 lifecycle | Fail every startup stage; stop idle/busy/full-queue runtimes; race CONNECTED, explicit release, finalization and disconnect/deactivation; drain already-claimed finalizers, gate other destruction until accepted work settles and DISCONNECTED runs; pending-release records do not block the notification that enables cleanup; unresolved access/cleanup cannot report successful teardown |
 | L2 socket teardown | ROUTER closes on its owner after drain; slow/frozen reader cannot block; REP/PAIR close on stop/ETERM; no final monitor-event dependency; all threads/context retire |
 | L2 reactivation | Repeated activation cycles rebind in host/container views; fresh identities/generations; stale callbacks/events cannot reach new clients; no FD/thread leaks |
 | L2 crash restart | Start with empty state; client monitor observes loss; no old replay/session restoration; fresh connection performs authentication and CONNECTED |
@@ -5023,8 +5292,9 @@ The application trust model is selected: authenticated apps cooperate with the
 shared-buffer rules and request release when an allocation is no longer needed,
 including after errors. Gateway automatically owns cleanup after a correlated
 unexpected disconnect or app crash; no release RPC is required from a dead app.
-Execution-time conflict rejection, normal release and disconnect/drain are
-specified in sections 6.10–6.14. They are not open design questions.
+Execution-time rejection of competing uses, accepted release with deferred
+destruction, quota retention and disconnect/drain ordering are specified in
+sections 6.10–6.14. They are not open design questions.
 
 FD/lifetime binding, graceful plugin stop/reactivation, fresh startup after a
 crash, authentication-time CONNECTED and bounded response handoff with one send
@@ -5035,20 +5305,25 @@ Section 7.1 retains only the abnormal backend-completion boundary. Section 7.2
 lists remaining API/product choices and future platform requirements. Section
 7.3 separates integration and verification from unresolved design decisions.
 
-### 7.1 Gap 1: Abnormal backend completion during resource cleanup
+### 7.1 Abnormal backend completion: lifecycle integration boundary
 
 **Defined behavior:** a completed synchronous ICrypto invocation, including a
 returned service error, ends its buffer access under the backend contract.
-Gateway can then settle active-use accounting and perform requested release or
-connection cleanup. The trusted app requests release after errors when it knows
-the buffer ID and has a usable connection. An app crash/disconnect transfers that
-responsibility to Gateway's normal drain and cleanup path.
+Gateway ends active-use accounting and triggers eligible pending release or
+connection cleanup. A valid release closes the ID to further use immediately
+and succeeds even while access is active; it retains the object and quota until
+physical cleanup. The trusted app requests release after errors when it knows
+the buffer ID and has a usable connection. App crash/disconnect needs no release
+RPC and transfers remaining reclamation to Gateway's normal drain/notification/
+cleanup path. Deferred release is selected behavior, not an unresolved policy.
 
 A 15-second synchronous client timeout retires the client request ID without
 cancelling backend work. The Gateway still observes its own ICrypto invocation
-and handles its eventual result. Release can fail while that access remains
-active; disconnect cleanup waits for it. A late response is discarded by the
-client. None of these normal paths needs an additional completion protocol.
+and handles its eventual result. An accepted release remains pending while that
+access continues, then completion triggers cleanup. Disconnect cleanup retains
+the same safety rule and notification ordering. A late response is discarded
+by the client without cancelling cleanup. None of these normal paths needs an
+additional completion protocol, release retry or fixed destruction deadline.
 
 **Remaining lifecycle question:** if an abnormal remote ICrypto invocation
 fails without establishing that backend memory access ended, what existing
@@ -5057,8 +5332,11 @@ A defined CryptoError is already a completed invocation; a communication failure
 with an uncertain remote outcome is the exceptional case. Do not infer safe
 completion merely because the client disconnected or its local wait expired.
 
-Gateway keeps affected references and private cleanup state until access is
-known to have ended. It does not implement Crypto recovery, health polling,
+Gateway accepts release and keeps affected references, quota and private cleanup
+state until access is known to have ended. Completion evidence makes the same
+deferred-cleanup path eligible; deferral itself is not evidence that a remote
+call finished. A failed DISCONNECTED notification also cannot end an unresolved
+access obligation. Gateway does not implement Crypto recovery, health polling,
 operation replay or forced termination of an in-process worker. A non-returning
 backend also remains subject to the platform's lifecycle policy. The required
 failure/termination evidence belongs at the backend/platform integration
@@ -5069,7 +5347,11 @@ no-unlink rules against that app in this version. Normal process exit and PID
 reuse are covered by retained allocation/directory references and target
 validation, not by reopening app-trust or parallel-ordering decisions.
 
-**Coverage affected:** AC1.8–AC1.12 on abnormal backend failures.
+**Scope:** exceptional backend/platform lifecycle handling. The supplied ACs
+require notification and connection-resource cleanup; they do not prescribe a
+retry mechanism, health observer or forced cleanup deadline. This boundary is
+not an additional AC requirement or a claim that the defined normal cleanup
+flow fails AC1.12.
 **TODO:** SHM-COMPLETION.
 
 ### 7.2 Remaining API and platform decisions
