@@ -58,24 +58,63 @@ Navigation: [ACs](#2-acceptance-criteria-and-scope),
 
 ## 2. Acceptance criteria and scope
 
-The acceptance criteria define required behavior and map to the detailed flows.
-AC1 covers EyilGateway, AC2 covers EyilClient and AC3 covers the Firebolt Crypto
-Client Library.
+Sections 2.1–2.3 reproduce the supplied acceptance criteria with their original
+wording and labels, including both groups labelled **AC2**. WHEN conditions and
+every THEN/AND clause are preserved. Row references are documentation-only
+identifiers for UML traceability: AC1.1–AC1.12, AC2-Client.1–AC2-Client.5 and
+AC2-Firebolt.1–AC2-Firebolt.2. They do not rename the original AC groups.
 
-### 2.1 AC1: EyilGateway plugin
+Implementation decisions and proposals are recorded separately in section 2.4
+and the detailed architecture sections. They do not replace or amend the ACs.
 
-| ID | Acceptance criterion |
+### 2.1 AC1 - Eyil Gateway Plugin
+
+WHEN the device runs thunder framework
+
+| Reference | Original acceptance criterion |
 | --- | --- |
-| AC1.1 | Run as the Thunder plugin `EyilGateway`, callsign `org.rdk.EyilGateway`. Initially run the implementation in process. |
-| AC1.2 | Bind a `ZMQ_ROUTER` to `ipc:///tmp/app-eyil-gateway.ipc` and accept multiple application connections. |
-| AC1.3 | Enable `ZMQ_PLAIN_SERVER` on the ROUTER and run a `ZMQ_REP` ZAP handler at `inproc://zeromq.zap.01` in the same ZMQ context. |
-| AC1.4 | Run a monitor worker receiving events on a `ZMQ_PAIR` at `inproc://app-eyil-gateway-monitor`. |
-| AC1.5 | Extract kernel-derived peer UID from the ZAP address; retain GID and host PID. For this phase, accept valid direct UDS clients without AppManager authorization and allow all gateway APIs. |
-| AC1.6 | Assign a unique ZAP `User-Id` per connection and bind it to the Gateway-side transport FD and connection lifetime. Notify Crypto with CONNECTED during authentication. Retrieve User-Id from every request and resolve its independent context. Multiple connections from one process remain independent. |
-| AC1.7 | Dispatch requests as separate jobs on a Gateway-owned Thunder thread pool. Allow at most 1,024 waiting requests with 10 seconds to start Dispatch; reject saturation/expiry with RPC_STATUS_INTERNAL. Keep transport and unrelated requests progressing. |
-| AC1.8 | Parse the Protobuf envelope and route `RPC_SERVICE_CRYPTO` to a service adapter. The adapter invokes the external Crypto plugin through ICrypto from topic/crypto, acquiring and releasing the interface per call. |
-| AC1.9 | Gateway creates, owns and accounts for shared-memory allocations used by encrypt, decrypt, sign and verify. AllocateSharedBuffer and ReleaseSharedBuffer terminate in Gateway. Allocations belong to one connection; multiple allocations per connection are supported. |
-| AC1.10 | On a correlated disconnect, close admission for that connection, finish accepted work, notify Crypto through a scoped NotifyAppState(DISCONNECTED) invocation, and release resources after backend access has ended. |
+| AC1.1 | THEN the Eyil Gateway SHALL run as the thunder plugin and listen for request from its client over ZMQ (over UDS) with ZMQ socket type ZMQ_ROUTER and bind on ipc:///tmp/app-eyil-gateway.ipc |
+| AC1.2 | AND the Eyil Gateway SHALL also run the ZMQ Auth Protocol (ZAP) Handler with ZMQ socket type ZMQ_REP and SHALL use ZMQ_PLAIN_SERVER mode for authentication |
+| AC1.3 | AND the Eyil Gateway SHALL also run the ZMQ monitor thread on inproc://app-eyil-gateway-monitor with socket type as ZMQ_PAIR |
+| AC1.4 | AND the Eyil Gateway SHALL retrieve the UID of the connecting client using ZMQ's PEER CREDENTIAL mechanism (address frame) within the ZMQ Auth Protocol (ZAP) Handler for the purpose of authentication and authorisation (As part of this EPIC, no auth check is required. Assume all clients are authenticated and all APIs are authorised). |
+| AC1.5 | AND the Eyil Gateway, upon successful authentication, SHALL assign a unique "User-ID" for the client within the ZAP Handler (One ID per connection). |
+| AC1.6 | AND the Eyil Gateway SHALL retrieve the "User-Id" (from every request it receives in its main thread) and maintain a separate session for each "User-ID" |
+| AC1.7 | AND ** the Eyil Gateway SHALL process each request in a separate thread AND processing of one request shall not block or delay the processing of other requests |
+| AC1.8 | AND the Eyil Gateway SHALL parse the payload as per the attached "proto" definition and when the RPC service name is RPC_SERVICE_CRYPTO, then route the calls to underlying Crypto Plugin whose interface definition is available at https://github.com/rdkcentral/entservices-apis/pull/1089/changes |
+| AC1.9 | AND the Eyil Gateway SHALL create and own the "shared memory" required for some of the crypto operations (encrypt, decrypt, sign and verify) as per the attached Gateway-Owned-Shared-Memory-Proposal.md |
+| AC1.10 | AND the AllocateSharedBufferRequest and  ReleaseSharedBufferRequest defined in proto SHALL terminate at the Eyil Gateway itself and the gateway shall own the life cycle of the shared memory |
+| AC1.11 | AND the Eyil Gateway SHALL create separate shared memory buffer for each of the connection so that there is no accidental overwrite by crypto gateway or multiple clients |
+| AC1.12 | AND the Eyil Gateway SHALL release all resources (including the shared memory) maintained for a connection whenever it learns that a particular client is disconnected after informing the same with Crypto Plugin through its NotifyAppState API. |
+
+### 2.2 AC2 - Eyil Client Lib
+
+WHEN the device runs thunder framework and Eyil Gateway
+
+| Reference | Original acceptance criterion |
+| --- | --- |
+| AC2-Client.1 | THEN Eyil Client Library SHALL provide convenience APIs for the Firebolt Crypto Client Library as defined in the attached EyilClient.h |
+| AC2-Client.2 | AND the Eyil Client Library SHALL connect with the Eyil Gateway at ipc:///tmp/app-eyil-gateway.ipc using ZMQ (over UDS) with ZMQ socket type ZMQ_DEALER |
+| AC2-Client.3 | AND the Eyil Client Library SHALL also use ZMQ Auth Protocol (ZAP), however SHALL pass dummy username and token (exists only for future potential use and also to provide a piggy bagging provision for the PEER CRED authentication over ZAP). |
+| AC2-Client.4 | AND the Eyil Client Library SHALL also run the ZMQ monitor thread on `"inproc://app-eyil-client-monitor-<client specific unique-identifier>"` with socket type as ZMQ_PAIR |
+| AC2-Client.5 | AND the Eyil Client Library SHALL provide both synchronous as well as asynchronous APIs for sending and receiving byte stream as well as "string" formatted request - response payload as defined in the google protobuf definitions attached, for the firebolt Crypto Client Library to route the requests coming from the Firebolt Apps. |
+
+### 2.3 AC2 - Firebolt Crypto Client Library
+
+WHEN Firebolt Apps and Eyil Gateway are running in the sytem
+
+| Reference | Original acceptance criterion |
+| --- | --- |
+| AC2-Firebolt.1 | THEN the Firebolt CryptoClient Library SHALL make use of the EyilClient Library to route the calls from apps to underlying Eyil Gateway (which will subsequently route the calls to Crypto Plugin) |
+| AC2-Firebolt.2 | AND Firebolt CryptoClient Library SHALL make use of the attached EyilClient.h for sending and receiving data from underlying Crypto operations and shall make use of the attached proto definitions for serialising / deserialzing the payload. |
+
+### 2.4 Design decisions and interpretation
+
+The following implementation decisions and proposals describe the design; they
+are not additional acceptance criteria. The original separate-thread and
+nonblocking wording remains in AC1.7. Private-pool scheduling, queue/deadline
+limits, callback behavior, lifecycle ordering and protocol handling below must
+be reviewed against the unchanged ACs. The proposed client monitor consolidation
+remains explicitly subject to the AC2-Client.4 confirmation in section 5.2.
 
 Each accepted request has an independent dispatch job on the fixed private
 worker pool. Workers are reused across jobs; available workers, backend
@@ -89,15 +128,6 @@ Reactivation and startup after a crash create
 fresh runtime state; old connections and requests are not restored. Section
 6.16 defines the sequence.
 
-### 2.2 AC2: EyilClient library
-
-| ID | Acceptance criterion |
-| --- | --- |
-| AC2.1 | Expose the C API in `eyilclient/EyilClient.h` for consumers such as the Firebolt Crypto Client Library. The library itself does not depend on Thunder. |
-| AC2.2 | Connect a `ZMQ_DEALER` to `ipc:///tmp/app-eyil-gateway.ipc`. Supply internal dummy PLAIN username/password strings to trigger server-side ZAP; they are not app credentials. |
-| AC2.3 | Receive socket monitor events on a monitor thread through a `ZMQ_PAIR` at `inproc://app-eyil-client-monitor-<unique-client-id>`. Consolidating this work into the I/O owner requires the confirmation described in section 5.2. |
-| AC2.4 | Implement all four binary/string request methods, including client_send_request_async and client_send_request_string_async. Support multiple outstanding requests on one connection and responses arriving out of order. Async calls return CLIENT_OK after the I/O owner successfully submits the message to libzmq, then deliver a validated response through the supplied response callback with no response timeout. Section 5.4 defines send failures and cleanup when no response can be delivered. |
-
 Both string methods accept ordinary NUL-terminated text without a caller-supplied
 length or encoding step. EyilClient owns input copying and wire serialization.
 The byte methods retain explicit sizes for binary Protobuf. Section 5.8 defines
@@ -110,7 +140,7 @@ or invoked. Async responses and connection-state callbacks retain their separate
 contracts.
 
 EyilClient uses a **library-owned serving/I/O thread**, one per `Client`.
-Applications do not supply an I/O handler or pump the library. AC2.3 specifies
+Applications do not supply an I/O handler or pump the library. AC2-Client.4 specifies
 a separate client monitor thread. Handling its PAIR socket on the serving loop
 is a proposed consolidation;
 confirmation is required before treating that as satisfying the literal
@@ -150,17 +180,10 @@ not require application heartbeat RPCs, an inactivity watchdog or ZeroMQ
 transport heartbeats. EyilClient and Gateway have transport heartbeats
 disabled and contain no custom heartbeat or inactivity-watchdog logic.
 
-### 2.3 AC3: Firebolt Crypto Client Library
-
-| ID | Acceptance criterion |
-| --- | --- |
-| AC3.1 | Firebolt Crypto uses EyilClient to route app requests to Gateway and ultimately the external Crypto backend. |
-| AC3.2 | Firebolt Crypto serializes CryptoRequest into RpcRequest.payload, selects RPC_SERVICE_CRYPTO and passes the serialized envelope to the byte API. EyilClient assigns request IDs and schema version 1, validates/correlates RpcResponse and returns its bytes; Firebolt Crypto inspects RpcStatus and deserializes CryptoResponse. |
-
 Firebolt Crypto and the real Crypto plugin are separate deliverables. Their
 presence in diagrams does not add their implementation to this repository.
 
-### 2.4 Delivery boundary
+### 2.5 Delivery boundary
 
 | Part | Responsibility | Integration boundary |
 | --- | --- | --- |
@@ -746,7 +769,7 @@ updates and request completions still need the owner. The proposed design
 therefore requires nonblocking I/O and short application callbacks.
 
 **Confirmation to obtain:** does the PAIR receiver plus the I/O owner, with the
-responsibilities above, satisfy AC2.3, or is an additional dedicated OS thread
+responsibilities above, satisfy AC2-Client.4, or is an additional dedicated OS thread
 itself mandatory? No heartbeat sender, idle-session watchdog or periodic PID
 responsiveness probe is part of this monitor contract. The monitor also does
 not perform Gateway-side ZAP authentication or decode service responses.
@@ -822,7 +845,7 @@ sequenceDiagram
 
 ### 5.3 General routing: concurrent requests on one connection
 
-Coverage: **AC2.1, AC2.2, AC2.4, AC1.6, AC1.7, AC3.1–AC3.2**.
+Coverage: **AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5, AC1.5–AC1.6, AC1.7, AC2-Firebolt.1–AC2-Firebolt.2**.
 
 ```mermaid
 sequenceDiagram
@@ -873,19 +896,19 @@ registered response handler. Slow callbacks must not monopolize the I/O loop.
 The public API is declared in
 [EyilClient.h](../EyilClient/include/eyilclient/EyilClient.h). All nine methods
 have individual sequences below. Both asynchronous request methods are required
-public functionality under AC2.4, alongside their synchronous counterparts.
+public functionality under AC2-Client.5, alongside their synchronous counterparts.
 
 | Method | Behavior | AC coverage |
 | --- | --- | --- |
-| client_connect | Return a handle after successful handshake; reject an occupied handle slot with CLIENT_ALREADY_CONNECTED; report exact startup/authentication/timeout errors | AC2.1–AC2.3; AC1.3, AC1.5–AC1.6 |
-| client_send_request | Binary request with a per-call synchronous waiter | AC2.1, AC2.2, AC2.4 |
-| client_send_request_async | Wait for libzmq send acceptance; deliver a later binary response through the supplied callback with no response timeout | AC2.1, AC2.2, AC2.4 |
-| client_send_request_string | Copy NUL-terminated request text, use shared RPC coordination and return owned NUL-terminated response text | AC2.1, AC2.4 |
-| client_send_request_string_async | Same plain-text boundary with the send-acceptance contract and response-only callback | AC2.1, AC2.4 |
-| client_free_response | Release a library-allocated result | AC2.1 |
-| client_register_notifications | Return CLIENT_NOT_IMPLEMENTED; reserved for future support | AC2.1 and the public header |
-| client_unregister_notifications | Return without changing state; reserved for future support | AC2.1 and the public header |
-| client_disconnect | Stop admission/I/O, settle pending work and destroy the handle | AC2.1–AC2.3; AC1.10 on the Gateway side |
+| client_connect | Return a handle after successful handshake; reject an occupied handle slot with CLIENT_ALREADY_CONNECTED; report exact startup/authentication/timeout errors | AC2-Client.1–AC2-Client.4; AC1.2, AC1.4–AC1.6 |
+| client_send_request | Binary request with a per-call synchronous waiter | AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5 |
+| client_send_request_async | Wait for libzmq send acceptance; deliver a later binary response through the supplied callback with no response timeout | AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5 |
+| client_send_request_string | Copy NUL-terminated request text, use shared RPC coordination and return owned NUL-terminated response text | AC2-Client.1, AC2-Client.5 |
+| client_send_request_string_async | Same plain-text boundary with the send-acceptance contract and response-only callback | AC2-Client.1, AC2-Client.5 |
+| client_free_response | Release a library-allocated result | AC2-Client.1 |
+| client_register_notifications | Return CLIENT_NOT_IMPLEMENTED; reserved for future support | AC2-Client.1 and the public header |
+| client_unregister_notifications | Return without changing state; reserved for future support | AC2-Client.1 and the public header |
+| client_disconnect | Stop admission/I/O, settle pending work and destroy the handle | AC2-Client.1–AC2-Client.4; AC1.12 on the Gateway side |
 
 #### Allocation failures across the public API
 
@@ -1044,7 +1067,7 @@ CLIENT_CONNECTION_LOST and explicit close emits no connection callback.
 
 ### 5.5 client_connect()
 
-Coverage: **AC2.1–AC2.3; AC1.3, AC1.5–AC1.6**.
+Coverage: **AC2-Client.1–AC2-Client.4; AC1.2, AC1.4–AC1.6**.
 
 #### Handle ownership and CLIENT_ALREADY_CONNECTED
 
@@ -1320,7 +1343,7 @@ defined above.
 
 ### 5.6 client_send_request()
 
-Coverage: **AC2.1, AC2.2, AC2.4**; Crypto use also supports **AC3.1–AC3.2**.
+Coverage: **AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5**; Crypto use also supports **AC2-Firebolt.1–AC2-Firebolt.2**.
 
 The caller supplies one serialized RpcRequest containing the service and its
 opaque payload. The library parses that envelope, replaces request_id and
@@ -1631,7 +1654,7 @@ size bounds remain under RESOURCE-LIMITS in section 7.2.
 
 ### 5.7 client_send_request_async()
 
-Coverage: **AC2.1, AC2.2, AC2.4**.
+Coverage: **AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5**.
 
 ```mermaid
 sequenceDiagram
@@ -1741,7 +1764,7 @@ even an async API waits for this same I/O owner to submit its send.
 
 ### 5.8 client_send_request_string()
 
-Coverage: **AC2.1, AC2.4**.
+Coverage: **AC2-Client.1, AC2-Client.5**.
 
 The string API accepts an ordinary NUL-terminated request string and returns an
 owned NUL-terminated response string. EyilClient determines the input length,
@@ -1943,7 +1966,7 @@ does not change the agreed timeout or ownership behavior.
 
 ### 5.9 client_send_request_string_async()
 
-Coverage: **AC2.1, AC2.4**.
+Coverage: **AC2-Client.1, AC2-Client.5**.
 
 ```mermaid
 sequenceDiagram
@@ -2056,7 +2079,7 @@ use the same NUL-terminated text contract as synchronous strings in section 5.8.
 
 ### 5.10 client_free_response()
 
-Coverage: **AC2.1**.
+Coverage: **AC2-Client.1**.
 
 ```mermaid
 sequenceDiagram
@@ -2078,7 +2101,7 @@ after another API reports CLIENT_OUT_OF_MEMORY.
 
 ### 5.11 client_register_notifications()
 
-Coverage: **AC2.1**. This API is reserved for future notification support.
+Coverage: **AC2-Client.1**. This API is reserved for future notification support.
 
 **Return CLIENT_NOT_IMPLEMENTED.** The function ignores its arguments and does
 not store or invoke the handler, allocate notification state, subscribe to events
@@ -2104,7 +2127,7 @@ section 5.6 and must not be reclassified as a notification.
 
 ### 5.12 client_unregister_notifications()
 
-Coverage: **AC2.1**. This API is reserved for future notification support.
+Coverage: **AC2-Client.1**. This API is reserved for future notification support.
 
 This void function returns without changing state. Notification registration
 is unsupported, so there is no handler to remove or notification delivery to drain.
@@ -2124,7 +2147,7 @@ Neither notification function allocates, so neither has an out-of-memory path.
 
 ### 5.13 client_disconnect()
 
-Coverage: **AC2.1–AC2.3**, leading to **AC1.10** when the Gateway detects closure.
+Coverage: **AC2-Client.1–AC2-Client.4**, leading to **AC1.12** when the Gateway detects closure.
 
 client_disconnect is a synchronous local cleanup barrier. The app may call it
 while requests are queued or awaiting responses; it need not wait for those
@@ -2597,7 +2620,7 @@ separate from Crypto and are still required.
 
 ### 6.2 Thread model and private Thunder pool
 
-Coverage: **AC1.2–AC1.4, AC1.7**.
+Coverage: **AC1.1–AC1.3, AC1.7**.
 
 | Execution context | Owns / performs | Must not do |
 | --- | --- | --- |
@@ -2791,7 +2814,7 @@ an application from writing through its own mapping.
 
 ### 6.4 Startup and partial-start failure
 
-Coverage: **AC1.1–AC1.4, AC1.7**.
+Coverage: **AC1.1–AC1.3, AC1.7**.
 
 ```mermaid
 sequenceDiagram
@@ -2858,7 +2881,7 @@ a new socket inode; container mounts must expose it as specified in section 3.3.
 
 ### 6.5 ZAP, interim identity and future AppManager lookup
 
-Coverage: **AC1.3, AC1.5–AC1.6; AC2.2**.
+Coverage: **AC1.2, AC1.4–AC1.6; AC2-Client.2–AC2-Client.3**.
 
 ```mermaid
 sequenceDiagram
@@ -2940,7 +2963,7 @@ identity or the future platform lookup.
 
 ### 6.6 Request ingress, dispatch and response delivery
 
-Coverage: **AC1.2, AC1.6–AC1.9; AC2.4**.
+Coverage: **AC1.1, AC1.5–AC1.11; AC2-Client.5**.
 
 ```mermaid
 sequenceDiagram
@@ -3130,7 +3153,7 @@ separate from this Gateway response policy.
 
 ### 6.7 Crypto adapter: per-call ICrypto references and per-connection sessions
 
-Coverage: **AC1.8, AC1.10**.
+Coverage: **AC1.8, AC1.12**.
 
 Use the ICrypto API from
 [entservices-apis branch topic/crypto](https://github.com/rdkcentral/entservices-apis/tree/topic/crypto),
@@ -3322,7 +3345,7 @@ and allocation/invocation failures use section 4.2, including an ERROR log.
 
 ### 6.9 Non-shared-memory operations
 
-Coverage: **AC1.8; AC3.1–AC3.2**. This flow applies to the eleven key/random
+Coverage: **AC1.8; AC2-Firebolt.1–AC2-Firebolt.2**. This flow applies to the eleven key/random
 operations above; allocation/release and the four bulk-data operations have
 separate flows.
 
@@ -3365,7 +3388,7 @@ failure rules in sections 6.10–6.13.
 
 ### 6.10 Shared-memory identity, records and invariants
 
-Coverage: **AC1.9–AC1.10**. Allocation is a Gateway responsibility; mapping by
+Coverage: **AC1.9–AC1.12**. Allocation is a Gateway responsibility; mapping by
 the application and access by Crypto are separate responsibilities.
 
 **Agreed application contract:** authenticated applications are trusted to
@@ -3516,7 +3539,7 @@ Both follow the single response-send attempt and delivery limits in section 6.6.
 
 ### 6.11 AllocateSharedBuffer and client mapping
 
-Coverage: **AC1.9; AC2.4; AC3.1–AC3.2**. No ICrypto call is involved.
+Coverage: **AC1.9–AC1.11; AC2-Client.5; AC2-Firebolt.1–AC2-Firebolt.2**. No ICrypto call is involved.
 
 ```mermaid
 sequenceDiagram
@@ -3590,7 +3613,7 @@ and invocation failures follow sections 6.7 and 6.15.
 
 #### Encrypt
 
-Coverage: **AC1.8–AC1.9; AC3.1–AC3.2**.
+Coverage: **AC1.8–AC1.11; AC2-Firebolt.1–AC2-Firebolt.2**.
 
 ```mermaid
 sequenceDiagram
@@ -3643,7 +3666,7 @@ sequenceDiagram
 
 #### Decrypt
 
-Coverage: **AC1.8–AC1.9; AC3.1–AC3.2**.
+Coverage: **AC1.8–AC1.11; AC2-Firebolt.1–AC2-Firebolt.2**.
 
 ```mermaid
 sequenceDiagram
@@ -3696,7 +3719,7 @@ sequenceDiagram
 
 #### Sign
 
-Coverage: **AC1.8–AC1.9; AC3.1–AC3.2**.
+Coverage: **AC1.8–AC1.11; AC2-Firebolt.1–AC2-Firebolt.2**.
 
 ```mermaid
 sequenceDiagram
@@ -3749,7 +3772,7 @@ sequenceDiagram
 
 #### Verify
 
-Coverage: **AC1.8–AC1.9; AC3.1–AC3.2**.
+Coverage: **AC1.8–AC1.11; AC2-Firebolt.1–AC2-Firebolt.2**.
 
 ```mermaid
 sequenceDiagram
@@ -3807,7 +3830,7 @@ retain/quarantine the resource until an agreed recovery mechanism resolves it.
 
 ### 6.13 ReleaseSharedBuffer and conflicting buffer operations
 
-Coverage: **AC1.9–AC1.10**. Release is a Gateway-local operation.
+Coverage: **AC1.9–AC1.12**. Release is a Gateway-local operation.
 
 **Failure policy:** check the buffer when a job executes. A queued operation
 has no reservation and may fail because another worker already released the
@@ -3918,7 +3941,7 @@ queue or change Crypto's internal synchronization responsibilities.
 
 ### 6.14 Disconnect detection, PID observations and hibernation
 
-Coverage: **AC1.4, AC1.6, AC1.10**.
+Coverage: **AC1.3, AC1.5–AC1.6, AC1.12**.
 
 #### Required connection-to-FD binding
 
@@ -3985,7 +4008,7 @@ target.
 
 #### Rationale: authentication succeeds before the first message
 
-Coverage: **AC1.4, AC1.6, AC1.10**. The source extension supplies the common
+Coverage: **AC1.3, AC1.5–AC1.6, AC1.12**. The source extension supplies the common
 connection identity needed for cleanup under the selected authentication-time
 session lifecycle. It is not needed merely to obtain an accepted FD.
 
@@ -4444,7 +4467,7 @@ runtime acceptance scenarios.
 
 ### 6.15 On-demand Crypto lookup and invocation failures
 
-Coverage: **AC1.8–AC1.10**.
+Coverage: **AC1.8–AC1.12**.
 
 There is no Crypto health-monitoring component or plugin-availability
 subscription. A request or lifecycle job resolves the configured interface
@@ -4515,7 +4538,7 @@ Crypto recovery or adding a Crypto health-monitoring worker.
 
 ### 6.16 Gateway deactivation, reactivation and fresh startup after a crash
 
-Coverage: **AC1.1–AC1.4, AC1.6–AC1.10**.
+Coverage: **AC1.1–AC1.3, AC1.5–AC1.12**.
 
 **Block new admissions, finish accepted work, close client connections, stop
 ZeroMQ and owned threads, then destroy the runtime.** This requirement is
@@ -5046,7 +5069,7 @@ no-unlink rules against that app in this version. Normal process exit and PID
 reuse are covered by retained allocation/directory references and target
 validation, not by reopening app-trust or parallel-ordering decisions.
 
-**Coverage affected:** AC1.8–AC1.10 on abnormal backend failures.
+**Coverage affected:** AC1.8–AC1.12 on abnormal backend failures.
 **TODO:** SHM-COMPLETION.
 
 ### 7.2 Remaining API and platform decisions
