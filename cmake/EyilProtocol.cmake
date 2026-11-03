@@ -17,9 +17,15 @@
 # limitations under the License.
 ###
 
+set(EYIL_PROTO_DIR "${PROJECT_SOURCE_DIR}/apis/proto")
+
+set(EYIL_PROTO_FILES
+    ${EYIL_PROTO_DIR}/rpc.proto
+    ${EYIL_PROTO_DIR}/crypto.proto
+)
+
 protobuf_generate_cpp(EYIL_PROTO_SOURCES EYIL_PROTO_HEADERS
-    rpc.proto
-    crypto.proto
+    ${EYIL_PROTO_FILES}
 )
 
 add_library(eyilprotocol SHARED ${EYIL_PROTO_SOURCES} ${EYIL_PROTO_HEADERS})
@@ -34,7 +40,7 @@ set_target_properties(eyilprotocol PROPERTIES
 target_include_directories(eyilprotocol
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<BUILD_INTERFACE:${EYIL_PROTO_DIR}>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/eyil/proto>
 )
 
@@ -46,15 +52,15 @@ install(TARGETS eyilprotocol
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
-install(FILES ${EYIL_PROTO_HEADERS} ProtocolVersion.h
+install(FILES ${EYIL_PROTO_HEADERS} ${EYIL_PROTO_DIR}/ProtocolVersion.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eyil/proto
 )
 
-install(FILES rpc.proto crypto.proto
+install(FILES ${EYIL_PROTO_FILES}
     DESTINATION ${CMAKE_INSTALL_DATADIR}/eyil/proto
 )
 
-configure_package_config_file(EyilProtocolConfig.cmake.in
+configure_package_config_file(${CMAKE_CURRENT_LIST_DIR}/EyilProtocolConfig.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/EyilProtocolConfig.cmake
     INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/EyilProtocol
 )

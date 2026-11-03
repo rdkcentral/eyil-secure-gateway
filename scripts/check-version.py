@@ -44,7 +44,7 @@ def main():
         parser.error("Requested release does not match the CMake version")
     if f"#### [{version}]" not in (root / "CHANGELOG.md").read_text(encoding="utf-8"):
         parser.error("Missing changelog entry for this version")
-    version_header = (root / "EyilGateway/Version.h").read_text(encoding="utf-8")
+    version_header = (root / "src/gateway/Version.h").read_text(encoding="utf-8")
     parts = []
     for component in ("MAJOR", "MINOR", "PATCH"):
         number = re.search(

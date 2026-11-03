@@ -38,10 +38,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(Protobuf 3.15 REQUIRED MODULE)
 find_package(ZeroMQ 4.3 REQUIRED)
 
-add_subdirectory(apis/proto)
+include(EyilProtocol)
 
 if(BUILD_EYILCLIENT)
-    add_subdirectory(EyilClient)
+    add_subdirectory(src/clientlib)
 endif()
 
 if(PLUGIN_EYILGATEWAY)
@@ -52,7 +52,7 @@ if(PLUGIN_EYILGATEWAY)
 
     include(CmakeHelperFunctions)
 
-    add_subdirectory(EyilGateway)
+    add_subdirectory(src/gateway)
 endif()
 
 if(BUILD_TESTING)

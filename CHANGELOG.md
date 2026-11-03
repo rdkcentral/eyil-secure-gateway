@@ -28,6 +28,8 @@ limitations under the License.
 - Add the public EyilClient C API with explicit unimplemented-operation results.
 - Keep the supplied nine-method client API without a version getter.
 - Integrate generated Protobuf contracts and ZeroMQ build dependencies.
+- Separate public interfaces in apis/ from implementation in src/ and move
+  protocol build rules and package templates into cmake/.
 - Introduce RpcStatus and RPC envelope schema version 1.
 - Add empty L1/L2 suites, coverage support, installation checks and CI workflows.
 - Run coverage within L1/L2 jobs and combine JSON, formatting and licensing checks

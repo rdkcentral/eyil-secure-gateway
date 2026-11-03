@@ -907,7 +907,7 @@ registered response handler. Slow callbacks must not monopolize the I/O loop.
 ### 5.4 Public API index
 
 The public API is declared in
-[EyilClient.h](../EyilClient/include/eyilclient/EyilClient.h). All nine methods
+[EyilClient.h](../apis/eyilclient/EyilClient.h). All nine methods
 have individual sequences below. Both asynchronous request methods are required
 public functionality under AC2-Client.5, alongside their synchronous counterparts.
 
@@ -5135,6 +5135,40 @@ provider is unavailable.
 These commands cover build and repository validation. Runtime acceptance also
 requires the behavior tests described above.
 
+#### Repository layout
+
+Public interfaces live in `apis/`; implementation lives in `src/`.
+
+```text
+apis/
+  eyilclient/EyilClient.h       Public C client API
+  proto/rpc.proto             RPC envelope schema
+  proto/crypto.proto          Crypto service schema
+  proto/ProtocolVersion.h     Public protocol version constant
+src/
+  clientlib/                  Client implementation and CMakeLists.txt
+  gateway/                    Plugin implementation, private headers,
+                              configuration and CMakeLists.txt
+cmake/
+  EyilProtocol.cmake          Protocol generation, library and install rules
+  EyilClientConfig.cmake.in   Installed client package template
+  EyilProtocolConfig.cmake.in Installed protocol package template
+  eyilclient.pc.in            pkg-config template
+  Coverage.cmake             Coverage configuration
+  FindZeroMQ.cmake            ZeroMQ discovery
+CMakeLists.txt                Top-level build
+Tests/                       Test suites
+scripts/                     Build and validation utilities
+doc/                         Architecture and supporting material
+```
+
+The interface tree contains only public headers and schemas. Build rules and
+package templates stay outside it; generated Protobuf sources/headers and
+configured package files are written to the build directory. The client keeps
+the public include path `eyilclient/EyilClient.h`. Library names, CMake targets
+`EyilClient::EyilClient` and `EyilProtocol::EyilProtocol`, and installed interface
+locations are independent of the source layout.
+
 <details>
 <summary>Build, installation, coverage and GitHub workflow details</summary>
 
@@ -5281,7 +5315,7 @@ committed with the workflows so a fresh checkout contains their dependencies.
 The release workflow is manual and creates a draft only from main after
 checking the requested version against CMake and CHANGELOG.md. Repository
 administrators must configure branch protection and runner access separately.
-Version checks also compare the CMake version and EyilGateway/Version.h so the
+Version checks also compare the CMake version and src/gateway/Version.h so the
 plugin's reported and registered versions agree.
 
 </details>

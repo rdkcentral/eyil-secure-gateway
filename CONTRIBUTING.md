@@ -26,6 +26,10 @@ Keep the EyilGateway wrapper thin and place implementation work in separate
 files. Keep EyilClient independently buildable. Define runtime behavior only
 when its contract is agreed; unresolved lifecycle requirements stay TODO.
 
+Keep public headers and Protobuf schemas in apis/. Put implementation and
+private headers in src/clientlib/ and src/gateway/. Keep build rules and package
+templates outside apis/, and generated files in the build directory.
+
 Follow .clang-format. Source, script, build and workflow files
 use the Apache-2.0 licensing header. JSON must remain valid JSON. README.md is
 intentionally empty; architecture and build instructions belong in

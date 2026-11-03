@@ -17,7 +17,7 @@
 # limitations under the License.
 ###
 
-add_library(eyilclient SHARED src/EyilClient.cpp)
+add_library(eyilclient SHARED EyilClient.cpp)
 add_library(EyilClient::EyilClient ALIAS eyilclient)
 
 set_target_properties(eyilclient PROPERTIES
@@ -30,7 +30,7 @@ set_target_properties(eyilclient PROPERTIES
 
 target_include_directories(eyilclient
     PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/apis>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
@@ -50,15 +50,20 @@ install(TARGETS eyilclient
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
-install(DIRECTORY include/eyilclient DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES ${PROJECT_SOURCE_DIR}/apis/eyilclient/EyilClient.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eyilclient
+)
 
-configure_file(eyilclient.pc.in eyilclient.pc @ONLY)
+configure_file(${PROJECT_SOURCE_DIR}/cmake/eyilclient.pc.in
+    ${CMAKE_CURRENT_BINARY_DIR}/eyilclient.pc
+    @ONLY
+)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/eyilclient.pc
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )
 
-configure_package_config_file(EyilClientConfig.cmake.in
+configure_package_config_file(${PROJECT_SOURCE_DIR}/cmake/EyilClientConfig.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/EyilClientConfig.cmake
     INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/EyilClient
 )
