@@ -2614,6 +2614,97 @@ are no framework/backend interfaces internally.
 | MonitorCollector | Own PAIR and post normalized transport events | Correlation is a prerequisite for targeted cleanup |
 | Optional lifecycle observer | Future app lifecycle events | TODO(LIFECYCLE-EVENTS), no current platform subscription |
 
+#### Gateway component and API-call overview
+
+Coverage: **AC1.1–AC1.12; AC2-Client.2–AC2-Client.3, AC2-Client.5;
+AC2-Firebolt.1–AC2-Firebolt.2**.
+
+The application calls EyilClient's C API. Gateway receives the resulting
+Protobuf RPC over its ROUTER socket and dispatches a request job. The diagram
+separates that request/response path from authentication, connection cleanup
+and Thunder lifecycle control. Everything inside the implementation block is
+owned by that Gateway runtime; the application and Crypto plugin remain
+outside it.
+
+```mermaid
+flowchart TB
+    APP["Application / Firebolt Crypto"]
+    CLIENT["EyilClient public C API<br/>Connect, request and disconnect<br/>Client I/O owner + DEALER"]
+    TH["Thunder framework"]
+    subgraph GW["EyilGateway plugin"]
+        WR["EyilGateway IPlugin wrapper<br/>Initialize / Deinitialize"]
+        subgraph RT["EyilGatewayImplementation"]
+            subgraph TRANSPORT["Socket owners"]
+                IO["Gateway I/O owner<br/>ROUTER + RequestDispatcher<br/>Validate, admit and send replies"]
+                ZAP["ZapAuthenticator worker - ZAP REP<br/>AuthenticationProvider<br/>Trusted UID / GID / host PID"]
+                MON["MonitorCollector worker<br/>Monitor PAIR"]
+            end
+            REG["ConnectionRegistry<br/>User-Id + FD / transport lifetime<br/>Context, route and admission state"]
+            Q["PendingRequestQueue<br/>1024 waiting requests globally<br/>10-second dispatch deadline"]
+            POOL["Private Thunder pool<br/>RequestJob::Dispatch + lifecycle jobs<br/>4 workers proposed, configurable"]
+            AD["CryptoServiceAdapter<br/>Decode and map Crypto operations<br/>Scoped ICrypto reference per call"]
+            BUF["SharedBufferManager<br/>Connection-owned allocations<br/>Active-use leases and deferred release"]
+            OUT["Bounded CompletionQueue<br/>RpcResponse + original generation<br/>Worker-to-I/O handoff"]
+        end
+    end
+    CRYPTO["Crypto plugin / ICrypto<br/>Configured cryptocallsign"]
+    PLATFORM["AppManager / RuntimeManager<br/>Future identity and authorization lookup"]
+
+    APP -- "Calls client_* functions" --> CLIENT
+    CLIENT <-->|"RpcRequest / RpcResponse over UDS<br/>ipc:///tmp/app-eyil-gateway.ipc"| IO
+    TH -- "Initialize / Deinitialize" --> WR
+    WR -- "Acquire, Configure, StopAndWait, release" --> RT
+
+    IO -. "libzmq internal ZAP exchange" .-> ZAP
+    IO -. "libzmq transport events" .-> MON
+    ZAP -. "TODO: authoritative platform lookup" .-> PLATFORM
+    ZAP -. "Bind transport and initialize connection" .-> REG
+    MON -. "Post disconnect to I/O owner for correlation" .-> REG
+    REG -. "CONNECTED / drain / DISCONNECTED<br/>Separate lifecycle control path" .-> POOL
+
+    IO <-->|"Resolve User-Id and original route"| REG
+    IO -- "Admit retained request job" --> Q
+    Q -- "Nonblocking pool handoff" --> POOL
+    POOL <-->|"Crypto operations and NotifyAppState"| AD
+    POOL <-->|"AllocateSharedBuffer / ReleaseSharedBuffer<br/>Deferred cleanup"| BUF
+    AD <-->|"TryUse / FinishUse for bulk operations"| BUF
+    AD <-->|"Query via IShell, invoke, Release"| CRYPTO
+    POOL -- "RPC job result or mapped error" --> OUT
+    OUT -- "Wake owner, check original route, one send attempt" --> IO
+```
+
+Solid arrows show API calls and RPC data flow. Dashed arrows show authentication,
+monitor events and connection lifecycle control. The ZAP and monitor arrows are
+libzmq's internal exchanges; they do not mean the ROUTER owner uses REP or PAIR.
+This is a component/call map; the sequence diagrams below define ordering and
+failure handling.
+
+The three transport owners are separate Gateway threads. RequestDispatcher
+runs on the ROUTER owner; request and lifecycle jobs run on the private pool.
+The monitor collector posts events to the I/O owner, which correlates them and
+serializes the registry's disconnect transition.
+The adapter, registry, buffer manager and queues are shared runtime components,
+not additional threads. Four request workers remain a sizing proposal in
+section 6.2, in addition to the transport owners and libzmq's internal threads.
+
+| Call or event entering Gateway | Internal path and result | Detailed flow |
+| --- | --- | --- |
+| Thunder Initialize / Deinitialize | Wrapper acquires/configures the implementation; deactivation awaits StopAndWait before releasing it | Sections 6.4 and 6.16 |
+| client_connect | DEALER handshake reaches ZAP; bind a unique User-Id to the transport/context and complete the worker-side NotifyAppState(CONNECTED) before ZAP success | Section 6.5 |
+| client_send_request / client_send_request_async carrying a Crypto RpcRequest | ROUTER owner validates/adopts the request, queues a distinct job and returns its correlated completion through the same owner | Sections 6.6–6.9 |
+| ALLOCATE_SHARED_BUFFER / RELEASE_SHARED_BUFFER | Worker calls SharedBufferManager locally. Allocation returns buffer_id, name and size; release acceptance blocks new use and defers physical cleanup while access remains active or unresolved | Sections 6.10–6.11 and 6.13 |
+| ENCRYPT / DECRYPT / SIGN / VERIFY | Worker-side adapter acquires an execution-time buffer lease, calls ICrypto using trusted context/object metadata, and ends the lease when backend access is definitively complete | Section 6.12 |
+| Other Crypto operations | Adapter queries the configured callsign through IShell, invokes the mapped ICrypto method and releases the reference immediately after that call | Sections 6.7–6.9 |
+| Peer closure after client_disconnect or unexpected transport loss | PAIR event identifies the original connection; close admission, drain accepted work, notify DISCONNECTED through the private pool and finalize releasable resources | Section 6.14 |
+
+Only the ROUTER owner sends RPC replies. Workers publish completions carrying
+the original connection generation; backend notifications publish internal
+lifecycle results, not unsolicited RPCs. A response gets at most one
+nonblocking send attempt. An undeliverable response is logged and dropped,
+without retry or a second error reply. Admission rejections use the same owner
+and delivery policy without creating a service job. Lifecycle work uses the
+separate control path and does not consume the 1,024 application waiting slots.
+
 There is no application heartbeat service, heartbeat worker or inactivity
 watchdog in the Gateway runtime. The registry has no last-request-age expiry
 rule. Connection cleanup is driven by correlated disconnect events and the
