@@ -130,8 +130,12 @@ fresh runtime state; old connections and requests are not restored. Section
 
 Both string methods accept ordinary NUL-terminated text without a caller-supplied
 length or encoding step. EyilClient owns input copying and wire serialization.
-The byte methods retain explicit sizes for binary Protobuf. Section 5.8 defines
-the string boundary and the remaining text/service interpretation contract.
+The byte methods retain explicit sizes for binary Protobuf. String calls use
+service=RPC_SERVICE_UNSPECIFIED until a text service is defined; Gateway returns
+RPC_STATUS_UNSUPPORTED_SERVICE and EyilClient exposes that received status as
+NUL-terminated text. Section 5.8 defines the exact request and response. This is
+an explicit delivery limitation against the original string-functionality AC,
+not a change to its wording or a local CLIENT_NOT_IMPLEMENTED implementation.
 
 Notification APIs are retained for future support. In this version,
 client_register_notifications returns CLIENT_NOT_IMPLEMENTED and
@@ -148,7 +152,9 @@ dedicated-thread wording. See TODO(CLIENT-MONITOR).
 
 Initial client defaults are **15 seconds for connect**, **15 seconds per
 synchronous request** and **15 seconds for async send submission**. Client
-submission queues and pending-request maps grow dynamically with no fixed
+requests use one submission slot per Client. Competing callers wait for that
+slot within their original deadline; there is no client submission queue or
+queue-full result. The pending-response map grows dynamically with no fixed
 request-count cap. Async responses have no deadline. These time limits do not
 expire idle connections. An application may freeze
 its process after finishing all operations and callbacks; it owns preparation
@@ -164,7 +170,7 @@ remain to be specified.
 The agreed design makes connection loss terminal for that Client
 connection: disable automatic reconnect, retire pending client work and discard
 undelivered messages. The app closes the old Client and explicitly connects again
-with fresh client and Gateway session state. No queued request, response, buffer
+with fresh client and Gateway session state. No waiting/submitted request, response, buffer
 ID or session key handle is transferred to the new connection. Section 5.14
 defines cleanup and ownership.
 
@@ -349,8 +355,10 @@ the client, transport or buffer registry.
 | [rpc.proto](../apis/proto/rpc.proto) | Service-neutral RpcRequest/RpcResponse, request_id, service, schema_version and RpcStatus | EyilClient ↔ Gateway routing |
 | [crypto.proto](../apis/proto/crypto.proto) | CryptoRequest/CryptoResponse, operations, key metadata, buffer allocation/release and offset/length regions | Crypto consumer ↔ Gateway Crypto adapter |
 
-`RpcRequest.payload` contains a serialized service request.
-`RpcResponse.payload` contains the service response when available. Crypto
+`RpcRequest.payload` carries service payload bytes. For CRYPTO these are a
+serialized CryptoRequest; the unsupported string path carries text as described
+below. `RpcResponse.payload` contains the service response when available and
+is empty for Gateway routing errors. Crypto
 defines an operation enum and a `oneof`; they must agree. A valid Protobuf parse
 alone does not validate the operation, enum values, required message presence
 or allowed lengths.
@@ -382,12 +390,20 @@ serialized response to that caller. The service is carried in the envelope;
 no separate service argument is needed. Crypto payload bytes remain opaque to
 EyilClient and are interpreted by the service-specific consumer.
 
+Request IDs are nonzero and unique throughout one Client connection generation,
+including after a request is retired. Different connections may use the same
+numeric ID. Gateway therefore identifies a request by its authenticated
+connection generation together with request_id, never by request_id globally.
+
 Both string request APIs accept ordinary NUL-terminated request text and return
 ordinary NUL-terminated response text. EyilClient measures and copies input up
 to the first NUL; the caller supplies no size or text encoding. Wire envelope
-construction and serialization belong inside the library. Protobuf bytes fields
-and ZMQ can carry text bytes directly. The service route and interpretation of
-that text are a separate contract, described in section 5.8.
+construction and serialization belong inside the library. The current string
+path uses service=RPC_SERVICE_UNSPECIFIED (0) and carries raw text bytes in
+payload. Gateway rejects that unrouted request with
+RPC_STATUS_UNSUPPORTED_SERVICE; the client returns its symbolic status name as
+text. No text is interpreted as CryptoRequest or sent to ICrypto. Section 5.8
+defines this unsupported behavior and the complete string error representation.
 
 ### 4.2 Status and error layers
 
@@ -420,10 +436,16 @@ carry local ClientResult errors.
 | Submission without a usable connection | CLIENT_NOT_CONNECTED | No response |
 | Explicit client_disconnect wins while a synchronous result or an unaccepted async send is pending | CLIENT_NOT_CONNECTED | Clear synchronous outputs, cancel unsent work and retire pending IDs; no async response callback |
 | Authentication explicitly rejected | CLIENT_AUTH_FAILED | No response |
-| Detected allocation failure during connect, sync processing or async submission before libzmq acceptance, including queue insertion | CLIENT_OUT_OF_MEMORY | Roll back local state; sync outputs remain NULL/0 and async submission invokes no response callback |
+| Detected allocation failure during connect, sync processing or async submission before libzmq acceptance, including request preparation and pending-map insertion | CLIENT_OUT_OF_MEMORY | Roll back local state; sync outputs remain NULL/0 and async submission invokes no response callback |
 | Connect, synchronous request or async send-submission deadline expires | CLIENT_TIMEOUT | No handle on connect failure; no synchronous response on timeout; async send failure invokes no response callback. A synchronous timeout may leave remote execution in progress |
 | Connection lost during a synchronous request or before async send acceptance, malformed synchronous response or terminal send failure | CLIENT_COMMUNICATION_ERROR | No response |
 | Valid correlated synchronous RPC response delivered, or async message accepted by zmq_send | CLIENT_OK | Sync returns the response; async returns without waiting for one. The caller checks RpcStatus and service status when a response is delivered |
+
+These mappings apply when that terminal path wins. An admitted nonblocking send
+must finish before its acceptance is known: timeout or close during the attempt
+cannot turn an accepted async send into a failed submission. A synchronous
+call can still time out or close while awaiting its response. Section 5.2
+defines result arbitration and preserves the first terminal runtime reason.
 
 For synchronous byte responses, every local error produces `response_data == NULL` and
 `response_size == 0`. For string responses, it produces `response_data == NULL`.
@@ -432,11 +454,14 @@ received RPC response: byte APIs return CLIENT_OK with its bytes and preserve
 RpcStatus.
 Do not turn a local failure into a fabricated Gateway RpcResponse or CryptoError.
 
-Byte APIs expose the complete RpcResponse for the caller to inspect. String
-APIs expose text; TEXT-SERVICE-CONTRACT must define how Gateway and service
-errors are represented in that text. A valid Gateway error response must remain
-an error visible to the consumer, without being fabricated as successful text
-or confused with a local allocation/transport failure.
+Byte APIs expose the complete RpcResponse for inspection. String APIs expose
+the symbolic name of its validated non-OK RpcStatus, normally the exact text
+"RPC_STATUS_UNSUPPORTED_SERVICE". Sync returns CLIENT_OK with that owned string;
+async delivers it through the existing response callback after a successful
+send. The text is a remote rejection, not successful text-service execution.
+Local errors still use ClientResult and do not fabricate a response. Unexpected
+OK, unknown status or nonempty payload on this unsupported string path is a
+response-validation failure as specified in section 5.8.
 
 Connect, synchronous request and async send-submission timeouts are **15,000 ms**
 in the initial version, using one common internal duration constant. Async
@@ -445,9 +470,11 @@ API is required for this version. An authentication error requires an explicit
 rejection; an unavailable endpoint or lost connection is not evidence of denied
 access.
 Temporary socket backpressure is handled within the active send deadline and
-is not automatically a terminal communication failure. The client has no fixed
-queue/request-count limit and does not report a local queue-full error. If it
-cannot allocate request state or grow the queue, return CLIENT_OUT_OF_MEMORY.
+is not automatically a terminal communication failure. Client callers wait for
+the one submission slot within their original deadline. There is no submission
+container or queue-full result. Allocation failure in owned request state or
+the dynamic pending-response map uses CLIENT_OUT_OF_MEMORY. A busy slot alone
+is not an allocation failure; expiry while waiting uses CLIENT_TIMEOUT.
 Gateway allows at most 1,024 requests waiting for a private-pool worker, with
 a 10-second deadline to start dispatch. Queue saturation, expiry before dispatch
 and detected Gateway allocation failure map to RPC_STATUS_INTERNAL when a
@@ -471,16 +498,16 @@ the operation automatically or claim that its shared buffer is safe to reuse.
 | OK (1) | Successfully routed and processed at the Gateway layer |
 | INVALID_REQUEST (2) | Parsed outer RPC envelope violates the agreed structure; service-payload rejections use the generic error below |
 | UNSUPPORTED_SCHEMA (3) | Unsupported envelope schema_version |
-| UNSUPPORTED_SERVICE (4) | Unknown or unregistered RPC service |
+| UNSUPPORTED_SERVICE (4) | No registered service, including service=UNSPECIFIED used by the unsupported string path; log ERROR and return empty payload |
 | MALFORMED_REQUEST (5) | Cannot decode the outer RPC envelope or its framing; service-payload decoding failures use the generic error below |
 | INVALID_CONNECTION (6) | Missing, stale or inadmissible authenticated connection context |
 | INTERNAL (7) | Generic Gateway rejection or execution failure, including the cases below, full 1,024-entry waiting queue, 10-second dispatch-wait expiry, allocation failure, null ICrypto lookup or failed invocation when a correlated reply is possible |
 
 #### Generic Gateway rejection and explicit error logging
 
-Use the existing **RPC_STATUS_INTERNAL** for duplicate request IDs, invalid
-service payloads, shared-buffer quota failures and rejected buffer uses involving
-a busy, release-pending or already released buffer. A first valid
+Use the existing **RPC_STATUS_INTERNAL** for invalid service payloads,
+shared-buffer quota failures and rejected uses of busy, release-pending or
+already released buffers, when a reply can be safely correlated. A first valid
 ReleaseSharedBuffer request is accepted even while the buffer is in use;
 physical cleanup is deferred as specified in section 6.13. No additional wire
 error codes are needed.
@@ -489,7 +516,7 @@ rejection is detected, independently of whether an error response can be sent.
 
 | Rejection | RPC result when safely correlatable | Required log detail |
 | --- | --- | --- |
-| Duplicate request ID | RPC_STATUS_INTERNAL | Duplicate ID and the original request's state |
+| Duplicate ID still owned by an accepted request on the same connection generation | No second response; log and discard the duplicate | Duplicate ID and the original request's state; preserve the original job/completion |
 | Invalid service payload | RPC_STATUS_INTERNAL | Decode failure, operation/oneof mismatch, invalid field, enum, range or buffer reference, as applicable |
 | Shared-buffer quota exceeded | RPC_STATUS_INTERNAL | Requested size/count, current usage, applicable limit and whether the quota is per connection or global |
 | New use rejected because a buffer is release-pending, being destroyed or already released | RPC_STATUS_INTERNAL | Buffer ID and release state or failed lookup |
@@ -513,8 +540,10 @@ Only send an error when the request ID and original authenticated route permit
 unambiguous correlation. A duplicate ID still owned by an accepted request must
 not produce a second competing response under that ID: log and discard the
 duplicate, leave the original job/completion intact and never dispatch a second
-operation. Likewise, log and discard malformed input without a trustworthy ID
-or route. The generic status does not justify inventing a request ID or replying
+operation. Scope this check to the authenticated connection generation; request
+1 on another connection is independent. This is not a replay/deduplication
+guarantee for completed operations. Likewise, log and discard malformed input
+without a trustworthy ID or route. The generic status does not justify inventing a request ID or replying
 to a replacement connection.
 
 Error replies follow the same single nonblocking send-attempt rule as successful
@@ -547,7 +576,7 @@ not undo the release. The full failure and ownership rules are in section 6.13.
 | No deadline/cancel message | A local timeout cannot cancel backend work or prove buffer reuse is safe |
 | No notification envelope | Notification support is reserved for the future; registration returns CLIENT_NOT_IMPLEMENTED and creates no subscription |
 | No retry/deduplication contract | Do not replay key generation, import or other operations automatically |
-| NUL-terminated string API boundary | Copy input up to the first NUL without caller encoding; service selection and text interpretation require TEXT-SERVICE-CONTRACT |
+| NUL-terminated string API boundary | Copy input without caller encoding; send an unrouted service=0 envelope and expose Gateway UNSUPPORTED_SERVICE as status text; successful text-service execution is deferred |
 | No lifecycle/heartbeat messages | Do not invent idle expiry, hibernation commands or heartbeat services |
 
 The protocol permits concurrent requests; it does not define ordering for
@@ -580,9 +609,10 @@ The ROUTER I/O owner copies `zmq_msg_gets(message, "User-Id")` before closing
 the received message. The routing frame is a delivery address, not authenticated
 identity. ZAP's User-Id is a different identifier.
 
-Each DEALER and ROUTER has one socket-owning thread. API callers and request
-workers communicate with it through queues; they never send or receive on its
-socket. This follows the restrictions for these socket types in the
+Each DEALER and ROUTER has one socket-owning thread. Client API callers hand
+work to their owner through one synchronized submission slot and a wakeup.
+Gateway workers hand results to ROUTER through its completion queue. Neither
+application callers nor Gateway workers send or receive on the owner's socket. This follows the restrictions for these socket types in the
 [ZeroMQ socket API](https://libzmq.readthedocs.io/en/latest/zmq_socket.html).
 Socket options, connection, monitoring and closure follow the same ownership.
 
@@ -626,89 +656,87 @@ The library does not:
 
 ### 5.2 Component organization and ownership
 
-| Component | Responsibility | Owner / synchronization |
-| --- | --- | --- |
-| C API facade | Validate arguments, clear outputs, prepare owned input by parsing a binary envelope or copying a NUL-terminated string, and hold a live call reference | Calling application thread; never touches DEALER |
-| Per-Client coordinator | State, generation, submission queue and shutdown coordination | Short protected state transitions; no fixed client request-count cap |
-| Submission queue | Dynamically growing std::queue<Action> of owned request actions; shutdown uses a separate stop flag | Mutex protects push/front/pop; process work after releasing it |
-| Request record | Copied request, assigned ID, waiter or response handler, generation and state; sync total deadline or async send deadline | Retained until response delivery or local retirement; accepted async response waiting has no deadline |
-| Serving/I/O loop | Drain submissions, send/receive, correlate replies, monitor events | Library-owned thread; sole DEALER owner |
-| Pending map | request_id → waiter/callback and expected response metadata | Serving thread; completion ownership transferred once |
-| Completion target | Sync result waiter, async send-result waiter and per-request response callback | Each waiter resolves once; response callbacks run at most once on the I/O owner without internal locks held |
-| Monitor collector | Read/decode PAIR events and hand them to connection-state handling | I/O owner performs these monitor-thread duties in the proposed design; a separate worker remains an AC wording decision |
-| Response storage | Independently allocated byte/string result | Ownership passes to application, freed with client_free_response |
+Use one ClientRuntime per Client, with one I/O owner and one retained request
+record per entered request call. The rows below describe responsibilities and
+method boundaries, not a requirement for a class or thread per row.
 
-Each request entry point retains a scoped live-call reference before accessing
-Client state or preparing input, and releases it on every return path. The guard
-covers validation, copying/parsing, queue admission, waits and final response
-preparation. Admission and callback claims are serialized against explicit
-disconnect. Section 5.13 defines the caller's handle-lifetime obligations and
-the cleanup barrier; a raw Client pointer alone is not a lifetime reference.
+| Component / state | Responsibility | Owner / synchronization |
+| --- | --- | --- |
+| Public C API | Retain a live call, validate arguments, prepare owned input and wait for submission/result | Calling application thread; never touches DEALER |
+| ClientRuntime | Connection generation, admission, slot, callback claims and shutdown | Per-Client state mutex and retained live-call references |
+| Single submission slot | One retained Request reference, EMPTY/PUBLISHED/CLAIMED state and slot-available condition variable | Pre-created during connect; no std::queue, list of submissions or queue-node allocation |
+| Request record | Owned envelope/text, mode, ID, generation, original deadline, send result and response waiter or handler | Retained independently by the caller, occupied slot, I/O owner and pending map as needed |
+| I/O owner | Claim the slot, serialize/send, receive/correlate, process deadlines and PAIR events | One library-owned thread; sole DEALER owner |
+| Pending map | request_id to expected response metadata and completion target | I/O owner; entry installed before first send and retired once |
+| Per-call result conditions | Wake the async caller on send outcome or sync caller on final result | Waits release the state mutex; send acceptance and response completion remain separate states in the Request |
+| Monitor collector | Decode PAIR events and drive connection-state handling | I/O owner in the proposed consolidation; dedicated-thread AC wording remains CLIENT-MONITOR |
+| Response storage | Owned binary response or NUL-terminated status text | Transferred to the application and freed with client_free_response |
+
+The slot is shared only within one Client. Callers waiting for it remain on
+their application threads, retaining their own request/call state; the library
+does not put them in another submission container. The slot remains occupied
+while its request is being prepared or waiting for libzmq acceptance. After a
+terminal send outcome, the owner clears it and wakes waiting callers. Sent
+requests remain independently tracked in the pending map, with no fixed count
+cap. One occupied slot does not mean one outstanding remote operation.
+
+Every request entry point obtains a live-call guard before input preparation.
+The guard covers slot waiting, publication, send/result waiting and response
+preparation. Disconnect wakes these calls before waiting for their guards to
+drain. The application must still coordinate raw-handle lifetime as specified
+in section 5.13. Socket ownership is never transferred to an application caller.
 
 ```mermaid
-flowchart LR
+flowchart TB
     A["Application / Firebolt Crypto<br/>Application threads"]
-    subgraph LIB["EyilClient runtime / libeyilclient.so - same application process"]
-        subgraph API["Public C API - called by the application"]
-            LIFE["client_connect()<br/>client_disconnect()"]
-            REQ["client_send_request()<br/>client_send_request_async()<br/>client_send_request_string()<br/>client_send_request_string_async()"]
-            NOTIFY["client_register_notifications()<br/>client_unregister_notifications()"]
-            FREE["client_free_response()"]
+    subgraph LIB["EyilClient / libeyilclient.so"]
+        subgraph API["Public C API"]
+            LIFE["client_connect / client_disconnect"]
+            REQ["client_send_request / client_send_request_async<br/>client_send_request_string / client_send_request_string_async"]
+            OTHER["client_free_response<br/>client_register_notifications / client_unregister_notifications"]
         end
-        CO["Per-Client coordinator<br/>Validation, connection and request state"]
-        Q["Dynamic std::queue of Action<br/>Mutex + pollable wakeup<br/>No fixed request-count limit"]
-        IO["Library-owned I/O owner thread<br/>Poll DEALER + monitor PAIR + wakeup<br/>Handle replies and connection events"]
-        D["DEALER socket"]
-        P["Pending map by request_id"]
-        SYNC["Per-call synchronous waiter"]
-        SEND_RESULT["Per-call async send-result waiter"]
-        CB["Async response callback<br/>Client + owned response"]
-        HANDLERS["Connection event handler<br/>Later unexpected loss only"]
-        EVENTS["libzmq internal monitor sender<br/>DEALER connection events"]
-        M["PAIR monitor receiver<br/>Polled and decoded by the I/O owner<br/>Same monitor-event collection duties"]
-        MN["Design note - AC confirmation<br/>PAIR receiver + I/O owner cover monitor-thread duties<br/>No separate monitor worker in this proposal"]
-        LIFE -- "Start / stop coordination" --> CO
-        CO -- "Owned request actions" --> Q
-        CO -- "Stop flag + existing wakeup" --> IO
-        LIFE -- "Start / join serving thread" --> IO
-        LIFE -- "Connection handler registration" --> HANDLERS
-        REQ -- "Validate and prepare owned request" --> CO
-        Q -- "Commands and requests" --> IO
-        IO -- "Send requests" --> D
-        D -- "Receive responses" --> IO
-        IO -- "Correlate result / settle local error" --> P
-        IO -- "Send accepted or submission failed" --> SEND_RESULT
-        P --> SYNC
-        P --> CB
-        IO -- "CLIENT_CONNECTION_LOST once" --> HANDLERS
-        D -. "Monitoring enabled" .-> EVENTS
-        EVENTS -- "Internal inproc event channel" --> M
-        M -- "Connection state events" --> IO
-        MN -. "Same proposed owner thread" .-> M
-        MN -. "Collect and handle monitor events" .-> IO
+        RT["ClientRuntime<br/>Admission, generation, live calls and stop flag"]
+        SLOT["One submission slot per Client<br/>Mutex + slotAvailable condition<br/>EMPTY / PUBLISHED / CLAIMED"]
+        WAKE["Pollable wakeup<br/>Submission, cancellation and stop"]
+        IO["One I/O owner<br/>DEALER + monitor PAIR + wakeup"]
+        P["Pending map by request_id<br/>Many sent requests can await responses"]
+        RESULT["Request completion state<br/>Send result / synchronous response waiter"]
+        CB["Async response or connection-loss handler<br/>Invoked by I/O owner without locks"]
+        MON["PAIR monitor receiver<br/>Same I/O owner performs collection duties<br/>Dedicated-thread AC confirmation remains"]
+        LIFE --> RT
+        LIFE -- "Create empty slot, start / stop / join" --> IO
+        REQ -- "F1 Retain call, validate and prepare" --> RT
+        RT -- "F2 WaitAndPublish, wait releases mutex" --> SLOT
+        SLOT -- "F3 Wake owner after publication" --> WAKE
+        RT -- "Cancellation / stop, independent of occupied slot" --> WAKE
+        WAKE --> IO
+        IO -- "F3 ClaimSubmission under mutex" --> SLOT
+        IO -- "F4 Install response target before send" --> P
+        IO -- "F5 CompleteSend, clear matching slot and notify slotAvailable" --> SLOT
+        IO -- "F6 Publish send result or final sync error" --> RESULT
+        P -- "F7/F8 Correlate and complete sync response" --> RESULT
+        P -- "F8 Claim and deliver async response" --> CB
+        IO -- "Established connection loss" --> CB
+        IO -- "Enable monitor, poll and decode" --> MON
     end
     G["Gateway ROUTER<br/>ipc:///tmp/app-eyil-gateway.ipc"]
-    A -- "Connect / disconnect" --> LIFE
-    A -- "Sync / async request calls" --> REQ
-    A -- "Call reserved notification APIs" --> NOTIFY
-    NOTIFY -- "Register returns CLIENT_NOT_IMPLEMENTED<br/>Unregister returns without changes" --> A
-    A -- "Free returned response storage" --> FREE
-    SYNC -- "Return ClientResult and response" --> A
-    SEND_RESULT -- "Return async submission ClientResult" --> A
-    CB -- "Invoke response callback" --> A
-    HANDLERS -- "Invoke registered handler" --> A
-    D -- "RpcRequest over UDS" --> G
-    G -- "RpcResponse over UDS" --> D
+    A -- "Lifecycle calls" --> LIFE
+    A -- "Request calls" --> REQ
+    A -- "Free response or reserved notification call" --> OTHER
+    OTHER -- "Free locally / register NOT_IMPLEMENTED / unregister no effect" --> A
+    RESULT -- "Return on the calling application thread" --> A
+    CB -- "Invoke application callback" --> A
+    IO -- "F5 zmq_send, one binary RpcRequest frame" --> G
+    G -- "F7 zmq_msg_recv, RpcResponse" --> IO
 ```
 
-The application explicitly calls the public functions shown in the inner API
-block. Those entry points run on the calling application thread; the submission
-queue transfers owned requests to the library-owned I/O loop. Startup and
-shutdown use retained runtime state and a separate stop flag. Synchronous results
-return to the caller, while asynchronous results use the registered per-request
-response handler. Section 5.4 defines send waiting and callback execution rules.
-Response freeing is a local operation. The reserved notification APIs do not
-create callback state, subscriptions or Gateway event producers.
+F1–F8 are the common flow points defined in section 5.3 and reused in every
+request sequence. WaitAndPublish, ClaimSubmission and CompleteSend are internal
+design method names on the runtime/owner, not additional public APIs. The slot
+is read explicitly by ClaimSubmission; a wakeup alone does not transfer or send
+the request. CompleteSend frees the slot after acceptance/failure, independently
+of later response delivery. Connection and response callbacks share the owner
+thread and must return promptly. Notification APIs create no callback state.
 
 The PAIR monitor receiver is an internal socket plus event-decoding code.
 Enabling monitoring on DEALER makes libzmq create the other PAIR endpoint, which
@@ -787,122 +815,236 @@ itself mandatory? No heartbeat sender, idle-session watchdog or periodic PID
 responsiveness probe is part of this monitor contract. The monitor also does
 not perform Gateway-side ZAP authentication or decode service responses.
 
-#### Request submission and completion
+#### Single-slot publication, claiming and completion
 
-A wakeup FD or equivalent queue notification lets application threads wake the
-serving loop without sharing a ZMQ socket. Use a dynamically growing
-`std::queue<Action>` with a mutex around push/front/pop. The I/O owner moves an
-action out under the lock, releases the lock, and then processes it. A pollable
-wakeup lets it service submissions alongside DEALER replies and PAIR events;
-a condition variable alone cannot wake its socket poll. Per-call waiters use
-condition variables for their result. There is no fixed client queue length,
-pending-request count or aggregate queue-byte admission limit.
+Create the slot, state mutex, slotAvailable condition and pollable wakeup during
+connect. No submission queue exists. The API prepares an owned Request before
+publication, including its callback/waiter, generation and original deadline.
+Preparation can fail with CLIENT_OUT_OF_MEMORY; publishing a retained reference
+into an empty slot must not allocate.
 
-Construct the owned request and retained waiter, initialize the mode, generation
-and original 15-second deadline, then publish the action.
-Use non-throwing ownership moves and release partially prepared storage if
-allocation fails. Publish only a successfully inserted action, unlock, then
-signal the existing wakeup. A failed queue insertion returns
-CLIENT_OUT_OF_MEMORY without sending or invoking a response callback. Copy an
-asynchronous request before returning to the caller, so the caller may reuse
-its input memory. The pending map can also allocate; install its entry before
-the first send and resolve the retained waiter with CLIENT_OUT_OF_MEMORY if
-that insertion fails. Never send an untracked request.
+WaitAndPublish locks the per-Client state, checks admission and waits until the
+slot is EMPTY or a terminal condition occurs. A condition-variable wait releases
+the mutex. Use one absolute 15-second deadline starting when the request call
+is admitted, before input preparation and slot waiting; no stage restarts it.
+After publication, unlock and signal the existing pollable wakeup. A condition
+variable alone cannot wake the I/O owner's socket poll.
 
-Proposed request states are `QUEUED → ACCEPTED_BY_LIBZMQ → RETIRED`, with local
-failure/cancellation/shutdown paths. Retirement may follow response delivery
-or cleanup without a response. Remove a pending entry atomically before
-invoking its response handler. Reserve IDs before sending; do not reuse an ID while
-a late response from the same connection generation could still arrive.
-Validate response ID, service, schema and status before completing the caller.
+On that wakeup, ClaimSubmission locks state, reads the published Request,
+retains it, marks the slot CLAIMED and unlocks. Reading the slot does not clear
+it. The owner prepares serialization and the pending-map entry outside the
+state lock, then attempts a nonblocking send. There is only one submitted,
+not-yet-accepted request at a time. EAGAIN leaves that request in the slot while
+the owner polls replies, PAIR events, writable readiness and active deadlines.
+It must not block in zmq_send, spin, or wait on an application condition variable.
+
+CompleteSend(request, outcome) applies to the retained Request that owns the
+attempt. Under the state lock, it ends SEND_IN_PROGRESS, records the send
+outcome once, applies any pending cancellation, disarms an accepted async send's
+deadline and clears the slot only if that slot still belongs to this Request.
+Unlock before notifying slotAvailable and the request's result condition.
+These updates form one coordinated transition. The owner removes
+an unsent pending entry before servicing another submission or response.
+
+After acceptance, the pending map retains the response target but not the slot.
+A synchronous caller can keep waiting for its response while another caller
+publishes and sends a new request. Response retirement for request A must never
+clear a slot now occupied by request B. Repeated retirement/completion is
+harmless and cannot change an already committed result or release another
+request's storage. No async response deadline starts.
+
+The owner allocates increasing nonzero request IDs within its connection
+generation. It never reuses a retired ID, including after timeout or failed
+submission, so a late response cannot match another request. Do not wrap the
+counter: exhaustion ends the generation through the terminal
+CLIENT_COMMUNICATION_ERROR path. A fresh Client may restart its ID sequence;
+its transport and Gateway context are independent.
+
+| State / event | Required action |
+| --- | --- |
+| Another request occupies the slot | Wait on slotAvailable within the caller's original deadline; no queue-full result and no FIFO guarantee among competing callers |
+| Deadline expires before publication | Return CLIENT_TIMEOUT; no request was transferred or sent |
+| Allocation fails during input/request preparation | Return CLIENT_OUT_OF_MEMORY; release partial state, no publication or callback |
+| Serialization or pending-map insertion fails after claiming | Owner retires unsent work, frees only its matching slot and completes with CLIENT_OUT_OF_MEMORY unless a terminal result/cancellation already won |
+| Published/claimed request is cancelled before a send attempt | Mark cancelled, wake the owner and prevent any later send; retain the record until owner retirement and slot release |
+| Nonblocking send attempt is in progress | Resolve that attempt before returning a failure claiming no acceptance; successful acceptance fixes the async result at CLIENT_OK |
+| Explicit disconnect closes READY admission | Latch CLIENT_NOT_CONNECTED, notify slotAvailable immediately and wake the owner; preserve earlier results and resolve any send in progress before completing affected calls |
+| Unexpected connection loss | Notify slotAvailable, retire unsent/sent state and complete unresolved calls with CLIENT_COMMUNICATION_ERROR; accepted async results remain CLIENT_OK |
+
+EMPTY/PUBLISHED/CLAIMED describe the slot. SEND_IN_PROGRESS describes an
+attempt on its retained Request while the slot remains CLAIMED. Only one such
+attempt can execute on the owner. The state lock protects the final eligibility
+check and transition into SEND_IN_PROGRESS against cancellation/close. Release it for the nonblocking
+socket call, then publish the actual outcome under the same synchronization.
+A waiter may request cancellation during an attempt but cannot declare that an
+accepted message was unsent. After EAGAIN/EINTR, end SEND_IN_PROGRESS under the
+lock and recheck cancellation, generation and the original deadline. If no
+longer eligible, complete with the winning error; otherwise keep the CLAIMED
+slot, poll other work and admit another attempt only through TryBeginSend.
+Only the I/O owner clears an occupied slot; an expired caller cannot destroy
+storage still retained by it.
+
+Latch the first terminal runtime reason when READY admission closes. Callers
+still preparing input or waiting for the slot are not in the pending map; they
+read this retained reason before publication or completion. Explicit close
+selects CLIENT_NOT_CONNECTED, transport loss CLIENT_COMMUNICATION_ERROR, and
+connection-wide decode allocation failure CLIENT_OUT_OF_MEMORY under section
+5.6. A later disconnect of an already LOST handle must not replace its reason.
+Already committed per-call results remain unchanged. New calls on an already
+lost/closing handle get CLIENT_NOT_CONNECTED. notify_all requires no heap
+allocation.
+Local stop uses its existing flag and wakeup, never waits for a free slot and
+never publishes a stop request into that slot.
+
+Every result arrow in the following UMLs uses this terminal-result arbitration.
+An error discovered during preparation cannot overwrite a timeout or close
+already committed while that preparation ran. A send-acceptance arrow records
+the actual attempt outcome; for sync it is distinct from the final response
+result. Only an accepted async send fixes the public result at CLIENT_OK.
 
 ```mermaid
 sequenceDiagram
-    participant A as Application thread
-    participant API as Request C API
-    participant Q as Dynamic queue and mutex
-    participant W as Retained result waiter
+    participant A as Calling application thread
+    participant API as Any request C API
+    participant S as ClientRuntime / single slot
     participant IO as I/O owner
     participant P as Pending map
     participant Z as DEALER
-    A->>API: Any of the four request methods
-    API->>API: Retain live Client for the call, validate and allocate owned input, record and waiter
-    Note over API,W: Initialize mode, generation and deadline before queue publication
-    alt Preparation allocation fails
-        API->>API: Release partial state
-        API-->>A: CLIENT_OUT_OF_MEMORY, no response or callback
+    A->>API: Request call
+    API->>API: Validate required pointers before accessing the Client
+    API->>S: F1 RetainCall, check thread and READY, start absolute deadline
+    API->>API: PrepareRequest with owned input and result state
+    alt Preparation fails
+        API-->>A: CLIENT_INVALID_ARGUMENT, CLIENT_NOT_CONNECTED or<br/>CLIENT_OUT_OF_MEMORY
     else Prepared
-        API->>Q: Lock, check connection and push owned action
-        alt Queue growth allocation fails
-            Q-->>API: Allocation failure, action not published
-            API->>API: Unlock and release owned state
-            API-->>A: CLIENT_OUT_OF_MEMORY, no response or callback
-        else Push succeeds
-            API->>Q: Unlock, signal existing wakeup
-            API->>W: Wait for sync result or async send acceptance
-            IO->>Q: Lock, move front and pop, unlock
-            IO->>IO: Check deadline and generation, serialize outside queue lock
-            IO->>P: Insert response target before sending
-            alt Serialization or pending-map allocation fails
-                IO->>IO: Release partial state and retire unsent action
-                IO->>W: Publish CLIENT_OUT_OF_MEMORY using retained state
-                W-->>API: CLIENT_OUT_OF_MEMORY
-                API-->>A: CLIENT_OUT_OF_MEMORY, no response or callback
-            else Request fully tracked
-                IO->>Z: zmq_send(DEALER, frame, DONTWAIT)
-                Note over IO,Z: Shared pipeline in section 5.6 handles send and receive results
+        API->>S: F2 WaitAndPublish(request, deadline)
+        opt Slot occupied
+            S->>S: Wait on slotAvailable, release mutex while waiting
+        end
+        alt Deadline / close / loss wins before publication
+            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED /<br/>CLIENT_COMMUNICATION_ERROR
+            API-->>A: Exact local result, no send or response callback
+        else EMPTY and eligible
+            S->>S: Store retained Request, mark PUBLISHED, unlock
+            S-->>API: Published
+            API->>IO: F3 Signal pollable wakeup
+            API->>S: Wait for this request result, release mutex
+            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
+            S-->>IO: Owned Request, mode, generation and deadline
+            IO->>IO: F4 Assign ID/schema, serialize
+            IO->>P: Insert expected response target before send
+            alt Allocation / cancellation / deadline / close / loss
+                IO->>P: Retire unsent entry if installed
+                IO->>S: CompleteSend(request, error), clear matching slot, notify all<br/>waiters
+            else Prepared and eligible
+                loop Until acceptance or terminal failure
+                    IO->>S: TryBeginSend, recheck cancellation, generation and deadline
+                    alt Request no longer eligible
+                        IO->>P: Retire unsent entry
+                        IO->>S: CompleteSend(request, exact error), clear matching slot, notify
+                    else Send attempt admitted
+                        IO->>Z: F5 zmq_send(DONTWAIT)
+                        alt EAGAIN or EINTR
+                            IO->>S: End SEND_IN_PROGRESS, check cancellation under state lock
+                            opt Still eligible
+                                IO->>IO: Keep CLAIMED slot, poll replies/monitor and writable readiness
+                            end
+                        else Terminal send failure
+                            IO->>P: Retire unsent entry
+                            IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY or<br/>CLIENT_COMMUNICATION_ERROR), clear matching slot, notify
+                        else Accepted by libzmq
+                            IO->>S: F5 CompleteSend(request, CLIENT_OK), clear matching slot, notify
+                            Note over S,P: Slot is reusable, response record remains pending
+                        end
+                    end
+                end
             end
+            S-->>API: F6 Send result, or continue synchronous response wait
+            API-->>A: Async send result / final synchronous result
         end
     end
 ```
 
 ### 5.3 General routing: concurrent requests on one connection
 
-Coverage: **AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5, AC1.5–AC1.6, AC1.7, AC2-Firebolt.1–AC2-Firebolt.2**.
+Coverage: **AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5,
+AC1.5–AC1.7, AC2-Firebolt.1–AC2-Firebolt.2**.
+
+Use these flow points in the API diagrams and implementation:
+
+| Point | Calling component / internal method | Work and next boundary |
+| --- | --- | --- |
+| F1 | C API: RetainCall / PrepareRequest | Validate handle, calling thread and arguments; check READY, start the deadline, own input and initialize request/result state |
+| F2 | Calling thread: WaitAndPublish | Wait for the single slot, releasing the mutex; publish only while eligible; timeout/close/loss can end the wait |
+| F3 | Caller: WakeIo; owner: ClaimSubmission | Wake the poller; owner explicitly locks, reads and retains the published request, marks CLAIMED and unlocks |
+| F4 | Owner: PrepareWireRequest / TrackRequest | Recheck deadline/generation, assign ID and schema 1, serialize and install the pending entry before sending |
+| F5 | Owner: TryBeginSend / CompleteSend | Attempt zmq_send(DONTWAIT); retain the slot on temporary backpressure; atomically record the send result and release only its matching slot, then wake callers |
+| F6 | Calling thread: WaitForSend or WaitForResponse | Async returns send result; sync waits for its own final response within the same total deadline, without occupying the slot after send |
+| F7 | Owner: ReceiveResponse / MatchRequest | Receive a complete response, validate framing/envelope, match the original ID/service/generation and require recorded send acceptance |
+| F8 | Owner: CompleteResponse | Prepare final bytes/status text, claim completion against timeout/close, retire once, wake the sync caller or invoke the async callback without locks |
+
+These internal names make the call boundaries explicit; they can be methods
+and state in one ClientRuntime plus Request records. The common send/error
+rules are in section 5.6; F1–F8 do not add public API methods. F6 is the caller's
+wait/return: it overlaps owner steps F3–F5 and, for sync, F7–F8. Waiting on that
+result condition does not prevent the owner from claiming or sending work.
 
 ```mermaid
 sequenceDiagram
-    participant A as App thread A
-    participant B as App thread B
-    participant API as C API / coordinator
-    participant IO as EyilClient I/O owner
-    participant Z as Client libzmq / DEALER
-    participant GW as Gateway ROUTER owner
-    participant W as Gateway private pool
-    Note over API,IO: Successful allocation path shown, failure paths are in sections 5.2 and 5.6
-    A->>API: client_send_request_async(request A, callback A)
-    API->>API: Reserve owned request and send-result waiter A
-    API->>IO: Queue A and wake owner
-    B->>API: client_send_request(request B)
-    API->>IO: Queue B with response waiter
-    Note over A,API: Async caller waits only for libzmq send acceptance
-    IO->>IO: Assign IDs and schema 1, install pending entries
-    IO->>Z: zmq_send(DEALER, RpcRequest A, DONTWAIT)
-    Z-->>IO: Message accepted into libzmq queue
-    IO-->>API: Resolve send-result waiter A with CLIENT_OK
-    API-->>A: CLIENT_OK, no response wait
-    Z->>GW: Transport RpcRequest A over UDS
-    IO->>Z: zmq_send(DEALER, RpcRequest B, DONTWAIT)
-    Z->>GW: Transport RpcRequest B over the same connection
-    GW->>W: Dispatch job A
-    GW->>W: Dispatch job B
-    Note over A,B: B waits for a response, A may continue its work
-    W-->>GW: Completion B before A
-    GW-->>IO: RpcResponse B through DEALER
-    IO->>IO: Validate and match ID B
-    IO-->>API: Resolve response waiter B
-    API-->>B: CLIENT_OK and serialized response B
-    W-->>GW: Completion A, with no client response deadline
-    GW-->>IO: RpcResponse A through DEALER
-    IO->>IO: Validate and match ID A, retire request once
-    IO-->>A: callback A(Client, owned response bytes, size)
+    participant A as App thread A / async
+    participant B as App thread B / sync
+    participant S as ClientRuntime / single slot
+    participant IO as Client I/O owner
+    participant P as Pending map / result records
+    participant Z as DEALER
+    participant G as Gateway / private workers
+    A->>A: client_send_request_async, F1 prepare A
+    A->>S: F2 WaitAndPublish(A)
+    S-->>A: Slot contains A
+    A->>IO: F3 WakeIo
+    A->>P: F6 WaitForSend(A), no state lock held
+    B->>B: client_send_request, F1 prepare B
+    B->>S: F2 WaitAndPublish(B)
+    Note over B,S: B waits for slotAvailable, mutex is released
+    IO->>S: F3 ClaimSubmission, read and retain A, slot stays occupied
+    S-->>IO: Request A
+    IO->>P: F4 Assign ID A, serialize, insert target A
+    IO->>Z: F5 zmq_send(A, DONTWAIT)
+    Z-->>IO: Accepted into libzmq
+    IO->>S: CompleteSend(A, CLIENT_OK), record result and disarm deadline,<br/>clear matching slot under lock, then notify
+    P-->>A: CLIENT_OK, API returns without response wait
+    Z->>G: Transport request A
+    S->>S: B acquires mutex, publishes B, unlocks
+    S-->>B: Published
+    B->>IO: F3 WakeIo
+    B->>P: F6 WaitForResponse(B) within original deadline
+    IO->>S: F3 ClaimSubmission, read and retain B
+    S-->>IO: Request B
+    IO->>P: F4 Assign ID B, serialize, insert target B
+    IO->>Z: F5 zmq_send(B, DONTWAIT)
+    Z-->>IO: Accepted
+    IO->>S: CompleteSend(B, CLIENT_OK), record acceptance, clear matching<br/>slot and notify, response result stays pending
+    Z->>G: Transport B while A can still execute
+    Note over S,G: Both IDs are pending, slot is free for another caller
+    G-->>Z: Response B before A
+    IO->>Z: F7 zmq_msg_recv(DONTWAIT)
+    Z-->>IO: RpcResponse B
+    IO->>P: F7/F8 Validate, match accepted B, prepare bytes, retire B
+    P-->>B: CLIENT_OK and owned response, synchronous API returns
+    G-->>Z: Response A, no async response deadline
+    IO->>Z: F7 zmq_msg_recv(DONTWAIT)
+    Z-->>IO: RpcResponse A
+    IO->>P: F7/F8 Validate, match accepted A, prepare bytes, claim callback,<br/>retire A
+    IO-->>A: callback A(Client, owned response, size), on I/O thread
 ```
 
-This is not a strict send/receive alternation. Several callers can wait for
-send acceptance while the same I/O owner continues receiving earlier replies.
-A successful send does not confirm that the UDS write or Gateway receipt has
-occurred. Request-ID correlation routes each response to its own waiter or
-registered response handler. Slow callbacks must not monopolize the I/O loop.
+The diagram shows the successful path; each request still has independent
+allocation, timeout, close and transport-error handling. Only one unsent
+submission occupies the slot, while any number of successfully sent requests
+can await responses subject to available memory. Callers waiting for the slot
+are not stored in a client submission queue. Simultaneous callers have no FIFO
+admission guarantee. The owner fairly services responses, monitor events,
+submission readiness and deadlines, even while an occupied slot cannot send.
 
 ### 5.4 Public API index
 
@@ -910,14 +1052,16 @@ The public API is declared in
 [EyilClient.h](../apis/eyilclient/EyilClient.h). All nine methods
 have individual sequences below. Both asynchronous request methods are required
 public functionality under AC2-Client.5, alongside their synchronous counterparts.
+The selected string path delivers Gateway's unsupported-service response;
+successful text execution is outside this delivery as recorded in section 5.8.
 
 | Method | Behavior | AC coverage |
 | --- | --- | --- |
 | client_connect | Return a handle after successful handshake; reject an occupied handle slot with CLIENT_ALREADY_CONNECTED; report exact startup/authentication/timeout errors | AC2-Client.1–AC2-Client.4; AC1.2, AC1.4–AC1.6 |
-| client_send_request | Binary request with a per-call synchronous waiter | AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5 |
-| client_send_request_async | Wait for libzmq send acceptance; deliver a later binary response through the supplied callback with no response timeout | AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5 |
-| client_send_request_string | Copy NUL-terminated request text, use shared RPC coordination and return owned NUL-terminated response text | AC2-Client.1, AC2-Client.5 |
-| client_send_request_string_async | Same plain-text boundary with the send-acceptance contract and response-only callback | AC2-Client.1, AC2-Client.5 |
+| client_send_request | Wait/publish one submission slot, then await the correlated binary response without holding that slot | AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5 |
+| client_send_request_async | Wait for the slot and libzmq send acceptance within 15 seconds; deliver a later binary response with no response timeout | AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5 |
+| client_send_request_string | Send copied raw text with service=UNSPECIFIED through the slot; return CLIENT_OK plus received RPC_STATUS_UNSUPPORTED_SERVICE status text | AC2-Client.1, AC2-Client.5 |
+| client_send_request_string_async | Same slot/send contract; Gateway unsupported-service status is delivered as owned text through the response callback | AC2-Client.1, AC2-Client.5 |
 | client_free_response | Release a library-allocated result | AC2-Client.1 |
 | client_register_notifications | Return CLIENT_NOT_IMPLEMENTED; reserved for future support | AC2-Client.1 and the public header |
 | client_unregister_notifications | Return without changing state; reserved for future support | AC2-Client.1 and the public header |
@@ -935,18 +1079,20 @@ allocation. Diagnostics are best effort and must not prevent retirement.
 | API | Allocation failure handling |
 | --- | --- |
 | client_connect | CLIENT_OUT_OF_MEMORY for handle/runtime/setup allocation failure; roll back only this attempt, join any started threads, leave the output NULL |
-| client_send_request | CLIENT_OUT_OF_MEMORY for input/envelope/request/waiter/queue/pending-map/send storage or correlated response allocation failure; NULL output and size 0 |
+| client_send_request | CLIENT_OUT_OF_MEMORY for input/envelope/request/waiter/pending-map/send storage or correlated response allocation failure; NULL output and size 0 |
 | client_send_request_async | Before send acceptance, return CLIENT_OUT_OF_MEMORY with no response callback; after acceptance, retire a matched response that cannot be allocated with diagnostics and no callback |
 | client_send_request_string | Same synchronous rules, including copying input text, constructing the wire request and allocating the response string; return CLIENT_OUT_OF_MEMORY and NULL, releasing temporary storage |
 | client_send_request_string_async | Same async rules, including input copying and wire-request preparation before acceptance, and response-string allocation afterward |
 | client_free_response | Void, releases storage without allocating; NULL is accepted; no ClientResult is returned |
 | client_register_notifications | Always CLIENT_NOT_IMPLEMENTED in this version; no state is allocated or handler retained |
 | client_unregister_notifications | Void, no effect or allocation in this version |
-| client_disconnect | Void, uses an existing stop flag and wakeup to initiate cleanup without allocating a queue entry; frees retained state, no ClientResult is returned |
+| client_disconnect | Void, uses an existing stop flag and wakeup to initiate cleanup without waiting for a free slot or allocating a control request; frees retained state, no ClientResult is returned |
 
-For all four request methods, pre-send failure cancels the unsent action and
-releases partial state. Failed queue publication cannot leave a hidden request
-to be sent later. A failure after sending does not undo remote execution or
+For all four request methods, pre-send failure cancels the unsent request and
+releases partial state. A call that times out before publication cannot leave
+work for the owner. A published request remains retained until owner retirement;
+cancellation prevents it being sent after the API reports failure. A failure
+after sending does not undo remote execution or
 make a shared buffer safe to reuse. Never replay the operation to recover a
 local allocation failure.
 
@@ -962,11 +1108,14 @@ using the same connection, request correlation and coordinator as the
 synchronous methods. The submitting thread waits for its send result, **not for
 the remote response**.
 
-- Validate and copy the request, reserve its pending record and send-result
-  waiter, then queue work for the I/O owner.
-- Return CLIENT_OK only after that owner successfully calls zmq_send for the
-  request. Enqueueing a command in the library's own submission queue is not
-  sufficient. EAGAIN remains pending within the 15-second send-submission budget.
+- Validate and copy the request, initialize its retained send-result state,
+  then WaitAndPublish into the single slot. Waiting releases the state mutex.
+- Wake the I/O owner, which explicitly claims the slot and installs the pending
+  record before attempting send. Return CLIENT_OK only after zmq_send accepts
+  that request. Slot publication alone is insufficient.
+- EAGAIN retains the occupied slot within the original 15-second budget while
+  the owner services other replies and events. Acceptance or terminal failure
+  clears the slot and wakes waiting callers.
 - Return validation, allocation, connection or send-submission timeout errors
   directly from the API. A failed submission invokes no response callback.
 - After send acceptance, retain the request for a response with **no response
@@ -1018,8 +1167,9 @@ ClientResult client_send_request_string_async(
 The pending map associates the library-assigned request_id with the handler
 supplied for that request. Callback arguments carry the actual response only.
 For byte responses, the app inspects RpcStatus and service status. String
-responses carry ordinary text, with Gateway/service error representation defined
-under TEXT-SERVICE-CONTRACT. The caller releases either result through
+responses carry the symbolic name of the received Gateway error, normally
+RPC_STATUS_UNSUPPORTED_SERVICE, under the defined contract in section 5.8.
+The caller releases either result through
 client_free_response(). A valid Gateway error response follows the same response
 delivery path. ClientNotificationHandler is reserved for future support and is
 not used to deliver request results or local errors.
@@ -1034,16 +1184,29 @@ per-request error through these response-only signatures.
 #### Send-result coordination and cancellation
 
 Each async request has two distinct stages: a bounded submission wait and an
-unbounded response wait. Use a retained send-result waiter separate from the
-pending response record. The I/O owner publishes ACCEPTED or a terminal send
-error once; the submitting thread returns that result.
+unbounded response wait. Keep separate send-result and response-completion
+states in the same retained Request, rather than requiring separate allocated
+coordinator objects. CompleteSend commits the send outcome and matching-slot
+release together under the state lock, then notifies the request and slot
+waiters. The submitting thread returns that result; response waiting never
+occupies the slot.
 
 Serialize the nonblocking send attempt and its acceptance publication against
 send-deadline cancellation. Check the request's state and deadline before every
-attempt. Once cancelled before acceptance, it must never be sent later. If a
-nonblocking attempt is already in progress, resolve that attempt before returning
-an error that claims the submission failed. A successful acceptance cannot
-later be changed into a send timeout by a competing waiter or disconnect event.
+attempt. With no attempt in progress, cancellation atomically makes the request
+ineligible for any later send. During SEND_IN_PROGRESS, latch the cancellation
+reason and resolve that attempt before publishing its terminal send result.
+If libzmq accepts it, the async result is CLIENT_OK even if the deadline or
+close occurred during that attempt. If it does not accept it, apply the latched
+reason and do not retry. Without cancellation, EAGAIN/EINTR leaves the request
+eligible only within its original deadline; a terminal send error completes it.
+
+After requesting cancellation, a waiter awaiting the active attempt uses its
+result condition; it must not spin on an already expired deadline. The deadline
+prevents a new send attempt, but resolving an admitted attempt and safely
+retiring its state can finish later. This is not a hard real-time return bound.
+Section 5.6 applies the same send eligibility rules to synchronous calls while
+keeping their final response result separate from send acceptance.
 
 After acceptance, disarm the async send deadline. Response arrival and
 connection cleanup compete only for ownership of the pending record; retire it
@@ -1054,7 +1217,7 @@ a shared buffer safe to reuse.
 #### Request-callback execution model
 
 - Invoke response callbacks on the owning Client's serving/I/O thread, without
-  internal state/queue locks held. Callbacks are serialized within a Client;
+  internal state/slot locks held. Callbacks are serialized within a Client;
   different Clients can invoke callbacks concurrently.
 - Retire the pending record before calling application code, and keep the Client
   and response storage alive for the invocation.
@@ -1221,8 +1384,8 @@ sequenceDiagram
     participant Z as Client libzmq / DEALER
     participant GW as Gateway libzmq / ROUTER
     participant G as Gateway ZAP handler
-    Note over A,API: Caller initializes handle to NULL and serializes access to its slot
-    Note over API,IO: Startup success and failure use the return value, no initial connection callback
+    Note over A,API: Caller initializes handle to NULL and serializes access to its<br/>slot
+    Note over API,IO: Startup success and failure use the return value, no initial<br/>connection callback
     A->>API: client_connect(Client handle slot, connectionHandler)
     API->>API: Validate slot, allocate only if valid and empty
     alt Output pointer is NULL
@@ -1234,36 +1397,36 @@ sequenceDiagram
         API->>API: Release partial allocations, keep out Client NULL
         API-->>A: CLIENT_OUT_OF_MEMORY, out Client NULL
     else Local runtime allocated
-        API->>C: Retain startup result, stop flag and wakeup, set PENDING with deadline at attempt start plus 15 seconds
+        API->>C: Retain startup result, empty slot, conditions, stop flag and<br/>wakeup, set PENDING with deadline at attempt start plus 15<br/>seconds
         API->>IO: Attempt to start owned serving thread
         alt Serving-thread allocation fails
-            API->>C: Publish FAILED with CLIENT_OUT_OF_MEMORY using retained startup state
+            API->>C: Publish FAILED with CLIENT_OUT_OF_MEMORY using retained startup<br/>state
         else Other thread-creation failure
             API->>C: Publish FAILED with CLIENT_COMMUNICATION_ERROR
         else Serving thread started
             API->>C: Wait until startup result is terminal or deadline expires
             Note over API,IO: Caller waits, I/O owner continues running
             IO->>Z: Create context and DEALER
-            IO->>Z: Set PLAIN credentials, bounds, RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0
+            IO->>Z: Set PLAIN credentials, bounds, RECONNECT_IVL=-1, IMMEDIATE=1 and<br/>LINGER=0
             IO->>Z: Set ZMQ_HEARTBEAT_IVL, TIMEOUT and TTL to 0 before connect
             Note over IO,GW: Transport heartbeats disabled on DEALER and ROUTER
             IO->>Z: Enable DEALER monitoring at the unique inproc endpoint
-            IO->>Z: Create PAIR receiver with LINGER=0 and connect to that monitor endpoint
+            IO->>Z: Create PAIR receiver with LINGER=0 and connect to that monitor<br/>endpoint
             opt Local setup succeeded
                 IO->>Z: zmq_connect(ipc:///tmp/app-eyil-gateway.ipc)
             end
             alt Local setup or synchronous zmq_connect call fails
-                IO->>C: Publish FAILED with CLIENT_OUT_OF_MEMORY or CLIENT_COMMUNICATION_ERROR
+                IO->>C: Publish FAILED with CLIENT_OUT_OF_MEMORY or<br/>CLIENT_COMMUNICATION_ERROR
                 C->>C: Wake connect waiter immediately, no application callback
             else Setup succeeds and connection attempt starts
                 opt Gateway reachable and handshake progresses
                     Z->>GW: UDS connection and PLAIN handshake
                     GW->>G: ZAP request with kernel-derived peer credentials
-                    G->>G: Bind connection and complete scoped ICrypto CONNECTED notification
+                    G->>G: Bind connection and complete scoped ICrypto CONNECTED<br/>notification
                     G-->>GW: Status 200 and User-Id after setup, or failure status
                     GW-->>Z: Handshake result
                 end
-                Note over IO,Z: CONNECTED and CONNECT_DELAYED do not establish readiness, no automatic reconnect
+                Note over IO,Z: CONNECTED and CONNECT_DELAYED do not establish readiness, no<br/>automatic reconnect
                 alt ZMQ_EVENT_HANDSHAKE_SUCCEEDED before deadline
                     Z-->>IO: Handshake success through monitor PAIR
                     IO->>C: Publish READY with CLIENT_OK and wake connect waiter
@@ -1274,7 +1437,7 @@ sequenceDiagram
                     IO->>C: Publish FAILED with CLIENT_OUT_OF_MEMORY and wake connect waiter
                 else Terminal protocol, transport or authentication-service failure
                     Z-->>IO: Failure event, exact mapping in table below
-                    IO->>C: Publish FAILED with CLIENT_COMMUNICATION_ERROR and wake connect waiter
+                    IO->>C: Publish FAILED with CLIENT_COMMUNICATION_ERROR and wake connect<br/>waiter
                 else Connect deadline expires while still PENDING
                     C->>C: Publish TIMED_OUT with CLIENT_TIMEOUT
                     C->>IO: Wake and abort pending connection attempt
@@ -1283,20 +1446,21 @@ sequenceDiagram
         end
         C-->>API: One terminal ClientResult
         alt Result is CLIENT_OK
-            API->>C: Publish initialized Client handle and enable later loss-callback delivery
+            API->>C: Publish initialized Client handle and enable later loss-callback<br/>delivery
             API-->>A: CLIENT_OK, valid Client, no initial callback
         else Result is an error
             opt Serving thread was started
-                API->>IO: Set existing stop flag and signal wakeup, owner closes created sockets
+                API->>IO: Set existing stop flag and signal wakeup, owner closes created<br/>sockets
                 IO-->>API: Serving loop exits
             end
-            API->>API: Join started threads, terminate context, free runtime without new queue allocation
+            API->>API: Join started threads, terminate context, free runtime without<br/>publishing a control request
             API-->>A: Exact ClientResult, out Client NULL, no callback
         end
     end
 ```
 
-Startup state includes the stop flag and wakeup needed for rollback. A detected
+Startup state includes the empty slot, slotAvailable condition, stop flag and
+wakeup needed for rollback. A detected
 allocation failure during serving-thread creation or owner-side setup publishes
 CLIENT_OUT_OF_MEMORY through that retained state. Other startup failures use
 CLIENT_COMMUNICATION_ERROR. Cleanup only stops or joins threads that actually
@@ -1369,70 +1533,119 @@ API signature change is needed for this agreed envelope handling.
 
 ```mermaid
 sequenceDiagram
-    participant A as Calling app thread
+    participant A as Application
     participant API as client_send_request
-    participant C as Client coordinator / queue
-    participant IO as I/O owner / pending map
-    participant W as Retained response waiter
+    participant S as ClientRuntime / single slot
+    participant W as Retained request / result condition
+    participant IO as I/O owner
+    participant P as Pending map
+    participant Z as DEALER
     participant G as Gateway ROUTER
-    A->>API: Binary request, out response, out size
-    Note over API,C: Validate Client pointer, retain a scoped live-call guard before input work, release it on every return
-    API->>API: Clear supplied outputs, validate arguments and calling thread
-    opt Arguments valid and current thread may block
-        API->>API: Parse RpcRequest into owned storage, validate envelope limits
-    end
-    alt Invalid arguments, envelope or blocking call on own I/O thread
-        API-->>A: CLIENT_INVALID_ARGUMENT, NULL response and size 0
-    else Input or envelope allocation fails
-        API->>API: Free partial request storage
-        API-->>A: CLIENT_OUT_OF_MEMORY, NULL response and size 0
-    else Valid prepared request
-        API->>C: Check connection readiness under the retained live-call guard
-        alt No usable connection
-            C-->>API: CLIENT_NOT_CONNECTED
-            API->>API: Release temporary state and call reference
-            API-->>A: CLIENT_NOT_CONNECTED, NULL response and size 0
-        else Connection usable
-            API->>C: Allocate and initialize record, waiter and deadline, then push under mutex
-            alt Record, waiter or queue allocation fails
-                C-->>API: CLIENT_OUT_OF_MEMORY, request not published
-                API->>API: Release partial state and call reference
-                API-->>A: CLIENT_OUT_OF_MEMORY, NULL response and size 0
-            else Queue insertion succeeds
-                C->>IO: Signal existing wakeup
-                API->>W: Wait for terminal result without coordinator lock
-                IO->>IO: Pop under queue lock, process after unlocking
-                IO->>IO: Check generation/deadline, assign ID and schema 1
-                IO->>IO: Serialize request and install pending entry before send
-                alt Serialization or pending-map allocation fails
-                    IO->>IO: Retire unsent record and free partial state
-                    IO->>W: Publish CLIENT_OUT_OF_MEMORY, NULL and 0
-                else Request fully tracked and still eligible
-                    IO->>G: zmq_send(DEALER, one frame, DONTWAIT) over UDS
-                    Note over IO,G: Shared pipeline handles backpressure and exact send errors
-                    alt Valid correlated response can be allocated
-                        G-->>IO: RpcResponse via zmq_msg_recv
-                        IO->>IO: Validate and allocate owned response
-                        IO->>W: Publish CLIENT_OK and owned response
-                    else Matched response storage allocation fails
-                        IO->>IO: Retire record and free temporary response storage
-                        IO->>W: Publish CLIENT_OUT_OF_MEMORY, NULL and 0
-                        Note over IO,G: Request may have executed, do not replay
-                    else Explicit disconnect wins before result completion
-                        IO->>W: Publish CLIENT_NOT_CONNECTED, NULL and 0
-                    else Deadline, connection loss or other local error
-                        IO->>W: Publish exact ClientResult, NULL and 0
-                    end
-                else Deadline or generation no longer permits sending
-                    IO->>W: Publish CLIENT_TIMEOUT or connection error, NULL and 0
-                end
-                W-->>API: One terminal ClientResult and response outputs
-                API->>C: Release live call reference
-                API-->>A: Result and response outputs
+    A->>API: Client, serialized RpcRequest and size, out response and size
+    API->>API: Clear every supplied output and validate required argument<br/>pointers
+    opt Pointer arguments valid
+        API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
+        opt Admitted on an allowed application thread
+            API->>API: F1 Parse and own RpcRequest, validate nonzero service and<br/>bounded input
+            opt Preparation succeeds
+                API->>W: Initialize owned Request, mode, generation and completion state
             end
         end
     end
+    alt Invalid arguments / own I/O-thread request call / no usable<br/>connection / preparation allocation failure
+        API->>API: Release partial state and any retained call guard
+        API-->>A: CLIENT_INVALID_ARGUMENT / CLIENT_NOT_CONNECTED /<br/>CLIENT_OUT_OF_MEMORY, no response callback
+    else Prepared request
+        API->>S: F2 WaitAndPublish(request, original deadline)
+        opt Slot occupied
+            S->>S: Wait on slotAvailable, release mutex, recheck predicate after<br/>wake
+        end
+        alt Deadline, close or terminal runtime failure wins before<br/>publication
+            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED / stored failure reason
+            API->>API: Free unpublished state and release live-call guard
+            API-->>A: Exact local result, cleared outputs if any, no callback
+        else Slot EMPTY and call still eligible
+            S->>S: Publish retained request, mark PUBLISHED, unlock
+            S-->>API: Published
+            API->>IO: F3 WakeIo through existing pollable wakeup
+            API->>W: F6 WaitForResponse within original deadline, no runtime mutex<br/>held
+            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
+            S-->>IO: Owned Request, mode, generation and deadline
+            IO->>IO: F4 Recheck eligibility, assign ID/schema, serialize outside lock
+            IO->>P: F4 Insert expected response target before sending
+            alt Serialization or pending-map allocation fails
+                IO->>P: Retire partial unsent entry
+                IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching<br/>slot, notify slotAvailable
+                S-->>W: Notify committed send failure, normally CLIENT_OUT_OF_MEMORY
+            else Prepared and tracked
+                loop Until accepted or terminal send outcome
+                    IO->>S: F5 TryBeginSend, check cancellation, generation and deadline
+                    alt Deadline / explicit close / unexpected loss wins
+                        IO->>P: Retire unsent entry, prevent later send
+                        IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
+                        S-->>W: Notify winning timeout, close or stored failure result
+                    else Send attempt admitted
+                        IO->>Z: F5 zmq_send(one frame, DONTWAIT)
+                        alt EAGAIN or EINTR without acceptance
+                            IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
+                            opt Still eligible within original deadline
+                                IO->>IO: Retain CLAIMED slot, poll replies, monitor and writable<br/>readiness
+                            end
+                            Note over S,IO: If ineligible, next eligibility check retires without sending
+                        else Terminal send error
+                            IO->>P: Retire unsent entry
+                            IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
+                            S-->>W: Notify winning send error, preserve any earlier cancellation
+                        else libzmq accepts message
+                            IO->>S: CompleteSend(request, CLIENT_OK), clear matching slot, notify<br/>slotAvailable
+                            Note over S,W: Send acceptance recorded, sync result remains pending unless<br/>timeout or close already won
+                            Z->>G: Transport RpcRequest over UDS
+                        end
+                    end
+                end
+            end
+            opt Send accepted and synchronous result still pending
+                Note over S,P: Slot is free for other callers during response wait
+                alt Response is delivered
+                    G-->>Z: RpcResponse with original ID/service/schema and Gateway status
+                    IO->>Z: F7 zmq_msg_recv(DONTWAIT), consume complete message
+                    Z-->>IO: Response frame
+                    IO->>P: F7 Match an accepted ID/generation and validate expected<br/>service/schema/status
+                    Note over IO,P: Unknown or premature replies follow the common pipeline, without<br/>completing this request
+                    alt Matched response validation fails
+                        IO->>P: Retire only the matched response record
+                        IO->>W: TryComplete(CLIENT_COMMUNICATION_ERROR), preserve earlier result
+                    else Matched response is valid
+                        IO->>IO: F8 Allocate and copy validated response bytes
+                        alt Response allocation fails
+                            IO->>P: Retire record and free temporary storage
+                            IO->>W: TryComplete(CLIENT_OUT_OF_MEMORY), preserve earlier result
+                        else Final response ready
+                            IO->>P: F8 TryComplete response against close and original deadline
+                            alt Delivery claim succeeds
+                                IO->>P: Retire record once, do not change the submission slot
+                                IO->>W: CLIENT_OK and owned serialized RpcResponse and size
+                            else Another terminal path already won
+                                IO->>IO: Free uncommitted response, preserve winning result
+                            end
+                        end
+                    end
+                else Original deadline, connection loss or explicit close wins
+                    IO->>P: Retire pending record and uncommitted response storage
+                    IO->>W: TryComplete with winning timeout/loss/close result, cleared<br/>outputs
+                end
+            end
+            W-->>API: F6 One final result and response outputs
+            API->>S: Release live-call guard
+            API-->>A: ClientResult and response outputs
+        end
+    end
 ```
+
+F2/F3 explicitly show publication and the owner's read of the single slot.
+CompleteSend releases the slot at F5, so the synchronous response wait does
+not serialize other requests behind the remote operation. Every local-error
+return releases the call guard and prepared storage, with NULL/0 outputs.
 
 Before dereferencing outputs, validate their addresses; clear every supplied
 output even if another required argument is missing. Require a non-NULL live
@@ -1446,7 +1659,7 @@ The request record owns its parsed data, completion state and connection
 generation. Application input need remain valid only for the API call. Allocate
 the owned request and completion bookkeeping before acceptance. For async
 calls the same preparation completes before returning CLIENT_OK. Neither API
-may leave a queued pointer into temporary caller storage.
+may leave a published pointer into temporary caller storage.
 
 #### Shared nonblocking send and receive pipeline
 
@@ -1456,6 +1669,18 @@ whether its caller waits for a synchronous result or only for async send
 acceptance. Sync requests retain their total deadline after send; async requests
 disarm their submission deadline once libzmq accepts the message.
 
+The send half below shows one attempt. After EAGAIN/EINTR, resume at
+TryBeginSend on the same tracked Request; do not assign another ID, reinsert
+the pending entry or claim another submission. Receive processing can run on
+any owner iteration, including while the slot waits for writable readiness.
+
+CompleteSend updates the retained Request's send result and releases only its
+matching slot in the single transition defined in section 5.2. Arrows to result
+waiters below notify/read that committed state; they do not perform another
+unconditional result assignment. All synchronous error completions use
+TryComplete and preserve an earlier terminal result. In particular, retirement
+of an accepted response record never touches another request's submission slot.
+
 Explicit local close uses CLIENT_NOT_CONNECTED for still-pending API results;
 unexpected transport loss uses CLIENT_COMMUNICATION_ERROR. Preserve any result
 that already won completion. No callback or send attempt can be newly admitted
@@ -1463,41 +1688,60 @@ after the local-close cutoff; section 5.13 covers an attempt already in progress
 
 ```mermaid
 sequenceDiagram
-    participant Q as Submission queue
+    participant S as ClientRuntime / single slot
     participant IO as Client I/O owner
     participant P as Pending requests
     participant W as Sync result or async send waiter
     participant Z as Client libzmq / DEALER
     participant G as Gateway ROUTER
     participant H as Async response handler
-    Q-->>IO: Owned request, mode, generation and active deadline
+    IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
+    S-->>IO: Owned request, mode, generation and active deadline
     alt Cancelled, expired before send or generation unusable
         IO->>P: Retire unsent request
+        IO->>S: CompleteSend(request, error), clear matching slot and notify<br/>slotAvailable
         IO-->>W: CLIENT_TIMEOUT or mapped connection error
     else Request can proceed
         IO->>IO: Assign nonzero request_id and schema 1, serialize envelope
         IO->>P: Install response target before first send
         alt Serialization, message storage or pending-map allocation fails
             IO->>P: Roll back partial insertion and retire unsent record
+            IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching slot<br/>and notify slotAvailable
             IO-->>W: CLIENT_OUT_OF_MEMORY, no response callback
         else Prepared and tracked
-            IO->>Z: zmq_send(DEALER, one frame, DONTWAIT)
-            alt Message accepted into libzmq queue
-                IO->>P: Mark ACCEPTED once
-                opt Async request
-                    IO->>P: Disarm send deadline, retain response record
-                    IO-->>W: CLIENT_OK, immutable async send result
+            IO->>S: F5 TryBeginSend, recheck cancellation, generation and deadline
+            alt Timeout, close or terminal runtime failure wins
+                IO->>P: Retire unsent entry, prevent later send
+                IO->>S: CompleteSend(request, error), clear matching slot and notify<br/>slotAvailable
+                IO-->>W: CLIENT_TIMEOUT, CLIENT_NOT_CONNECTED or stored terminal error
+            else Send attempt admitted
+                IO->>Z: zmq_send(DEALER, one frame, DONTWAIT)
+                alt Message accepted into libzmq queue
+                    IO->>S: F5 CompleteSend(request, CLIENT_OK), record ACCEPTED, clear<br/>matching slot and notify
+                    opt Async request
+                        IO-->>W: CLIENT_OK, immutable async send result
+                    end
+                    Note over S,P: Accepted response target remains pending unless local retirement<br/>already won
+                    Z->>G: Transport queued request over UDS
+                else EAGAIN or EINTR, no acceptance
+                    IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
+                    alt Cancellation, deadline or runtime cutoff now applies
+                        IO->>P: Retire unsent entry
+                        IO->>S: CompleteSend(request, winning error), clear matching slot and<br/>notify
+                        S-->>W: Committed failure, no response callback
+                    else Still eligible
+                        IO->>S: Retain CLAIMED slot and owned bytes, no attempt in progress
+                        Note over IO,Z: Service replies/events, resume at TryBeginSend when eligible
+                    end
+                else Detected memory failure before acceptance
+                    IO->>P: Retire unsent record and free temporary storage
+                    IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching slot<br/>and notify slotAvailable
+                    IO-->>W: CLIENT_OUT_OF_MEMORY, no response callback
+                else Other terminal send error
+                    IO->>P: Retire request
+                    IO->>S: CompleteSend(request, CLIENT_COMMUNICATION_ERROR), clear<br/>matching slot and notify slotAvailable
+                    IO-->>W: CLIENT_COMMUNICATION_ERROR, no response callback
                 end
-                Z->>G: Transport queued request over UDS
-            else EAGAIN or EINTR, no acceptance
-                IO->>P: Retain unsent bytes within original deadline
-                Note over IO,Z: Retry eligible work while processing other responses and events
-            else Detected memory failure before acceptance
-                IO->>P: Retire unsent record and free temporary storage
-                IO-->>W: CLIENT_OUT_OF_MEMORY, no response callback
-            else Other terminal send error
-                IO->>P: Retire request
-                IO-->>W: CLIENT_COMMUNICATION_ERROR, no response callback
             end
         end
     end
@@ -1506,30 +1750,35 @@ sequenceDiagram
         Z-->>IO: Readable, zmq_msg_recv(DONTWAIT)
         IO->>IO: Check framing and parse envelope
         alt Receive/decode allocation fails before trustworthy correlation
-            IO->>P: Mark connection unusable and retire affected records
+            IO->>S: Latch CLIENT_OUT_OF_MEMORY terminal reason, close admission,<br/>notify slotAvailable
+            IO->>P: Retire affected records and clear occupied slot safely
             IO-->>W: Resolve still-pending API results with CLIENT_OUT_OF_MEMORY
-            Note over IO,H: Close through connection-state path, no accepted-async error callback
+            Note over IO,H: Close through connection-state path, no accepted-async error<br/>callback
         else Unparseable response, invalid framing or zero request_id
-            IO->>P: Mark connection unusable and retire affected records
-            IO-->>W: Resolve still-pending API results with CLIENT_COMMUNICATION_ERROR
+            IO->>S: Latch CLIENT_COMMUNICATION_ERROR, close admission, notify<br/>slotAvailable
+            IO->>P: Retire affected records and clear occupied slot safely
+            IO-->>W: Resolve still-pending API results with<br/>CLIENT_COMMUNICATION_ERROR
             Note over IO,H: Connection event handling, no accepted-async error callback
         else Parsed response
             IO->>P: Match request_id and generation
             alt Unknown or retired nonzero ID
                 IO->>IO: Discard without invoking another request's handler
-            else Matching request
+            else Matching entry exists but send is not accepted
+                IO->>IO: Log and discard premature response, keep request and slot<br/>unchanged
+                Note over IO,P: No completion or callback before send acceptance
+            else Matching accepted request
                 IO->>IO: Validate service, schema and RpcStatus, prepare owned response
-                alt Response allocation or response-text preparation allocation fails
+                alt Response allocation or response-text preparation allocation<br/>fails
                     IO->>P: Retire record once and free temporary storage
                     alt Synchronous request
-                        IO-->>W: CLIENT_OUT_OF_MEMORY, NULL response and size 0
+                        IO-->>W: TryComplete(CLIENT_OUT_OF_MEMORY), preserve prior result
                     else Async send already accepted
                         IO->>IO: Record diagnostics, no response callback
                         Note over IO,H: Already-published send result remains CLIENT_OK
                     end
                 else Matched metadata or non-memory response-text error
                     IO->>P: Retire record once
-                    Note over IO,H: Sync gets CLIENT_COMMUNICATION_ERROR, async records diagnostics without callback
+                    Note over IO,H: Sync TryComplete(CLIENT_COMMUNICATION_ERROR) preserves prior<br/>results, async records diagnostics without callback
                 else Valid response ready before any applicable deadline
                     IO->>P: Try claiming final delivery against local close and any deadline
                     alt Claim succeeds
@@ -1555,8 +1804,10 @@ Implementation rules:
 - Install the response target before sending, so even an immediate reply can
   be correlated. Serialization, message-storage and pending-map allocation
   failures retire only the affected unsent request, publish
-  CLIENT_OUT_OF_MEMORY through its retained waiter and leave other requests
-  progressing. Use one DEALER body frame without a REQ-style delimiter.
+  CLIENT_OUT_OF_MEMORY unless another terminal path already won, and leave
+  other requests progressing. Clear only that Request's matching slot and notify
+  waiting callers on its terminal send result. Use one DEALER body frame without
+  a REQ-style delimiter.
 - A successful zmq_send is the async return boundary: libzmq queued the message.
   Do not claim physical delivery or submit it again. EAGAIN permits retry only
   for work that has not been accepted, within its original active deadline.
@@ -1571,7 +1822,8 @@ Implementation rules:
 - A detected receive/decode allocation failure before trustworthy request-ID
   correlation cannot safely be attributed to one request. Mark the connection
   unusable and close it on its owner. Resolve still-pending synchronous results
-  and unaccepted async send waiters with CLIENT_OUT_OF_MEMORY; retire accepted
+  and unaccepted async send waiters with CLIENT_OUT_OF_MEMORY, including callers
+  waiting for the slot through the retained runtime failure reason; retire accepted
   async records and report CLIENT_CONNECTION_LOST through the connection-state
   path. Do not use a partly parsed ID to fail an unrelated request. Complete
   cleanup with retained state, without allocating another control action.
@@ -1581,18 +1833,27 @@ Implementation rules:
   records and report connection loss through the connection-state path.
 - A parsed nonzero ID absent from the pending map is discarded. It may be a
   late synchronous reply or a duplicate; it is not a notification.
+- A pending entry alone does not authorize response delivery: its send must
+  already be recorded as accepted. Log and discard a premature response for an
+  installed but unaccepted request without retiring it, changing its send result
+  or clearing its slot. The sole owner records acceptance before processing
+  another received message, so a valid fast response satisfies this check.
 - A matched response must have the expected service, schema version 1 and a
   known nonzero RpcStatus. A valid Gateway error response is still delivered
-  normally: sync returns CLIENT_OK with bytes, async invokes its response
-  handler. The service consumer interprets CryptoResponse.
+  normally: byte sync returns CLIENT_OK with bytes and byte async invokes its
+  response handler. String records expect service=0 and a non-OK status with
+  empty payload; return its symbolic name as defined in section 5.8. Only the
+  service-specific byte consumer interprets CryptoResponse.
 - Matched metadata failure returns CLIENT_COMMUNICATION_ERROR to a synchronous
   waiter; matched response allocation failure returns CLIENT_OUT_OF_MEMORY.
+  Claim either error through TryComplete; preserve a timeout/close that already
+  won and free any uncommitted storage.
   For an async record whose send succeeded, retire it with diagnostics and no
   response callback. Its send result remains CLIENT_OK, even if its submitting
   thread has not resumed yet. These signatures have no post-send error channel.
 - Returned response storage must be compatible with client_free_response.
-  String methods prepare NUL-terminated response text according to the service
-  contract; they do not return the serialized binary envelope as a C string.
+  String methods copy the validated non-OK RpcStatus name into owned
+  NUL-terminated storage; they do not return the binary envelope as a C string.
   If response-text preparation fails, apply the same sync-error/async-retirement
   distinction. Never truncate binary data at an embedded NUL to report success.
 - Prepare the final byte or string result before claiming synchronous success
@@ -1607,16 +1868,19 @@ allocation failure follows the terminal cleanup path in section 5.14, preserving
 the error mappings above. Recovery requires explicit close and a fresh connect.
 An allocation failure after trustworthy correlation affects only that request.
 No async response deadline or synthetic local-error RpcResponse is introduced.
+Failure before correlation wakes all entered slot waiters as well as pending
+requests. The runtime latches its first terminal reason before notifying
+slotAvailable; later explicit teardown cannot overwrite that reason.
 
 #### Synchronous timeout, disconnect and response races
 
 ```mermaid
 sequenceDiagram
     participant A as Synchronous caller / waiter
-    participant R as Retained request completion state
+    participant R as Runtime lock / retained Request
     participant IO as I/O owner / pending map
     participant G as Gateway
-    alt Response is validated and wins terminal transition before deadline
+    alt Response is validated and wins terminal transition before<br/>deadline
         G-->>IO: RpcResponse
         IO->>R: TryComplete(CLIENT_OK, owned response)
         R-->>A: Wake with successful local delivery
@@ -1625,7 +1889,19 @@ sequenceDiagram
         R-->>A: Wake with CLIENT_OUT_OF_MEMORY
         Note over A,G: Local failure does not undo execution or allow replay
     else Request deadline expires first
-        A->>R: TryComplete(CLIENT_TIMEOUT, NULL, 0)
+        A->>R: CancelOrExpireSync under the send-eligibility lock
+        alt Request never published
+            R->>R: Commit CLIENT_TIMEOUT, caller owns unpublished storage
+        else Published or claimed, no send accepted or in progress
+            R->>R: Atomically disable future sends and commit CLIENT_TIMEOUT
+        else SEND_IN_PROGRESS
+            R->>R: Latch expiry, prevent any subsequent attempt
+            A->>R: Wait for active attempt outcome without holding the lock
+            IO->>R: CompleteSend with actual outcome, commit sync CLIENT_TIMEOUT
+            Note over R,G: Accepted send may execute remotely, async acceptance rules do<br/>not turn a sync timeout into success
+        else Send already accepted
+            R->>R: Commit CLIENT_TIMEOUT for response wait only
+        end
         A->>IO: Wake for owner-side retirement
         R-->>A: CLIENT_TIMEOUT, NULL response and size 0
     else Connection is lost first
@@ -1633,34 +1909,44 @@ sequenceDiagram
         R-->>A: Wake with CLIENT_COMMUNICATION_ERROR
     else Explicit client_disconnect wins first
         IO->>R: TryComplete(CLIENT_NOT_CONNECTED, NULL, 0)
-        R-->>A: Wake with CLIENT_NOT_CONNECTED and release live-call guard on return
+        R-->>A: Wake with CLIENT_NOT_CONNECTED and release live-call guard on<br/>return
     end
-    IO->>IO: Retire pending/unsent state and accounting exactly once
+    Note over R,IO: Loss/close also prevent future sends and resolve any active<br/>attempt before completing affected calls
+    IO->>IO: Retire this request once, clear only its matching occupied slot
     opt Late or duplicate response arrives
         G-->>IO: RpcResponse for retired request ID
-        IO->>IO: Discard, no second completion and no ID reassignment
+        IO->>IO: Discard, no second completion, ID reuse or change to another<br/>request's slot
     end
 ```
 
-The waiter and I/O owner share a retained completion object, not a pointer to
-the caller's stack. TryComplete publishes the result and its response ownership
-atomically with respect to other terminal paths. If a prepared response loses
-that race, its storage is freed internally. The I/O owner alone removes pending
-entries; a caller-side timeout marks completion and wakes that owner. The queued
-record stays alive until owner-side retirement, even if the caller has returned.
-This response-deadline race applies to synchronous requests only. For async
-submission, section 5.4 defines the separate send-result race; after acceptance,
-an async request has no response deadline. A cancelled unsent record must never
-be sent later. Check a synchronous request's absolute deadline when claiming its
-response as well as when processing timers.
+The waiter and owner share a retained Request, not a pointer to the caller's
+stack. TryComplete claims its final result and response ownership once against
+all other terminal paths. Before send acceptance, a synchronous timeout must
+also cancel send eligibility under the same state lock used by TryBeginSend;
+changing only the response waiter is insufficient. During an admitted attempt,
+latch expiry and wait for its actual outcome. An accepted send is recorded as
+such, but a synchronous call whose response deadline expired still returns
+CLIENT_TIMEOUT. It may have executed remotely. A nonaccepted attempt after
+expiry is retired without another send.
+
+After acceptance, timeout ends only the local response wait. Check the absolute
+deadline when claiming the final response, including after byte/string storage
+preparation. If another result wins during preparation, free the uncommitted
+storage. The owner alone removes pending entries and clears a slot only when
+it still contains this Request; an older response timeout cannot affect a newer
+submission. Published storage survives until owner retirement, even if its
+caller has returned. Unpublished storage remains the caller's responsibility.
+Async submission uses the separate send-result rules in section 5.4 and has
+no response deadline after acceptance.
 
 On every local failure, return NULL response and size zero. A timeout ends the
 local wait; it does not cancel remote work, release remote buffers or authorize
 replay. A valid response containing a non-OK RpcStatus still returns CLIENT_OK;
 the caller inspects that status and eventually calls client_free_response.
 
-The 15-second synchronous deadline is selected. The queue and pending map grow
-dynamically; detected allocation failures use CLIENT_OUT_OF_MEMORY, with no
+The 15-second synchronous deadline includes preparation and waiting for the
+single slot. The pending-response map grows dynamically; detected allocation
+failures use CLIENT_OUT_OF_MEMORY. A busy slot waits or times out, with no
 local queue-full result. Section 5.14 defines terminal loss and explicit reconnect.
 Section 5.13 defines explicit-close results and callback quiescence. Per-message
 size bounds remain under RESOURCE-LIMITS in section 7.2.
@@ -1669,426 +1955,460 @@ size bounds remain under RESOURCE-LIMITS in section 7.2.
 
 Coverage: **AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5**.
 
+The caller waits for slot availability and libzmq acceptance within one total
+15-second send budget. Publishing the slot or waking the owner does not complete
+the API. The owner's explicit claim, pending-map insertion and send are shown
+as separate calls below. A valid response may arrive before the submitting
+thread resumes, so application callback state must be ready before API entry.
+
 ```mermaid
 sequenceDiagram
-    participant A as Application thread
+    participant A as Application
     participant API as client_send_request_async
-    participant Q as Dynamic submission queue
-    participant W as Retained send-result waiter
-    participant IO as I/O owner / pending map
-    participant Z as Client libzmq / DEALER
-    participant G as Gateway
-    A->>API: Client, serialized request, size and response handler
-    Note over API,IO: Validate Client pointer, retain a scoped live-call guard before input work, release it on every return
-    API->>API: Validate caller thread, arguments, envelope and connection
-    alt Invalid arguments, envelope, handler or caller thread
-        API-->>A: CLIENT_INVALID_ARGUMENT, no callback
-    else Input or envelope allocation fails
-        API->>API: Release partial request storage
-        API-->>A: CLIENT_OUT_OF_MEMORY, no callback
-    else No usable connection
-        API-->>A: CLIENT_NOT_CONNECTED, no callback
-    else Request eligible
-        API->>API: Allocate and initialize owned record, send waiter and deadline
-        API->>Q: Push owned action under mutex
-        alt Preparation or queue growth allocation fails
-            API->>API: Release partial state, no published action
-            API-->>A: CLIENT_OUT_OF_MEMORY, no callback
-        else Queued with original 15-second send deadline
-            API->>IO: Signal existing wakeup
-            API->>W: Wait for send result
-            IO->>IO: Check generation/deadline, assign ID/schema, serialize and insert pending record
-            alt Serialization or pending-map allocation fails
-                IO->>IO: Retire unsent state, prevent later send
-                IO->>W: Publish CLIENT_OUT_OF_MEMORY using retained waiter
-            else Record fully prepared and still eligible
-                IO->>Z: zmq_send(DEALER, one frame, DONTWAIT)
-                alt EAGAIN or EINTR before acceptance
-                    IO->>IO: Retry eligible work within original send deadline
-                    Note over IO,Z: Other responses and monitor events continue
-                end
-                alt Explicit disconnect wins before send acceptance
-                    IO->>IO: Retire unsent state, prevent later send
-                    IO->>W: Publish CLIENT_NOT_CONNECTED, no response callback
-                else Send fails or deadline expires before acceptance
-                    IO->>IO: Retire unsent state, prevent later send
-                    IO->>W: Publish CLIENT_OUT_OF_MEMORY, CLIENT_COMMUNICATION_ERROR or CLIENT_TIMEOUT
-                else libzmq accepts the message
-                    IO->>IO: Disarm send deadline, retain response record
-                    IO->>W: Publish immutable CLIENT_OK once
-                    Z->>G: Transport queued request over UDS
-                end
-            else Explicit disconnect wins before sending
-                IO->>IO: Retire unsent state
-                IO->>W: Publish CLIENT_NOT_CONNECTED
-            else Deadline expires or connection is lost before send
-                IO->>IO: Retire unsent state
-                IO->>W: Publish CLIENT_TIMEOUT or CLIENT_COMMUNICATION_ERROR
+    participant S as ClientRuntime / single slot
+    participant W as Retained request / result condition
+    participant IO as I/O owner
+    participant P as Pending map
+    participant Z as DEALER
+    participant G as Gateway ROUTER
+    A->>API: Client, serialized RpcRequest and size, response handler
+    API->>API: Validate required argument pointers and handler
+    opt Pointer arguments valid
+        API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
+        opt Admitted on an allowed application thread
+            API->>API: F1 Parse and own RpcRequest, validate nonzero service and<br/>bounded input
+            opt Preparation succeeds
+                API->>W: Initialize owned Request, mode, generation and completion state
             end
-            W-->>API: One send result
+        end
+    end
+    alt Invalid arguments / own I/O-thread request call / no usable<br/>connection / preparation allocation failure
+        API->>API: Release partial state and any retained call guard
+        API-->>A: CLIENT_INVALID_ARGUMENT / CLIENT_NOT_CONNECTED /<br/>CLIENT_OUT_OF_MEMORY, no response callback
+    else Prepared request
+        API->>S: F2 WaitAndPublish(request, original deadline)
+        opt Slot occupied
+            S->>S: Wait on slotAvailable, release mutex, recheck predicate after<br/>wake
+        end
+        alt Deadline, close or terminal runtime failure wins before<br/>publication
+            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED / stored failure reason
+            API->>API: Free unpublished state and release live-call guard
+            API-->>A: Exact local result, cleared outputs if any, no callback
+        else Slot EMPTY and call still eligible
+            S->>S: Publish retained request, mark PUBLISHED, unlock
+            S-->>API: Published
+            API->>IO: F3 WakeIo through existing pollable wakeup
+            API->>W: F6 WaitForSend, no runtime mutex held
+            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
+            S-->>IO: Owned Request, mode, generation and deadline
+            IO->>IO: F4 Recheck eligibility, assign ID/schema, serialize outside lock
+            IO->>P: F4 Insert expected response target before sending
+            alt Serialization or pending-map allocation fails
+                IO->>P: Retire partial unsent entry
+                IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching<br/>slot, notify slotAvailable
+                S-->>W: Notify committed send failure, normally CLIENT_OUT_OF_MEMORY
+            else Prepared and tracked
+                loop Until accepted or terminal send outcome
+                    IO->>S: F5 TryBeginSend, check cancellation, generation and deadline
+                    alt Deadline / explicit close / unexpected loss wins
+                        IO->>P: Retire unsent entry, prevent later send
+                        IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
+                        S-->>W: Notify winning timeout, close or stored failure result
+                    else Send attempt admitted
+                        IO->>Z: F5 zmq_send(one frame, DONTWAIT)
+                        alt EAGAIN or EINTR without acceptance
+                            IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
+                            opt Still eligible within original deadline
+                                IO->>IO: Retain CLAIMED slot, poll replies, monitor and writable<br/>readiness
+                            end
+                            Note over S,IO: If ineligible, next eligibility check retires without sending
+                        else Terminal send error
+                            IO->>P: Retire unsent entry
+                            IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
+                            S-->>W: Notify winning send error, preserve any earlier cancellation
+                        else libzmq accepts message
+                            IO->>S: CompleteSend(request, CLIENT_OK), clear matching slot, notify<br/>slotAvailable
+                            S-->>W: Notify immutable CLIENT_OK already committed by CompleteSend
+                            Z->>G: Transport RpcRequest over UDS
+                        end
+                    end
+                end
+            end
+            W-->>API: F6 One send result
+            API->>S: Release live-call guard
             API-->>A: ClientResult, no response wait
             opt Send accepted with CLIENT_OK
-                Note over A,G: No response timeout, return does not confirm UDS delivery
-                alt Valid response and callback claim wins before close cutoff
-                    G-->>Z: RpcResponse, possibly much later
-                    Z-->>IO: Receive response through DEALER
-                    IO->>IO: Validate, allocate response, claim callback before close cutoff, retire record and release locks
-                    IO-->>A: handler(Client, owned response, size)
-                    A->>API: Later client_free_response(response)
-                else Matched response allocation fails
-                    IO->>IO: Retire record, free temporary storage and record diagnostics
-                    Note over A,IO: No response callback and no revision of CLIENT_OK
-                else Connection closes or response validation fails
-                    IO->>IO: Retire record without a response callback
-                    Note over A,IO: Unexpected loss uses connection handler, explicit close creates no event, local response failure uses diagnostics
+                Note over S,P: Slot is free, pending response has no deadline
+                alt Response is delivered
+                    G-->>Z: RpcResponse with original ID/service/schema and Gateway status
+                    IO->>Z: F7 zmq_msg_recv(DONTWAIT), consume complete message
+                    Z-->>IO: Response frame
+                    IO->>P: F7 Match an accepted ID/generation and validate expected<br/>service/schema/status
+                    Note over IO,P: Unknown or premature replies follow the common pipeline, without<br/>completing this request
+                    alt Matched response validation fails
+                        IO->>P: Retire only the matched response record
+                        IO->>IO: Record diagnostics, no callback, send result stays CLIENT_OK
+                    else Matched response is valid
+                        IO->>IO: F8 Allocate and copy validated response bytes
+                        alt Response allocation fails
+                            IO->>P: Retire record and free temporary storage
+                            IO->>IO: Log allocation failure, no callback, send result stays CLIENT_OK
+                        else Final response ready
+                            IO->>P: F8 Claim callback delivery against explicit close
+                            alt Delivery claim succeeds
+                                IO->>P: Retire record once, do not change the submission slot
+                                IO->>IO: Release internal locks
+                                IO-->>A: handler(Client, owned serialized RpcResponse, size), on I/O<br/>thread
+                            else Another terminal path already won
+                                IO->>IO: Free uncommitted response, preserve winning result
+                            end
+                        end
+                    end
+                else Connection loss or explicit close
+                    IO->>P: Retire pending record and uncommitted response storage
+                    Note over IO,A: No response callback, accepted send result remains CLIENT_OK
                 end
             end
         end
     end
 ```
 
-CLIENT_OK is returned after libzmq send acceptance, not after insertion into
-the library's command queue. The API may wait up to the 15-second send budget
-for the owner to submit the message; it never waits for the operation's response.
+There is no response timeout after acceptance. All pre-acceptance failures
+return through ClientResult and invoke no response callback. Invalid arguments,
+envelope, handler or request calls from the I/O-owner callback return
+CLIENT_INVALID_ARGUMENT. A non-ready handle returns CLIENT_NOT_CONNECTED.
+Preparation, serialization or pending-map allocation failure returns
+CLIENT_OUT_OF_MEMORY. Slot/send deadline expiry returns CLIENT_TIMEOUT.
+Explicit close returns CLIENT_NOT_CONNECTED; unexpected loss or terminal send
+failure returns CLIENT_COMMUNICATION_ERROR. Connection-wide local failures
+retain the mappings in the common pipeline.
 
-Invalid arguments/envelope/handler or invocation on the I/O-owner callback thread
-returns CLIENT_INVALID_ARGUMENT. No usable connection returns
-CLIENT_NOT_CONNECTED; allocation failure returns CLIENT_OUT_OF_MEMORY; terminal
-send failure or connection loss before acceptance returns CLIENT_COMMUNICATION_ERROR.
-Send-deadline expiry returns CLIENT_TIMEOUT. Queue insertion or pending-map
-allocation failure returns CLIENT_OUT_OF_MEMORY. Every failed submission returns
-without a response callback.
+After CLIENT_OK, a validated correlated response, including a Gateway error,
+invokes ClientResponseHandler at most once. Connection cleanup or local response
+processing failure can retire it without a callback. The pending map remains
+dynamic; an unanswered async request can stay there until teardown. Callbacks
+run on the I/O owner without locks and may free their response, but must schedule
+new request calls on an application thread.
 
-An explicit disconnect that wins before send acceptance returns
-CLIENT_NOT_CONNECTED through the retained send waiter. If the in-progress send
-was accepted, preserve CLIENT_OK and retire the response record without a
-synthetic callback. Section 5.13 defines the close/acceptance race.
+### 5.8 client_send_request_string() — Gateway returns unsupported service
 
-After acceptance, invoke the supplied ClientResponseHandler only for a validated,
-deliverable response, including a Gateway error response. No local response
-timeout or error callback runs. Connection teardown or a local response-processing
-failure can retire the request without invoking the handler. A server that stays
-connected but never replies leaves the record pending until local retirement
-or teardown; the client imposes no fixed pending-request count limit.
+Coverage: **AC2-Client.1, AC2-Client.5**. Actual string-service execution is a
+delivery limitation against AC2-Client.5; the original AC remains unchanged.
 
-Callbacks run on the I/O owner with no internal locks. They may free their
-response, but must schedule subsequent request calls on an application thread:
-even an async API waits for this same I/O owner to submit its send.
+Accept an ordinary NUL-terminated request string, without a size argument,
+Base64, ProtoJSON or a caller-built envelope. The library copies bytes up to
+the first NUL and uses the same slot, owner, pending map and total synchronous
+deadline as the byte API. **Gateway rejects the string request with the existing
+RPC_STATUS_UNSUPPORTED_SERVICE (4).** The public method does not return a local
+CLIENT_NOT_IMPLEMENTED without contacting Gateway.
 
-### 5.8 client_send_request_string()
+#### Defined wire request and error response
 
-Coverage: **AC2-Client.1, AC2-Client.5**.
+| Boundary | Selected representation |
+| --- | --- |
+| Caller input | NUL-terminated text, including an empty string; NULL is invalid |
+| Internal request | RpcRequest with assigned nonzero request_id, schema_version=1, service=RPC_SERVICE_UNSPECIFIED (0) and payload equal to the copied text bytes, excluding the terminator |
+| Gateway dispatch | After common context/envelope/ID checks, service 0 has no registered handler. Log ERROR unsupported_service and construct a correlated RPC_STATUS_UNSUPPORTED_SERVICE response; do not parse CryptoRequest or submit a service job |
+| Wire response | RpcResponse echoes request_id and service=0, sets schema_version=1 and status=RPC_STATUS_UNSUPPORTED_SERVICE, with empty payload |
+| Synchronous C result | CLIENT_OK with a library-allocated NUL-terminated string containing exactly RPC_STATUS_UNSUPPORTED_SERVICE |
+| Async C result / response | CLIENT_OK after libzmq send acceptance; a delivered error response later invokes the supplied string callback with that same owned status string |
 
-The string API accepts an ordinary NUL-terminated request string and returns an
-owned NUL-terminated response string. EyilClient determines the input length,
-copies the text and handles wire serialization internally. It shares request
-coordination, IDs, schema version 1, deadlines and socket ownership with the
-byte APIs. It does not parse the caller's raw string as a serialized Protobuf
-envelope.
+UNSPECIFIED records the absence of an assigned text service. It is not a new
+service identifier and never selects Crypto. The internal string builder alone
+creates this envelope; the public byte-input validator continues to require a
+nonzero service. Common response validation matches the service expected by
+the pending record, including 0 for this string path. No Protobuf field, enum
+or schema-version change is needed for this unsupported behavior. A future text
+service requires an explicit route and interpretation contract; do not turn
+service 0 into a working text service or guess a route from input contents.
 
-The sequence includes a text/service mapping boundary. Its service route,
-request interpretation and response/error representation remain
-TODO(TEXT-SERVICE-CONTRACT); copying a C string does not resolve those choices.
-The input/ownership behavior below is agreed independently of that mapping.
+The status string is the symbolic name of the **received** non-OK RpcStatus.
+For example, a correlated INVALID_CONNECTION or INTERNAL reply is exposed as
+RPC_STATUS_INVALID_CONNECTION or RPC_STATUS_INTERNAL. This is a defined remote
+error representation, not a fabricated local-error response. Reject an unknown
+or UNSPECIFIED status, unexpected OK or nonempty payload on this unsupported
+path as CLIENT_COMMUNICATION_ERROR for sync, or diagnostic retirement without
+a callback for an already-accepted async request. Future successful text/service
+responses are outside this version's scope.
 
 ```mermaid
 sequenceDiagram
     participant A as Application
     participant API as client_send_request_string
-    participant TEXT as Text/service mapping
-    participant B as Shared request core / synchronous waiter
-    participant IO as Client I/O owner
+    participant S as ClientRuntime / single slot
+    participant W as Retained request / result condition
+    participant IO as I/O owner
+    participant P as Pending map
+    participant Z as DEALER
     participant G as Gateway ROUTER
-    A->>API: NUL-terminated request text and out response
-    Note over API,IO: Validate Client pointer, retain a scoped live-call guard through input and response preparation, release it on every return
-    API->>API: Clear supplied output, validate caller thread and pointers, scan to first NUL within bound
-    opt Arguments valid
-        API->>API: Copy request text into owned storage with known length
-        API->>TEXT: Resolve service and prepare owned RpcRequest from text
-        Note over API,TEXT: TEXT-SERVICE-CONTRACT defines routing and interpretation
+    A->>API: Client, NUL-terminated text, out response
+    API->>API: Clear every supplied output and validate required argument<br/>pointers
+    opt Pointer arguments valid
+        API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
+        opt Admitted on an allowed application thread
+            API->>API: F1 Scan to first NUL within bound, copy text, build service<br/>UNSPECIFIED envelope
+            opt Preparation succeeds
+                API->>W: Initialize owned Request, mode, generation and completion state
+            end
+        end
     end
-    alt Invalid arguments, excessive text length, service input or caller thread
-        API-->>A: CLIENT_INVALID_ARGUMENT, NULL response
-    else Input copying or request preparation allocation fails
-        API->>API: Release partial input and wire-request storage
-        API-->>A: CLIENT_OUT_OF_MEMORY, NULL response
-    else Request prepared
-        API->>B: Submit prepared envelope with string result target and one 15-second budget
-        B->>B: Check connection, initialize owned record/waiter/deadline, then push under queue mutex
-        alt No usable connection
-            B-->>API: CLIENT_NOT_CONNECTED, no response
-        else Request, waiter or queue growth allocation fails
-            B->>B: Release partial state, no published action
-            B-->>API: CLIENT_OUT_OF_MEMORY, no response
-        else Queued
-            B->>IO: Signal existing wakeup and wait for result
-            IO->>IO: Check deadline/generation, serialize and insert pending request
+    alt Invalid arguments / own I/O-thread request call / no usable<br/>connection / preparation allocation failure
+        API->>API: Release partial state and any retained call guard
+        API-->>A: CLIENT_INVALID_ARGUMENT / CLIENT_NOT_CONNECTED /<br/>CLIENT_OUT_OF_MEMORY, no response callback
+    else Prepared request
+        API->>S: F2 WaitAndPublish(request, original deadline)
+        opt Slot occupied
+            S->>S: Wait on slotAvailable, release mutex, recheck predicate after<br/>wake
+        end
+        alt Deadline, close or terminal runtime failure wins before<br/>publication
+            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED / stored failure reason
+            API->>API: Free unpublished state and release live-call guard
+            API-->>A: Exact local result, cleared outputs if any, no callback
+        else Slot EMPTY and call still eligible
+            S->>S: Publish retained request, mark PUBLISHED, unlock
+            S-->>API: Published
+            API->>IO: F3 WakeIo through existing pollable wakeup
+            API->>W: F6 WaitForResponse within original deadline, no runtime mutex<br/>held
+            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
+            S-->>IO: Owned Request, mode, generation and deadline
+            IO->>IO: F4 Recheck eligibility, assign ID/schema, serialize outside lock
+            IO->>P: F4 Insert expected response target before sending
             alt Serialization or pending-map allocation fails
-                IO->>IO: Retire unsent request and release temporary storage
-                IO-->>B: CLIENT_OUT_OF_MEMORY
-            else Prepared and eligible to send
-                IO->>G: zmq_send(DEALER, one binary frame, DONTWAIT) over UDS
-                alt Correlated response is received
-                    G-->>IO: RpcResponse via zmq_msg_recv
-                    IO->>IO: Validate ID, service, schema and RpcStatus
-                    alt Matched envelope metadata is invalid
-                        IO->>IO: Free temporary storage, retire record once
-                        IO-->>B: CLIENT_COMMUNICATION_ERROR if failure wins completion, NULL response
-                    else Envelope is valid
-                        IO->>TEXT: Prepare response text preserving Gateway/service errors
-                        TEXT->>TEXT: Check representation and bound, allocate length plus one and append NUL
-                        alt Response-text allocation fails
-                            IO->>IO: Free temporary storage, retire record once
-                            IO-->>B: CLIENT_OUT_OF_MEMORY if failure wins completion, NULL response
-                        else Response text cannot satisfy the contract
-                            IO->>IO: Free temporary storage, retire record once
-                            IO-->>B: CLIENT_COMMUNICATION_ERROR if failure wins completion, NULL response
-                        else Final response text is ready
-                            TEXT-->>IO: Owned NUL-terminated response
-                            IO->>IO: Claim final result against deadline, loss and explicit close
-                            alt Response wins before deadline and close cutoff
-                                IO->>IO: Retire record and release temporary wire storage
-                                IO-->>B: CLIENT_OK and owned response string
-                            else Another terminal result already won
-                                IO->>IO: Free uncommitted string and retire record once
-                                Note over B,IO: Preserve the winning error, return no response
+                IO->>P: Retire partial unsent entry
+                IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching<br/>slot, notify slotAvailable
+                S-->>W: Notify committed send failure, normally CLIENT_OUT_OF_MEMORY
+            else Prepared and tracked
+                loop Until accepted or terminal send outcome
+                    IO->>S: F5 TryBeginSend, check cancellation, generation and deadline
+                    alt Deadline / explicit close / unexpected loss wins
+                        IO->>P: Retire unsent entry, prevent later send
+                        IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
+                        S-->>W: Notify winning timeout, close or stored failure result
+                    else Send attempt admitted
+                        IO->>Z: F5 zmq_send(one frame, DONTWAIT)
+                        alt EAGAIN or EINTR without acceptance
+                            IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
+                            opt Still eligible within original deadline
+                                IO->>IO: Retain CLAIMED slot, poll replies, monitor and writable<br/>readiness
+                            end
+                            Note over S,IO: If ineligible, next eligibility check retires without sending
+                        else Terminal send error
+                            IO->>P: Retire unsent entry
+                            IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
+                            S-->>W: Notify winning send error, preserve any earlier cancellation
+                        else libzmq accepts message
+                            IO->>S: CompleteSend(request, CLIENT_OK), clear matching slot, notify<br/>slotAvailable
+                            Note over S,W: Send acceptance recorded, sync result remains pending unless<br/>timeout or close already won
+                            Z->>G: Transport RpcRequest over UDS
+                        end
+                    end
+                end
+            end
+            opt Send accepted and synchronous result still pending
+                Note over S,P: Slot is free for other callers during response wait
+                G->>G: Validate context, envelope and ID, find service UNSPECIFIED<br/>unsupported
+                G->>G: Log ERROR unsupported_service, no Crypto or worker dispatch
+                alt Response is delivered
+                    G-->>Z: RpcResponse with matching ID, service UNSPECIFIED, schema 1,<br/>UNSUPPORTED_SERVICE, empty payload
+                    IO->>Z: F7 zmq_msg_recv(DONTWAIT), consume complete message
+                    Z-->>IO: Response frame
+                    IO->>P: F7 Match an accepted ID/generation and validate expected<br/>service/schema/status
+                    Note over IO,P: Unknown or premature replies follow the common pipeline, without<br/>completing this request
+                    alt Matched response validation fails
+                        IO->>P: Retire only the matched response record
+                        IO->>W: TryComplete(CLIENT_COMMUNICATION_ERROR), preserve earlier result
+                    else Matched response is valid
+                        IO->>IO: F8 Copy validated non-OK RpcStatus name plus NUL
+                        alt Response allocation fails
+                            IO->>P: Retire record and free temporary storage
+                            IO->>W: TryComplete(CLIENT_OUT_OF_MEMORY), preserve earlier result
+                        else Final response ready
+                            IO->>P: F8 TryComplete response against close and original deadline
+                            alt Delivery claim succeeds
+                                IO->>P: Retire record once, do not change the submission slot
+                                IO->>W: CLIENT_OK and owned NUL-terminated status name
+                            else Another terminal path already won
+                                IO->>IO: Free uncommitted response, preserve winning result
                             end
                         end
                     end
-                else Detected send or receive allocation failure
-                    IO->>IO: Retire affected state per common pipeline
-                    IO-->>B: CLIENT_OUT_OF_MEMORY, no response
-                else Explicit disconnect wins before result completion
-                    IO-->>B: CLIENT_NOT_CONNECTED, no response
-                else Deadline, connection loss or other processing failure
-                    IO-->>B: CLIENT_TIMEOUT or CLIENT_COMMUNICATION_ERROR
+                else Original deadline, connection loss or explicit close wins
+                    IO->>P: Retire pending record and uncommitted response storage
+                    IO->>W: TryComplete with winning timeout/loss/close result, cleared<br/>outputs
                 end
-            else Explicit disconnect wins before sending
-                IO-->>B: CLIENT_NOT_CONNECTED, no response
-            else Deadline or generation no longer permits sending
-                IO-->>B: CLIENT_TIMEOUT or CLIENT_COMMUNICATION_ERROR
             end
-            B-->>API: One final ClientResult and response string only on CLIENT_OK
-        end
-        API->>API: Release input temporaries and scoped live-call guard
-        API-->>A: Final ClientResult, owned string on success or NULL on local error
-        opt Final result is CLIENT_OK
-            A->>A: Consume response text according to the service contract
-            A->>A: Release returned string with client_free_response
+            W-->>API: F6 One final result and response outputs
+            API->>S: Release live-call guard
+            API-->>A: ClientResult and response outputs
         end
     end
 ```
 
-Final text preparation belongs to the shared I/O receive/completion path, just
-as it does for the asynchronous string method. Complete the synchronous waiter
-only after the returned string is ready. The same 15-second deadline and
-explicit-close cutoff cover that preparation; they are not restarted after
-receiving the binary envelope. If timeout or close wins while text is being
-prepared, free the uncommitted string and preserve the winning result. A text
-allocation failure may occur after remote execution and does not permit replay.
+#### Plain-string ownership and local failures
 
-#### Plain-string input, length and ownership
+The caller keeps input valid and unchanged until the API returns. Scan within
+the configured text bound, own the bytes before publication and keep explicit
+binary lengths during Protobuf serialization and ZMQ transmission. The first
+NUL ends input: "abc\0def" supplies "abc" only. Empty input still reaches the
+same unsupported-service response. Never measure a serialized envelope using
+strlen(), decode caller text as Protobuf, or infer a Crypto operation from it.
 
-Both string methods take a valid NUL-terminated C string. There is no request
-size argument because the first `\0` determines its length. The library scans
-within the configured text bound and copies the bytes before that terminator
-into owned storage. It records the length internally for serialization and
-transport. The caller must keep the source valid and unchanged until the API
-returns; subsequent I/O must not reference the caller's storage.
+For a valid remote error, allocate the symbolic status name plus its final NUL
+before claiming completion. The application checks that text and calls
+client_free_response. CLIENT_OK means the remote error response was delivered;
+it does not mean the text operation succeeded. A successful string result is
+never NULL and is never binary Protobuf disguised as a C string.
 
-No Base64 encoding or decoding is needed, either by the caller or inside the
-transport. Protobuf's bytes field and ZMQ already carry the text bytes. The
-caller does not supply a serialized RPC envelope through this API. EyilClient
-constructs and serializes that envelope internally once the service mapping is
-defined. Serialized wire messages always retain their explicit binary length;
-never measure them with strlen(). See the
-[Protobuf wire format](https://protobuf.dev/programming-guides/encoding/).
+Invalid arguments or oversized input return CLIENT_INVALID_ARGUMENT. Allocation
+failure in copying, request creation, serialization, pending-map insertion or
+final status-string preparation returns CLIENT_OUT_OF_MEMORY. Slot waiting,
+send attempts and final response preparation share the original 15-second
+deadline. Timeout, explicit close and unexpected loss return CLIENT_TIMEOUT,
+CLIENT_NOT_CONNECTED and CLIENT_COMMUNICATION_ERROR respectively, with NULL
+output. Free all partial storage and release the live-call guard on every exit.
+The general race/uncorrelatable-response rules in section 5.6 also apply.
 
-The first NUL ends the request. A pointer to `"abc\0def"` supplies only `"abc"`;
-the library cannot infer that the caller intended additional bytes. Use the
-byte API with its explicit size for arbitrary binary Protobuf. An empty string
-is valid at the C-string boundary; whether it is a meaningful service request
-is determined by the service contract. A NULL input pointer is invalid.
+This keeps the existing C signatures and raw-string input boundary. Consumers
+use the byte APIs with serialized CryptoRequest payloads for actual Crypto
+operations. Neither client nor Gateway translates arbitrary text into ICrypto.
 
-On response delivery, the library uses the known response-text length,
-allocates length plus one bytes, copies the text and appends `\0`. The caller
-receives ordinary text and frees it with client_free_response. An empty text
-response is an allocated string containing only the terminator, not a NULL
-success result. Do not truncate an unrepresentable binary response at its first
-NUL or automatically expose it in a different encoding.
+### 5.9 client_send_request_string_async() — Gateway returns unsupported service
 
-#### Text interpretation and service routing
-
-Transporting text and interpreting it as an operation are separate contracts.
-RpcRequest.payload can hold text bytes directly when the selected service
-accepts text. The current CRYPTO adapter expects a serialized CryptoRequest,
-so arbitrary text is not automatically a valid Crypto operation.
-
-**TODO(TEXT-SERVICE-CONTRACT):** define the service route for string calls, how
-Gateway distinguishes/interprets their payload, and the response text contract,
-including representation of RpcStatus and service errors. The public string
-method has no service argument and the current schema defines only CRYPTO.
-Do not silently infer a service, add an implicit text operation to Crypto or
-change the binary Crypto payload contract. Any service-specific translation
-belongs at the service integration boundary; EyilClient transport remains
-independent of Crypto policy.
-
-This question concerns service semantics, not input length or caller encoding.
-The UML mapping participant marks that integration boundary; it does not select
-a new text format or claim that arbitrary text is already a Crypto request.
-
-#### Application impact and tradeoffs
-
-The effect on callers depends on which API they use:
-
-| Consumer | Effect of the plain-string contract |
-| --- | --- |
-| Application using a high-level Firebolt Crypto API | The Crypto library continues to own service request construction; choosing the string transport does not change the app's high-level function signatures |
-| Application or binding calling the string APIs directly | Pass NUL-terminated text and consume returned text; no caller-side wire serialization or encoding, but the service must understand the request |
-| Consumer calling the byte APIs | Continue passing serialized Protobuf with explicit request/response lengths |
-
-| Advantage | Cost or limitation |
-| --- | --- |
-| No size argument or caller encoding is required | Input must be valid NUL-terminated storage; embedded NUL ends the string |
-| No text-encoding expansion or extra encoding pass | The library still scans/copies text and serializes the binary wire envelope |
-| Existing C signatures and callbacks remain usable | Service routing and request/response meaning still need a defined contract |
-| Uses the same request coordinator, IDs and transport | The string API cannot expose arbitrary binary response data as ordinary text |
-
-Check length-plus-one arithmetic for overflow and enforce configured text and
-wire-message bounds before allocation. Product-specific values remain under
-RESOURCE-LIMITS. No new public size parameter is required. The string API hides
-wire representation from its caller; it cannot hide the service's required
-operation arguments or make an undefined command meaningful.
-
-Ownership and failures are defined: validate and copy input before submission,
-own all intermediate wire storage, and return a separately owned NUL-terminated
-response for client_free_response. Check size arithmetic and configured text
-and wire-message limits before allocation. Invalid arguments or oversized input
-return CLIENT_INVALID_ARGUMENT; allocation failure returns CLIENT_OUT_OF_MEMORY.
-All temporary storage is released on every success/rejection/error path. A valid
-received response must satisfy the response-text contract and its size bound;
-an unrepresentable response, including unexpected embedded NUL in response text,
-is a local CLIENT_COMMUNICATION_ERROR rather than a silently truncated success.
-
-CLIENT_TIMEOUT and transport errors propagate unchanged from the shared binary
-core. Failure to allocate the final text can occur after remote execution and
-successful receipt of its response: return CLIENT_OUT_OF_MEMORY and NULL, and
-do not replay the operation. Before send acceptance, local failures return
-through the API with no async response callback. NUL-terminated string handling
-does not change the agreed timeout or ownership behavior.
-
-### 5.9 client_send_request_string_async()
-
-Coverage: **AC2-Client.1, AC2-Client.5**.
+Coverage: **AC2-Client.1, AC2-Client.5**, with the same string-service delivery
+limitation as section 5.8. The async transport path is required: the method
+copies raw text, waits for its single-slot handoff and libzmq acceptance, then
+returns the send result. It does not wait for Gateway's unsupported response
+and does not return CLIENT_NOT_IMPLEMENTED locally.
 
 ```mermaid
 sequenceDiagram
-    participant A as Application thread
+    participant A as Application
     participant API as client_send_request_string_async
-    participant TEXT as Text/service mapping
-    participant Q as Dynamic submission queue
-    participant W as Retained send-result waiter
-    participant IO as Shared I/O owner / pending map
-    participant Z as Client libzmq / DEALER
-    participant G as Gateway
-    A->>API: Client, NUL-terminated request text and string response handler
-    Note over API,IO: Validate Client pointer, retain a scoped live-call guard before input work, release it on every return
-    API->>API: Validate caller thread, arguments and connection, scan to first NUL within bound
-    opt Arguments valid and connection usable
-        API->>API: Copy request text into owned storage with known length
-        API->>TEXT: Resolve service and prepare owned RpcRequest from text
-        Note over API,TEXT: Same TEXT-SERVICE-CONTRACT as synchronous strings
-    end
-    alt Invalid arguments, excessive text length, service input, handler or caller thread
-        API-->>A: CLIENT_INVALID_ARGUMENT, no callback
-    else No usable connection
-        API-->>A: CLIENT_NOT_CONNECTED, no callback
-    else Input copying or wire-request preparation allocation fails
-        API->>API: Free partial input and wire-request storage
-        API-->>A: CLIENT_OUT_OF_MEMORY, no callback
-    else Envelope prepared
-        API->>API: Allocate and initialize request, string response target, send waiter and deadline
-        API->>Q: Push owned action under mutex
-        alt Request, waiter or queue growth allocation fails
-            API->>API: Free partial state, no published action
-            API-->>A: CLIENT_OUT_OF_MEMORY, no callback
-        else Queued with original 15-second send deadline
-            API->>IO: Signal existing wakeup
-            API->>W: Wait for send result
-            IO->>IO: Check deadline/generation, serialize and insert pending record
-            alt Serialization or pending-map allocation fails
-                IO->>IO: Retire unsent state, prevent later send
-                IO->>W: Publish CLIENT_OUT_OF_MEMORY using retained state
-            else Prepared and eligible to send
-                IO->>Z: zmq_send(DEALER, one binary frame, DONTWAIT)
-                Note over IO,Z: Retry EAGAIN or EINTR only while eligible within original send deadline
-                alt Detected allocation failure before acceptance
-                    IO->>IO: Retire unsent record
-                    IO->>W: Publish CLIENT_OUT_OF_MEMORY
-                else Explicit disconnect wins before send acceptance
-                    IO->>IO: Retire unsent record
-                    IO->>W: Publish CLIENT_NOT_CONNECTED
-                else Other send error, connection loss or send expiry
-                    IO->>IO: Retire unsent record
-                    IO->>W: Publish CLIENT_COMMUNICATION_ERROR or CLIENT_TIMEOUT
-                else libzmq accepts the send
-                    IO->>IO: Disarm send deadline, retain response record
-                    IO->>W: Publish immutable CLIENT_OK
-                    Z->>G: Transport queued RpcRequest over UDS
-                end
-            else Explicit disconnect wins before sending
-                IO->>IO: Retire unsent record
-                IO->>W: Publish CLIENT_NOT_CONNECTED
-            else Deadline expires or connection is lost before sending
-                IO->>IO: Retire unsent record
-                IO->>W: Publish CLIENT_TIMEOUT or CLIENT_COMMUNICATION_ERROR
+    participant S as ClientRuntime / single slot
+    participant W as Retained request / result condition
+    participant IO as I/O owner
+    participant P as Pending map
+    participant Z as DEALER
+    participant G as Gateway ROUTER
+    A->>API: Client, NUL-terminated text, response handler
+    API->>API: Validate required argument pointers and handler
+    opt Pointer arguments valid
+        API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
+        opt Admitted on an allowed application thread
+            API->>API: F1 Scan to first NUL within bound, copy text, build service<br/>UNSPECIFIED envelope
+            opt Preparation succeeds
+                API->>W: Initialize owned Request, mode, generation and completion state
             end
-            W-->>API: One send result
-            API->>API: Release input preparation temporaries
-            API-->>A: ClientResult, no response wait
-            opt Send accepted with CLIENT_OK
-                Note over A,G: Response waiting has no timeout
-                alt Response arrives
-                    G-->>Z: RpcResponse
-                    Z-->>IO: Receive and correlate response
-                    IO->>TEXT: Map validated RpcResponse to response text, preserving Gateway/service errors
-                    TEXT->>TEXT: Check representation and bound, allocate length plus one and append NUL
-                    alt Matched response copying or text allocation fails
-                        IO->>IO: Retire record, free temporaries, record diagnostics
-                        Note over A,IO: No response callback, send result remains CLIENT_OK
-                    else Other matched validation or text-representation failure
-                        IO->>IO: Retire record with diagnostics, no callback
-                    else Response string ready
-                        TEXT-->>IO: Owned NUL-terminated response text
-                        IO->>IO: Try claiming callback against explicit close
-                        alt Callback claim succeeds before cutoff
-                            IO->>IO: Retire record, release internal locks
-                            IO-->>A: handler(Client, owned response string)
-                            A->>A: Consume response text or hand off heavy work
-                            A->>API: Later client_free_response(response)
-                        else Explicit close already won
-                            IO->>IO: Free uncommitted string and retire record, no callback
+        end
+    end
+    alt Invalid arguments / own I/O-thread request call / no usable<br/>connection / preparation allocation failure
+        API->>API: Release partial state and any retained call guard
+        API-->>A: CLIENT_INVALID_ARGUMENT / CLIENT_NOT_CONNECTED /<br/>CLIENT_OUT_OF_MEMORY, no response callback
+    else Prepared request
+        API->>S: F2 WaitAndPublish(request, original deadline)
+        opt Slot occupied
+            S->>S: Wait on slotAvailable, release mutex, recheck predicate after<br/>wake
+        end
+        alt Deadline, close or terminal runtime failure wins before<br/>publication
+            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED / stored failure reason
+            API->>API: Free unpublished state and release live-call guard
+            API-->>A: Exact local result, cleared outputs if any, no callback
+        else Slot EMPTY and call still eligible
+            S->>S: Publish retained request, mark PUBLISHED, unlock
+            S-->>API: Published
+            API->>IO: F3 WakeIo through existing pollable wakeup
+            API->>W: F6 WaitForSend, no runtime mutex held
+            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
+            S-->>IO: Owned Request, mode, generation and deadline
+            IO->>IO: F4 Recheck eligibility, assign ID/schema, serialize outside lock
+            IO->>P: F4 Insert expected response target before sending
+            alt Serialization or pending-map allocation fails
+                IO->>P: Retire partial unsent entry
+                IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching<br/>slot, notify slotAvailable
+                S-->>W: Notify committed send failure, normally CLIENT_OUT_OF_MEMORY
+            else Prepared and tracked
+                loop Until accepted or terminal send outcome
+                    IO->>S: F5 TryBeginSend, check cancellation, generation and deadline
+                    alt Deadline / explicit close / unexpected loss wins
+                        IO->>P: Retire unsent entry, prevent later send
+                        IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
+                        S-->>W: Notify winning timeout, close or stored failure result
+                    else Send attempt admitted
+                        IO->>Z: F5 zmq_send(one frame, DONTWAIT)
+                        alt EAGAIN or EINTR without acceptance
+                            IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
+                            opt Still eligible within original deadline
+                                IO->>IO: Retain CLAIMED slot, poll replies, monitor and writable<br/>readiness
+                            end
+                            Note over S,IO: If ineligible, next eligibility check retires without sending
+                        else Terminal send error
+                            IO->>P: Retire unsent entry
+                            IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
+                            S-->>W: Notify winning send error, preserve any earlier cancellation
+                        else libzmq accepts message
+                            IO->>S: CompleteSend(request, CLIENT_OK), clear matching slot, notify<br/>slotAvailable
+                            S-->>W: Notify immutable CLIENT_OK already committed by CompleteSend
+                            Z->>G: Transport RpcRequest over UDS
                         end
                     end
-                else Connection loss or explicit disconnect
-                    IO->>IO: Retire record, free temporary storage, no response callback
-                    Note over A,IO: Unexpected loss may report an event, explicit close creates no event
+                end
+            end
+            W-->>API: F6 One send result
+            API->>S: Release live-call guard
+            API-->>A: ClientResult, no response wait
+            opt Send accepted with CLIENT_OK
+                Note over S,P: Slot is free, pending response has no deadline
+                G->>G: Validate context, envelope and ID, find service UNSPECIFIED<br/>unsupported
+                G->>G: Log ERROR unsupported_service, no Crypto or worker dispatch
+                alt Response is delivered
+                    G-->>Z: RpcResponse with matching ID, service UNSPECIFIED, schema 1,<br/>UNSUPPORTED_SERVICE, empty payload
+                    IO->>Z: F7 zmq_msg_recv(DONTWAIT), consume complete message
+                    Z-->>IO: Response frame
+                    IO->>P: F7 Match an accepted ID/generation and validate expected<br/>service/schema/status
+                    Note over IO,P: Unknown or premature replies follow the common pipeline, without<br/>completing this request
+                    alt Matched response validation fails
+                        IO->>P: Retire only the matched response record
+                        IO->>IO: Record diagnostics, no callback, send result stays CLIENT_OK
+                    else Matched response is valid
+                        IO->>IO: F8 Copy validated non-OK RpcStatus name plus NUL
+                        alt Response allocation fails
+                            IO->>P: Retire record and free temporary storage
+                            IO->>IO: Log allocation failure, no callback, send result stays CLIENT_OK
+                        else Final response ready
+                            IO->>P: F8 Claim callback delivery against explicit close
+                            alt Delivery claim succeeds
+                                IO->>P: Retire record once, do not change the submission slot
+                                IO->>IO: Release internal locks
+                                IO-->>A: handler(Client, owned NUL-terminated status name), on I/O thread
+                            else Another terminal path already won
+                                IO->>IO: Free uncommitted response, preserve winning result
+                            end
+                        end
+                    end
+                else Connection loss or explicit close
+                    IO->>P: Retire pending record and uncommitted response storage
+                    Note over IO,A: No response callback, accepted send result remains CLIENT_OK
                 end
             end
         end
     end
 ```
 
-Both string APIs share the byte APIs' coordinator, pending map and DEALER.
-The async string method uses the public ClientStringResponseHandler signature,
-with no size argument. Local input copying, wire preparation and send errors
-return from the API using the same ClientResult mappings as section 5.7.
+The wire envelope and exact status-text representation are defined in section
+5.8. A delivered RPC_STATUS_UNSUPPORTED_SERVICE response invokes
+ClientStringResponseHandler(Client, owned_status_text); the caller frees it
+through client_free_response. Gateway errors are real responses and therefore
+use the existing response-only callback, with no new ClientResult callback
+argument or user_data parameter.
 
-After successful send acceptance there is no response timeout. Preparing or
-allocating the returned string may fail after remote execution; in that case,
-retire the record with diagnostics and do not invoke a synthetic error callback.
-Connection failures use the connection-event path. Input and callback output
-use the same NUL-terminated text contract as synchronous strings in section 5.8.
+Input validation, copying, slot waiting and send failures follow section 5.7.
+A failed submission has no response callback. After acceptance there is no
+response timeout: loss, explicit close, invalid response or inability to allocate
+the status text can retire the record without a callback. Preserve the already
+published CLIENT_OK send result. A fast response can invoke the handler on the
+I/O owner before the submitting thread resumes. No internal lock is held during
+the callback, and request/disconnect calls must be scheduled on an application
+thread.
 
 ### 5.10 client_free_response()
 
@@ -2100,7 +2420,7 @@ sequenceDiagram
     participant API as client_free_response
     participant M as Library-compatible allocator
     A->>API: Response allocation or NULL
-    Note over API,M: No new allocation or queue submission, no ClientResult return
+    Note over API,M: No new allocation or slot publication, no ClientResult return
     API->>M: free(pointer)
     M-->>API: Storage released, NULL is harmless
     API-->>A: Return
@@ -2126,7 +2446,7 @@ sequenceDiagram
     participant API as client_register_notifications
     A->>API: Client and notification handler
     API-->>A: CLIENT_NOT_IMPLEMENTED
-    Note over A,API: No allocation, handler retention or transport activity, no CLIENT_OUT_OF_MEMORY path
+    Note over A,API: No allocation, handler retention or transport activity, no<br/>CLIENT_OUT_OF_MEMORY path
 ```
 
 Notification delivery is outside this version's scope. A future feature must
@@ -2151,7 +2471,7 @@ sequenceDiagram
     participant API as client_unregister_notifications
     A->>API: Client
     API-->>A: Return without changing state
-    Note over A,API: No allocation, notification state or ZMQ activity, no ClientResult return
+    Note over A,API: No allocation, notification state or ZMQ activity, no<br/>ClientResult return
 ```
 
 Calling this function is not required before client_disconnect in this version.
@@ -2163,8 +2483,8 @@ Neither notification function allocates, so neither has an out-of-memory path.
 Coverage: **AC2-Client.1–AC2-Client.4**, leading to **AC1.12** when the Gateway detects closure.
 
 client_disconnect is a synchronous local cleanup barrier. The app may call it
-while requests are queued or awaiting responses; it need not wait for those
-responses first. The function closes new admission, cancels unsent actions,
+while calls wait for the slot, occupy it or await responses; it need not wait for those
+responses first. The function closes new admission, wakes slot waiters, cancels the unsent submission,
 retires pending response IDs and closes the connection. It returns only after
 the old runtime is quiescent and the handle is destroyed. It does not wait for
 a Gateway acknowledgement or certify that remote operations have finished.
@@ -2173,8 +2493,9 @@ a Gateway acknowledgement or certify that remote operations have finished.
 
 | State when local close wins | Outcome |
 | --- | --- |
-| Synchronous request still waiting | Return CLIENT_NOT_CONNECTED with NULL response and size 0 for bytes, or NULL for strings |
-| Async submission not yet accepted by libzmq | Return CLIENT_NOT_CONNECTED through its send waiter; cancel the unsent action and invoke no response callback |
+| Synchronous request still waiting | Return CLIENT_NOT_CONNECTED with NULL response and size 0 for bytes, or NULL for strings; prevent further sends and resolve any admitted send attempt before returning |
+| Async submission not accepted and no send attempt in progress | Return CLIENT_NOT_CONNECTED through its send waiter; cancel the unsent action and invoke no response callback |
+| Nonblocking send attempt in progress | Latch close and wait for its outcome; acceptance preserves async CLIENT_OK, while a pending sync response result becomes CLIENT_NOT_CONNECTED; nonacceptance cannot trigger another attempt |
 | Async send already accepted | Preserve CLIENT_OK, remove its pending response ID and release library-owned storage without a response callback |
 | Uncommitted response or unclaimed callback | Discard its storage and pending record; do not start delivery after the close cutoff |
 | Result or callback already claimed | Preserve the winning result/ownership, let the call or callback finish and wait for its live reference to be released |
@@ -2184,9 +2505,11 @@ Serialize local-close admission with request publication and callback claims.
 Use the same retained completion state for close, response, timeout and transport
 failure: only one terminal result wins. If a nonblocking send is already in
 progress, let the owner resolve it before completing its send waiter. Successful
-libzmq acceptance remains CLIENT_OK even if local close was requested while
-that attempt ran; it must not become a reported failure for a message that was
-accepted. Unsent actions cancelled by close can never execute later.
+libzmq acceptance remains CLIENT_OK for an async submission even if local close
+was requested while that attempt ran. A synchronous call still waiting for its
+response returns CLIENT_NOT_CONNECTED when close wins, even if its send was
+accepted. That local error does not prove remote cancellation. Unsent actions
+cancelled by close can never execute later.
 
 An intentional close generates no connection callback. Suppress monitor events
 caused by shutting down the socket. A connection callback already claimed for an
@@ -2199,45 +2522,49 @@ can execute for that Client after client_disconnect returns.
 sequenceDiagram
     participant A as Application lifecycle thread
     participant API as client_disconnect
-    participant C as Coordinator
-    participant W as In-progress API calls and waiters
+    participant C as ClientRuntime / single slot
+    participant W as In-progress calls, slot and result waiters
     participant IO as Serving thread and callbacks
     participant Z as libzmq / DEALER and monitor
     participant G as Gateway monitor
     A->>A: Stop new API entry and coordinate ownership of the handle
     A->>API: Client
-    API->>C: Mark CLOSING, close request/callback admission, set existing stop flag
-    Note over API,IO: No allocation or queued shutdown action required
+    API->>C: Mark CLOSING, close request/callback admission, set existing<br/>stop flag
+    Note over API,C: Latch CLIENT_NOT_CONNECTED only for a READY runtime, preserve an<br/>earlier LOST reason and per-call results
+    Note over API,IO: Stop does not allocate or wait for the submission slot
+    C->>W: notify_all(slotAvailable), unpublished calls use the latched<br/>reason
     C->>IO: Signal existing wakeup
     opt Callback or nonblocking send already claimed before cutoff
-        IO->>IO: Finish callback or resolve send result, preserve any accepted send
+        IO->>IO: Finish callback or resolve send result, preserve any accepted<br/>send
     end
-    IO->>W: Complete unresolved sync/send waiters with CLIENT_NOT_CONNECTED
-    IO->>IO: Cancel unsent actions, retire pending IDs and discard uncommitted responses
-    Note over C,IO: No synthetic response callback or intentional-close connection event
+    IO->>W: Complete unresolved results with the latched reason, preserve<br/>accepted async CLIENT_OK and earlier completions
+    IO->>C: Cancel unsent submission, clear matching slot after any active<br/>send resolves, notify
+    IO->>IO: Retire pending IDs and discard uncommitted responses
+    Note over C,IO: No synthetic response callback or intentional-close connection<br/>event
     IO->>Z: Disable monitoring, close owned sockets with LINGER=0
     Z-->>G: Peer closure eventually becomes monitor event
     IO-->>C: Serving loop exits
-    W->>C: Return mapped or already-committed results, release live-call guards
+    W->>C: Return mapped or already-committed results, release live-call<br/>guards
     API->>IO: Join thread, also join separate monitor worker if used
-    API->>C: Wait for remaining live calls and claimed callbacks without holding their locks
+    API->>C: Wait for remaining live calls and claimed callbacks without<br/>holding their locks
     API->>Z: Terminate owned context after all its sockets close
-    API->>C: Clear handler, release queues/records and destroy handle
+    API->>C: Clear handler, verify empty slot, release records and destroy<br/>handle
     API-->>A: Void return, handle is invalid, no ClientResult
     A->>A: Reset caller's handle slot to NULL before reuse
-    Note over A,IO: No old Client callback or state access survives the cleanup barrier
-    Note over API,G: Gateway drains accepted work and retains buffers until backend access ends
+    Note over A,IO: No old Client callback or state access survives the cleanup<br/>barrier
+    Note over API,G: Gateway drains accepted work and retains buffers until backend<br/>access ends
 ```
 
 Disconnect must remain possible after allocation failure. Set a stop flag
-created during connect and signal the existing wakeup instead of pushing a
-new shutdown action onto the dynamic queue. Resolve waiters using retained
+created during connect, notify slotAvailable and signal the existing wakeup.
+Shutdown must not acquire an empty slot or publish a control request. Resolve
+result waiters using retained
 completion objects and erase/free records without constructing a temporary
 container. The function is void; it cannot report CLIENT_OUT_OF_MEMORY and
 must not depend on allocating an error object to clean up.
 
 Wake and resolve pending callers before waiting for their live-call references
-to drain. Never wait while holding the queue, state or callback locks they need
+to drain. Never wait while holding the state/slot or callback locks they need
 to return. Joining the I/O owner also waits for its active callback. Callbacks
 must return promptly; safe cleanup cannot forcefully terminate application code
 running on that thread. Preserve results already committed to a caller,
@@ -2260,12 +2587,14 @@ from a NULL handle slot with no old runtime state, as specified in section 5.14.
 - The application serializes connect/disconnect and destruction of the same
   handle. Stop new call entry and coordinate threads that could still enter
   using a copied raw pointer. A call not yet holding an internal live reference
-  must not race handle destruction; neither the internal queue lock nor a raw
+  must not race handle destruction; neither the internal state mutex nor a raw
   Client pointer makes that race safe.
 - Calls already holding live references may remain blocked in the library while
   disconnect runs. Close wakes their waiters. An entered call that has not yet
-  submitted work checks CLOSING before publication and returns
-  CLIENT_NOT_CONNECTED instead of publishing a new action. Every return path
+  submitted work checks admission before publication and returns the retained
+  terminal reason instead of publishing into the slot: CLIENT_NOT_CONNECTED for
+  explicit close from READY, or the earlier loss reason for an already LOST
+  runtime. Every return path
   releases its guard, including validation and allocation failures.
 - Serialize callback admission with CLOSING. Claims made before the cutoff
   retain the Client until return; later responses/events are discarded. Keep
@@ -2282,47 +2611,46 @@ shared-buffer leases follow their existing drain and completion rules.
 
 ### 5.14 Deadlines, callbacks, reconnect and library unloading
 
-#### Initial timeout and queue defaults
+#### Initial timeout and submission defaults
 
 | Setting | Initial value | Meaning |
 | --- | --- | --- |
-| Common timed-wait duration | 15,000 ms | Shared by connect, synchronous requests and async send submission; no public timeout setter is required initially |
-| Connect deadline | Connect-attempt start plus 15 seconds | Covers setup/handshake waiting for one explicit attempt; events cannot restart it and safe rollback must finish before return |
-| Synchronous request deadline | Admission time plus 15 seconds | One budget across queueing, serialization, send attempts, response validation and preparation of the final byte/string result |
-| Async send-submission deadline | Admission time plus 15 seconds | Covers queueing, serialization and send attempts until libzmq accepts the request; return its result through the API |
-| Async response deadline | None | Disarm the send deadline after acceptance and retain the response record until delivery or local retirement/teardown |
-| Submission queue and pending map | Dynamic, no fixed request-count cap | std::queue<Action> grows under a mutex; detected allocation failure returns CLIENT_OUT_OF_MEMORY while an API result is still pending |
+| Common timed-wait duration | 15,000 ms | Used for connect, sync requests and async send submission; no public timeout setter |
+| Connect deadline | Attempt start plus 15 seconds | Includes startup/handshake waiting; rollback must finish safely |
+| Synchronous request deadline | Request-call admission plus 15 seconds | One budget covering input preparation, slot availability, serialization, send, receive/validation and final result preparation |
+| Async send deadline | Request-call admission plus 15 seconds | Covers preparation, waiting/publishing the slot and send attempts until libzmq acceptance |
+| Async response deadline | None | Send acceptance disarms its send timer; pending response remains until delivery or retirement/teardown |
+| Client submission storage | One pre-created slot | At most one published/claimed unsent request; other callers wait on slotAvailable, with no queue container or queue-full result |
+| Pending-response map | Dynamic, no fixed request-count cap | Install before first send; sent requests awaiting replies do not occupy the slot |
 
-The synchronous deadline is one total budget, not a new 15 seconds per phase.
-An async request has a 15-second send budget only: time waiting for libzmq
-acceptance does not start a response timer afterward. Connect and each request
-use independent deadlines. None of these timers expires an idle connection.
+Do not restart the deadline after acquiring the slot or after sending. Use a
+monotonic clock. A call waiting for the slot gets CLIENT_TIMEOUT when its
+original budget expires. Callers wait without holding the state mutex; the I/O
+owner can process the occupied slot, earlier responses and monitor events.
+None of these timers expires an idle connection.
 
-A send-submission timeout must cancel unsent work and resolve any racing send
-attempt before returning; it must not leave an abandoned queue entry that can
-later be sent. If libzmq already accepted the request, preserve CLIENT_OK as
-that submission's result. This does not prove that Gateway received or executed
-the operation.
+Cancellation before publication leaves nothing for the owner. Cancellation of
+a published request marks its retained state and wakes the owner; that request
+cannot be sent later. If a nonblocking send is already in progress, resolve
+that attempt before reporting failure claiming no acceptance. Acceptance keeps
+the async CLIENT_OK result even if a deadline/close raced it. The slot remains
+occupied until its owner finishes that send/cancellation outcome, then becomes
+available independently of response waiting.
 
-Allocate request state and grow the submission queue/pending map as needed.
-There is no local queue-full result or aggregate queue-byte admission limit.
-Catch allocation failure, release partial state and return CLIENT_OUT_OF_MEMORY
-through the pending API result as described in sections 5.2 and 5.4. Free each
-record once on response delivery, terminal local failure or teardown.
-Outstanding async requests that receive no response can retain their memory
-indefinitely; there is no hidden response or idle timeout.
+Slot publication moves a retained reference and does not allocate. Input,
+request state, serialization, pending-map growth and response preparation still
+can fail with CLIENT_OUT_OF_MEMORY under sections 5.2 and 5.4. Unpublished callers
+retain their own prepared requests while blocked, so removal of the submission
+container is not a total client memory bound. The pending map can retain
+unanswered async requests indefinitely because there is no response timeout.
+No FIFO guarantee is made among callers competing for the slot.
 
-A response callback may free its storage but must schedule new requests on an
-application thread, because even async submission waits for the I/O owner.
-
-Per-message validation/encoding bounds and libzmq socket high-water marks are
-separate from the dynamic C++ submission queue. Select those transport settings
-under RESOURCE-LIMITS. EAGAIN is temporary transport backpressure handled within
-the active send deadline, not a local queue-full error. Gateway separately caps
-waiting requests at 1,024 and expires a request that cannot start dispatch within
-10 seconds. Its shared-buffer quotas and response-backpressure policy are
-separate. The client queue remains dynamic without a fixed request-count cap.
-Already-delivered response allocations belong to the application until freed.
+Per-message bounds and libzmq high-water marks remain separate transport
+settings under RESOURCE-LIMITS. EAGAIN retains the occupied slot while the owner
+continues polling; it is not a local queue-full error. Gateway retains its own
+1,024 waiting-request limit and 10-second dispatch deadline. Client-side slot
+waiting is unrelated to that Gateway queue. App-owned delivered responses
+remain valid until freed.
 
 #### Terminal connection loss and explicit reconnect
 
@@ -2334,10 +2662,11 @@ request on the still-allocated lost handle returns CLIENT_NOT_CONNECTED.
 
 | State at detected transport loss | Required cleanup/result |
 | --- | --- |
-| Unsent client submission actions | Cancel and erase them; they must never be sent later |
+| Callers waiting for the slot | Save the terminal failure reason and notify slotAvailable; entered calls return that reason without publication |
+| Published/claimed unsent request | Cancel, resolve any active send attempt, clear the slot and release its reference; never send cancelled work later |
 | Synchronous result or async send-result waiter still pending | Complete once with CLIENT_COMMUNICATION_ERROR; clear response outputs and invoke no async response callback |
 | Async send already accepted by libzmq | Preserve its CLIENT_OK submission result, retire its response record without a callback and release library-owned request state |
-| Queued, received or prepared response not committed to a caller | Discard it and release its library-owned storage and accounting |
+| Unread, received or prepared response not committed to a caller | Discard it and release its library-owned storage and accounting |
 | Result already committed to a waiter or callback | Preserve the winning completion and ownership transfer; do not overwrite it or free the caller's response |
 | Old libzmq queues | Disable monitoring and close owner-held sockets with LINGER=0; discard unread input, release received message objects and do not reuse the sockets |
 
@@ -2347,6 +2676,12 @@ already won its terminal transition keeps its result. For connection-wide
 local allocation/validation failures, use the existing error mappings from
 section 5.6 with the same teardown discipline. No synthetic async error response
 is introduced.
+
+The terminal runtime reason is latched once. Explicit cleanup after loss must
+not change CLIENT_COMMUNICATION_ERROR or CLIENT_OUT_OF_MEMORY to
+CLIENT_NOT_CONNECTED for previously admitted callers still preparing input or
+waiting for the slot. New calls after READY ended are rejected before admission
+with CLIENT_NOT_CONNECTED; they do not inherit an older operation's error.
 
 Report CLIENT_CONNECTION_LOST once for the established connection, without held
 internal locks, if its callback is claimed before explicit close shuts callback
@@ -2376,8 +2711,8 @@ The application first coordinates its callers and the old handle's lifetime.
 A successful new connect has a new Client runtime, owned ZMQ context, DEALER,
 monitor endpoint and connection generation. Gateway authenticates a new
 User-Id/session and performs CONNECTED again. Matching UID/PID or future
-authoritative app identity does not restore an old connection. Pending maps,
-queues and response records start empty; old buffer IDs and session key handles
+authoritative app identity does not restore an old connection. The submission
+slot and pending-response map start empty; old buffer IDs and session key handles
 cannot be used in the new session.
 
 ```mermaid
@@ -2392,7 +2727,7 @@ sequenceDiagram
     participant G as Gateway
     Z-->>IO: Established connection disconnects
     IO->>IO: READY to LOST, close admission for old generation
-    IO->>W: Fail unresolved API waiters, cancel unsent actions, retire async records
+    IO->>W: Wake slot waiters with terminal reason, retire occupied<br/>submission and pending records
     IO->>IO: Free uncommitted response storage, preserve transferred results
     IO->>Z: Disable monitor and close owned sockets with LINGER=0
     IO->>H: Invoke handler with CLIENT_CONNECTION_LOST
@@ -2400,15 +2735,15 @@ sequenceDiagram
     H-->>IO: Return promptly
     IO->>IO: Exit serving loop, no automatic reconnect
     A->>API: client_disconnect(old Client), then clear handle slot
-    API->>API: Quiesce callers/callbacks, join threads, terminate old context and free handle
+    API->>API: Quiesce callers/callbacks, join threads, terminate old context<br/>and free handle
     A->>API: client_connect(empty handle slot, connection handler)
-    API->>N: Create fresh runtime, empty queues and pending map
+    API->>N: Create fresh runtime, empty submission slot and pending map
     N->>G: New UDS connection and authentication
     G->>G: New connection/session identity, scoped ICrypto CONNECTED
     G-->>N: Successful handshake
     N-->>API: READY for new generation
     API-->>A: CLIENT_OK and new handle, no connection callback
-    Note over A,G: No old requests, replies or session resources move to the new connection
+    Note over A,G: No old requests, replies or session resources move to the new<br/>connection
 ```
 
 Client cleanup is not a remote cancellation acknowledgement. Gateway separately
@@ -2439,10 +2774,11 @@ and the distinction from process destruction.
 
 The following constraints apply to all request APIs:
 
-- Protect the dynamic submission queue with a mutex and process actions outside
-  that lock. Nonblocking socket operations and fair processing of submissions,
-  responses and monitor events keep other work progressing. There is no fixed
-  client request-count cap.
+- Protect the one submission slot and admission state with a per-Client mutex.
+  WaitAndPublish releases that mutex while waiting; ClaimSubmission retains
+  the request and unlocks before serialization or I/O. CompleteSend frees the
+  slot after acceptance/failure. Process replies and monitor events even when
+  the occupied slot cannot send. The pending-response map has no fixed count cap.
 - Use a monotonic clock for the agreed 15-second local deadlines. The current
   API has no timeout argument; future configurability is optional and does not
   block the initial fixed defaults. There is no idle-connection expiry.
@@ -2493,89 +2829,81 @@ this obligation. See the
 ```text
 Application / Firebolt Crypto
   client_connect
-    ClientCoordinator::Start
-      Allocate runtime, startup result, stop flag and wakeup
-        Allocation fails -> CLIENT_OUT_OF_MEMORY, roll back, output NULL
-      IoLoop::Run
-        Configure DEALER options with heartbeat IVL/TIMEOUT/TTL set to 0
-        Set RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0 before connect
-        Enable monitor and connect PAIR receiver -> zmq_connect
-        Poll PAIR -> handshake result -> complete startup waiter, no callback
-      On startup success, publish handle and enable loss-callback delivery
-      Return CLIENT_OK with published handle or exact error with NULL
+    ClientRuntime::Start
+      Allocate runtime, EMPTY slot, slotAvailable, result conditions, stop flag, wakeup
+      Start I/O owner, create DEALER and set options before connecting
+        heartbeat IVL/TIMEOUT/TTL=0, RECONNECT_IVL=-1, IMMEDIATE=1, LINGER=0
+      Enable monitoring, connect PAIR receiver, then connect DEALER and await handshake
+      HANDSHAKE_SUCCEEDED -> publish handle, CLIENT_OK, no initial callback
+      Failure -> retained error, stop/join/close and NULL output
 
-  client_send_request[_async]
-  client_send_request_string[_async]
-    Validate Client pointer and retain a scoped live-call guard
-      Release guard on every return, including errors
-    Validate caller thread and arguments
-      Byte API: parse the supplied binary RpcRequest using its explicit length
-      String API: scan to first NUL within bound, copy text, prepare wire request
-        TEXT-SERVICE-CONTRACT defines service routing and text interpretation
-      Retain owned RpcRequest and payload
-      Allocate owned request and sync result / async send-result waiter
-      Initialize mode, generation and original deadline before publication
-      ClientCoordinator::Submit -> mutex-protected dynamic queue -> wakeup
-        Allocation or queue insertion fails -> CLIENT_OUT_OF_MEMORY, no send
-        IoLoop::DrainSubmissions
-          CheckGenerationAndActiveDeadline
-          EnvelopeCodec::SerializeRequest(schema=1, unique request_id)
-          PendingRequests::Insert(handler or synchronous waiter)
-            Serialization/insertion allocation fails -> CLIENT_OUT_OF_MEMORY, no send
-          zmq_send(DEALER, DONTWAIT)
-            EAGAIN -> retain unsent work within original deadline
-            Error -> retire request, resolve API waiter, no async callback
-            Accepted -> resolve async send waiter with CLIENT_OK
-                        disarm async send deadline, retain response record
-        IoLoop::Receive
-          zmq_msg_recv -> framing/size check -> parse RpcResponse
-            Allocation fails before correlation -> close through connection-state path
-              still-pending API results get CLIENT_OUT_OF_MEMORY
-              accepted async records retire without response callbacks
-            match ID/generation -> validate service/schema/status
-              Byte API: owned serialized RpcResponse and explicit length
-              String API: prepare response text, allocate length plus one, append NUL
-                TEXT-SERVICE-CONTRACT preserves Gateway/service error meaning
-                Allocation fails -> sync CLIENT_OUT_OF_MEMORY and NULL/0
-                                    async diagnostics and retirement, no callback
-                claim final result/callback against close and any sync deadline
-                losing preparation frees its uncommitted result
-                retire pending record once
-                  sync: return ClientResult and response to waiter
-                  async: handler(Client, response[, size]), no held locks
-        Sync deadline -> CLIENT_TIMEOUT through response waiter
-        Async send deadline -> cancel unsent work, return CLIENT_TIMEOUT
-        Async response waiting -> no deadline
-        Post-send async local response failure -> diagnostics, retire, no callback
+  client_send_request / client_send_request_async
+    F1 RetainCall / PrepareRequest
+      Check READY, start original deadline, own and validate binary RpcRequest
+  client_send_request_string / client_send_request_string_async
+    F1 RetainCall / PrepareRequest
+      Check READY, start original deadline, scan/copy raw text to first NUL
+      Build service=UNSPECIFIED envelope, payload=text bytes, no terminator
 
-  Monitor processing on the same I/O owner
-    Poll PAIR -> decode transport event -> connection-state transition
-      established loss -> close admission, mark old generation LOST
-      resolve unresolved API waiters, cancel unsent actions
-      retire accepted async records and discard uncommitted responses
-      close sockets with LINGER=0, no automatic reconnect
-      CLIENT_CONNECTION_LOST once if callback admission remains open
-      exit serving loop, no RESTORED or TERMINATED callback
-      app thread: disconnect old handle -> connect fresh runtime/session
+  Shared request path for all four methods
+    F2 ClientRuntime::WaitAndPublish
+      Wait until EMPTY or deadline/close/failure, release mutex during wait
+      Publish retained Request, mark PUBLISHED, unlock
+    F3 WakeIo -> I/O poller
+      ClientRuntime::ClaimSubmission -> lock/read/retain/CLAIMED/unlock
+    F4 I/O owner: PrepareWireRequest / TrackRequest
+      Recheck eligibility -> assign ID/schema -> serialize -> install pending entry
+      Allocation failure -> CLIENT_OUT_OF_MEMORY unless another terminal path won
+                            retire unsent entry, free matching slot, notify
+    F5 TryBeginSend -> zmq_send(DEALER, DONTWAIT)
+      EAGAIN/EINTR -> occupied slot retained, process replies/events, retry if eligible
+      Deadline/close/loss -> disable later sends, resolve any active attempt first
+      CompleteSend(request, outcome) -> commit send result and free matching slot once
+        Accepted async -> CLIENT_OK, even if cancellation raced the admitted attempt
+        Sync response result remains separate; expiry/close does not become success
+        Unlock -> notify result and slot waiters
+    F6 Calling thread
+      Async: return send result, no response timeout after acceptance
+      Sync: wait for final response within original deadline, slot already free
+    F7 I/O owner: zmq_msg_recv -> framing/parse -> match ID/service/schema/status
+      Uncorrelatable allocation failure -> terminal CLIENT_OUT_OF_MEMORY, wake slot waiters
+      Uncorrelatable invalid response -> terminal CLIENT_COMMUNICATION_ERROR, wake waiters
+      Unknown/retired ID -> discard
+      Installed but unaccepted ID -> log/discard response, preserve request and slot
+    F8 CompleteResponse
+      Byte: allocate serialized response bytes, preserve RpcStatus/service payload
+      String: validate non-OK status/empty payload -> allocate RpcStatus name + NUL
+        Gateway normally returns UNSUPPORTED_SERVICE, service=0, no Crypto invocation
+      Claim result against deadline/close -> retire pending entry once
+        Never clear another request's occupied submission slot
+      Sync: CLIENT_OK + response, or exact local error with NULL/0
+      Async: response callback without locks, or diagnostics/retirement without callback
 
-  client_register_notifications -> CLIENT_NOT_IMPLEMENTED, future support
-  client_unregister_notifications -> return without changing state
+  Monitor processing on I/O owner
+    Established loss -> READY to LOST, latch reason once, notify slotAvailable
+    Resolve occupied send, fail unresolved results, retire async records
+    Close sockets with LINGER=0, emit CLIENT_CONNECTION_LOST if callback claim allowed
+    Exit owner, no automatic reconnect or RESTORED/TERMINATED event
+    App explicitly disconnects old handle and connects a fresh runtime/session
 
-  client_free_response -> free
+  client_register_notifications -> CLIENT_NOT_IMPLEMENTED, no retained handler
+  client_unregister_notifications -> no effect
+  client_free_response -> free, no slot access or allocation
+
   client_disconnect
     App coordinates handle lifetime and stops new call entry
-    CloseRequestAndCallbackAdmission -> existing stop flag and wakeup, no queue allocation
-      resolve in-progress send, preserve accepted CLIENT_OK
-      unresolved sync/send waiters -> CLIENT_NOT_CONNECTED
-      cancel unsent work, retire pending IDs and discard uncommitted responses
-      owner closes sockets -> join threads -> wait for live calls/claimed callbacks
-      clear handler -> terminate context -> release handle
-      no intentional-close connection callback and no callback after return
+    Close admission, set existing stop flag, notify slotAvailable, wake I/O owner
+    No wait for EMPTY and no control request published into the slot
+    Resolve active send, preserve accepted async CLIENT_OK
+    Unresolved calls -> latched reason (CLIENT_NOT_CONNECTED for close from READY)
+    Preserve earlier LOST reason, clear matching occupied slot and pending IDs
+    Owner closes sockets -> join -> quiesce entered calls/claimed callbacks
+    Terminate context, destroy runtime, no callback after return
 ```
 
-The call hierarchy contains no application heartbeat producer, heartbeat
-service dispatch or inactivity-watchdog task. Pending lifecycle/API choices are
-kept in sections 5.5 and 7.2.
+The numbered boundaries match sections 5.2–5.9. They belong to one runtime and
+its Request records; no additional client coordinator thread or request pool
+is implied. Gateway request scheduling remains independent.
 
 ## 6. EyilGateway design and flows
 
@@ -2663,7 +2991,8 @@ flowchart TB
     REG -. "CONNECTED / drain / DISCONNECTED<br/>Separate lifecycle control path" .-> POOL
 
     IO <-->|"Resolve User-Id and original route"| REG
-    IO -- "Admit retained request job" --> Q
+    IO -- "Unregistered service including string calls<br/>UNSUPPORTED_SERVICE, no worker dispatch" --> CLIENT
+    IO -- "Admit supported request job" --> Q
     Q -- "Nonblocking pool handoff" --> POOL
     POOL <-->|"Crypto operations and NotifyAppState"| AD
     POOL <-->|"AllocateSharedBuffer / ReleaseSharedBuffer<br/>Deferred cleanup"| BUF
@@ -2692,6 +3021,7 @@ section 6.2, in addition to the transport owners and libzmq's internal threads.
 | Thunder Initialize / Deinitialize | Wrapper acquires/configures the implementation; deactivation awaits StopAndWait before releasing it | Sections 6.4 and 6.16 |
 | client_connect | DEALER handshake reaches ZAP; bind a unique User-Id to the transport/context and complete the worker-side NotifyAppState(CONNECTED) before ZAP success | Section 6.5 |
 | client_send_request / client_send_request_async carrying a Crypto RpcRequest | ROUTER owner validates/adopts the request, queues a distinct job and returns its correlated completion through the same owner | Sections 6.6–6.9 |
+| client_send_request_string / client_send_request_string_async | ROUTER rejects the unrouted service=0 envelope with RPC_STATUS_UNSUPPORTED_SERVICE before worker admission; client exposes the received status as text | Sections 5.8–5.9 and 6.6 |
 | ALLOCATE_SHARED_BUFFER / RELEASE_SHARED_BUFFER | Worker calls SharedBufferManager locally. Allocation returns buffer_id, name and size; release acceptance blocks new use and defers physical cleanup while access remains active or unresolved | Sections 6.10–6.11 and 6.13 |
 | ENCRYPT / DECRYPT / SIGN / VERIFY | Worker-side adapter acquires an execution-time buffer lease, calls ICrypto using trusted context/object metadata, and ends the lease when backend access is definitively complete | Section 6.12 |
 | Other Crypto operations | Adapter queries the configured callsign through IShell, invokes the mapped ICrypto method and releases the reference immediately after that call | Sections 6.7–6.9 |
@@ -2748,7 +3078,7 @@ failure; pop under the mutex and process after unlocking.
 A new request at the limit is rejected with RPC_STATUS_INTERNAL. A queued request
 has **10,000 ms from Gateway admission to the start of Dispatch**, measured with
 a monotonic clock. This is neither a backend execution timeout nor the client's
-15-second deadline. The client submission queue remains unlimited by count.
+15-second deadline. EyilClient uses a single submission slot; its pending-response map remains dynamic.
 
 Atomically arbitrate WAITING -> RUNNING against WAITING -> EXPIRED. The worker
 checks the original deadline before executing any service logic; expiry wins
@@ -2845,9 +3175,10 @@ Expose adopted values through product configuration supplied by CMake/BitBake;
 no public client API change is needed. Keep the existing error and delivery
 contracts: Gateway resource rejection emits an explicit ERROR log and returns
 RPC_STATUS_INTERNAL when a correlated reply is possible. Each response has one
-send attempt. The client's C++ submission queue remains dynamic with no fixed
-count cap; local allocation failures use CLIENT_OUT_OF_MEMORY. Finite transport
-high-water marks do not introduce a new client submission-queue limit.
+send attempt. EyilClient uses one submission slot and a dynamic pending-response
+map; local allocation failures use CLIENT_OUT_OF_MEMORY. Transport high-water
+marks can delay slot release through backpressure but do not create a local
+queue-full result.
 
 Apply message bounds at the client API and Gateway validation boundaries as
 well as in transport configuration. A libzmq ZMQ_MAXMSGSIZE rejection disconnects
@@ -3087,12 +3418,16 @@ sequenceDiagram
     R->>REG: Resolve ACTIVE context, transport binding and runtime admission
     REG-->>R: Retained context or rejection
     R->>R: Validate framing, envelope, schema, service and request ID
-    alt Request ID already belongs to an accepted request
+    alt Duplicate ID on this authenticated connection generation
         R->>R: Log ERROR with duplicate ID and original state, reject duplicate
         Note over R,C: Keep original completion, no competing reply under the same ID
     else Invalid request or admission closed
         R->>R: Log ERROR with exact rejection reason and available request context
         R-->>C: Mapped RpcStatus error when safely correlatable
+    else Service is UNSPECIFIED or has no registered handler
+        R->>R: Log ERROR unsupported_service with ID and connection, no payload logging
+        R-->>C: RPC_STATUS_UNSUPPORTED_SERVICE, echoed ID/service, schema 1, empty payload
+        Note over R,Q: One nonblocking error-response attempt, no worker or buffer/Crypto operation
     else Waiting-request count is already 1024
         R->>R: Log ERROR with waiting count and limit
         R-->>C: RPC_STATUS_INTERNAL, no accepted job
@@ -3172,10 +3507,21 @@ before calling Crypto, end that lease through FinishUse; a concurrently accepted
 release may then become eligible for cleanup. Once release is accepted, later
 response preparation/delivery failure cannot undo it, as defined in section 6.13.
 
-The same binary-envelope validation applies when a caller used a string API.
-For CRYPTO, the payload must still satisfy CryptoRequest. Plain text support
-needs the explicit routing and payload interpretation in TEXT-SERVICE-CONTRACT;
-do not bypass service validation or parse arbitrary text as a Crypto message.
+String APIs build a binary RpcRequest with service=RPC_SERVICE_UNSPECIFIED,
+schema 1, an assigned nonzero ID and raw text payload. After context/framing/
+schema/ID validation, reject that unregistered service with
+RPC_STATUS_UNSUPPORTED_SERVICE and log ERROR unsupported_service. Echo the ID,
+service=0 and schema 1, with empty payload. Do not parse CryptoRequest, acquire
+ICrypto, mutate buffers or consume a waiting-request slot for this rejection.
+The same rule handles other unregistered service values. CRYPTO still requires
+its normal serialized CryptoRequest; no format sniffing or text translation is
+performed. Common invalid-context/schema/duplicate-ID rules take precedence.
+
+The rejected string request uses the same bounded error-response allocation,
+original-transport validation and one-attempt send policy as other admission
+errors. If it cannot be delivered, log/drop rather than retry or send a second
+error. The client may then time out (sync) or receive no callback (async).
+Sections 5.8–5.9 define the response text only when a valid reply arrives.
 
 A job publishes completion rather than touching ROUTER. The handoff queue exists
 to transfer the result to its socket owner; it is not a retry queue. Process
@@ -3450,7 +3796,7 @@ CryptoResponse and checks CryptoError before using operation outputs.
 An operation name in a diagram identifies its payload; it is not another public
 EyilClient function. Shared-buffer allocation returns response bytes containing
 buffer_id, name and size, never a mapped pointer from EyilClient. String APIs
-need TEXT-SERVICE-CONTRACT and are not implicitly usable for these Crypto flows.
+receive Gateway UNSUPPORTED_SERVICE and are not usable for these Crypto operations in this version.
 
 Every dispatch follows the waiting-deadline, resource-reservation and accepted
 work-drain rules in section 6.6. Response arrows show the successful delivery
@@ -4772,7 +5118,7 @@ violates its preparation contract:
 - A frozen client must not occupy workers waiting to deliver replies. Bound the
   completion handoff and libzmq output storage. The 1,024 waiting-request limit
   and 10-second dispatch deadline do not limit bytes already queued by libzmq.
-  The client's own submission queue remains dynamic.
+  Client submission uses one slot; its pending-response map remains dynamic.
 - If an operation is still executing, retain its context and buffer leases
   until its actual completion. Freezing, an undelivered reply or a local timeout
   must not invalidate backend memory access. On thaw, a synchronous request whose
@@ -4916,7 +5262,7 @@ callback that initiated teardown.
 
 - Serialize RUNNING to DRAINING with request acceptance. An accepted request has
   its owned job/context/accounting published before the cutoff. Work still in
-  a client's queue or in libzmq without Gateway admission is not in that set.
+  a client's submission slot or in libzmq without Gateway admission is not in that set.
 - Block new RPC and authentication admission. Reply to a trustworthy rejected
   RPC with RPC_STATUS_INVALID_CONNECTION when its route permits; otherwise
   discard it safely. Do not invent a disconnect message or new status.
@@ -5109,7 +5455,7 @@ routing and lifecycle work without deferring the ICrypto dependency:
 1. Implement the FD/lifetime binding and fresh-runtime stop/reactivation
    contract. Apply the agreed client callback and synchronous local-close
    contracts, together with the selected 15-second
-   connect/sync-request/async-send deadlines, dynamic client queues and
+   connect/sync-request/async-send deadlines, the single client submission slot and
    CLIENT_OUT_OF_MEMORY handling, with no async response timeout. Disable ZeroMQ
    heartbeats on both ends. Implement terminal client loss, zero-linger queue
    disposal and explicit fresh reconnect. Keep app-owned freeze preparation and
@@ -5117,10 +5463,10 @@ routing and lifecycle work without deferring the ICrypto dependency:
    integration decisions remain separate.
 2. Implement the agreed RPC envelope, local error behavior and selected async
    completion contract. Document that contract in the public API. Add EyilClient's
-   owner loop, mutex-protected dynamic queue, pending map and shutdown. Prove
-   two callers can use one connection without touching its socket. Resolve
-   TEXT-SERVICE-CONTRACT before implementing string service routing and response
-   interpretation; both string request methods retain their required plain-text
+   owner loop, single slot with mutex/condition/wakeup, pending map and shutdown.
+   Prove callers wait/publish/claim/send independently of earlier responses.
+   Implement string service=0 requests and Gateway UNSUPPORTED_SERVICE replies,
+   including symbolic status text in both string methods. Preserve the plain-text
    public boundary.
 3. Implement startup, ZAP/interim identities, authentication-time CONNECTED,
    the registry and monitor binding. Prove multiple connections from one PID
@@ -5145,24 +5491,29 @@ routing and lifecycle work without deferring the ICrypto dependency:
 
 | Test scope | Scenario / evidence required |
 | --- | --- |
-| L1 client | Request IDs and response matching; duplicate/late replies; argument/output ownership; each waiter resolves once and each response callback runs at most once |
+| L1 client | Nonzero request IDs are never reused within a generation, including after failed submission/retirement; counter exhaustion cannot wrap; response matching and duplicate/late replies; argument/output ownership; each waiter resolves once and each response callback runs at most once |
 | L1 async send | API cannot return CLIENT_OK before zmq_send accepts the message; EAGAIN keeps the send waiter pending; timeout/error cancels unsent work with no callback; race acceptance against deadline and disconnect |
 | L1 async response | A response later than 15 seconds is delivered; no response timer exists; original callback signatures carry valid Gateway error responses; connection loss or local response-processing failure retires the record without an error callback |
 | L1 callback execution | Request calls from the I/O-owner callback return CLIENT_INVALID_ARGUMENT; freeing a response is allowed; callback runs without internal locks and may precede submitting-thread resumption |
 | L1 connection callbacks | Initial success and every startup failure produce no callback; later unexpected loss produces CLIENT_CONNECTION_LOST at most once; explicit close suppresses new callback claims; RESTORED and TERMINATED are never emitted, including after an explicit fresh connect |
-| L1 dynamic client queue | Grow submission/pending state independently of finite socket high-water marks when allocations succeed; producers push under the mutex and the owner processes outside it; no fixed client queue-count rejection |
+| L1 client submission slot | At most one published/claimed unsent request; competing callers wait with the mutex released; owner explicitly claims it; acceptance/failure frees the slot, sent requests remain independently pending; no queue container or queue-full result |
+| L1 slot waiting and cancellation | Occupy the slot with EAGAIN, keep receiving earlier responses/PAIR events, expire a competing caller without publication, and prove its request never sends; clear SEND_IN_PROGRESS after every nonaccepted attempt and apply latched cancellation before retry; race cancellation with acceptance and preserve accepted async CLIENT_OK |
+| L1 synchronous pre-send timeout | Expire a published/claimed sync request before TryBeginSend and prove no later send occurs; expire during an admitted attempt and resolve its actual outcome before returning CLIENT_TIMEOUT, even if accepted; verify the same behavior for both sync methods |
+| L1 request-specific retirement | Retire response/timeout for accepted A while B occupies the slot; B remains intact. Repeat completion/retirement for A and inject preparation failure after timeout/close; preserve each winning result and release each matching slot/reference once |
+| L1 premature response | Inject a response for a pending entry whose send is not yet accepted; discard/log it without callback, retirement or slot release. A fast valid reply after recorded acceptance still completes normally |
+| L1 slot-waiter teardown | Wake callers that have not entered the pending map on explicit close, transport loss and connection-wide decode allocation failure; propagate CLIENT_NOT_CONNECTED, CLIENT_COMMUNICATION_ERROR and CLIENT_OUT_OF_MEMORY respectively, without allocating or waiting for EMPTY; a later explicit close cannot overwrite the loss reason for already admitted callers |
 | L1 client startup allocation failures | Fail runtime, thread-start and owner-side setup allocation; CLIENT_OUT_OF_MEMORY leaves output NULL, closes partial resources and joins only started threads |
-| L1 client submission allocation failures | Inject failure during input copy, request/waiter creation, queue push, serialization and pending-map insertion; all four request APIs return CLIENT_OUT_OF_MEMORY before send acceptance, release partial state and cannot send later or invoke a callback |
+| L1 client submission allocation failures | Inject failure during input copy, request/waiter creation, serialization and pending-map insertion; all four request APIs return CLIENT_OUT_OF_MEMORY before send acceptance, release partial state and cannot send later or invoke a callback |
 | L1 client response allocation failures | Sync returns CLIENT_OUT_OF_MEMORY and NULL/0; matched async responses retire without a callback or revision of accepted CLIENT_OK, even before the submitter resumes; uncorrelatable decode failure follows connection-wide cleanup |
-| L1 client cleanup under allocation failure | Free/disconnect complete without allocating a queue action or temporary cleanup container; notification register/unregister allocate nothing and retain their specified outcomes |
-| L1 client deadlines | Sync uses one 15-second total budget through final byte/string result preparation and async only a 15-second send budget; queue cancellation cannot send work after returning failure |
+| L1 client cleanup under allocation failure | Free/disconnect complete without waiting for a free slot or allocating a control request/temporary cleanup container; notification register/unregister allocate nothing and retain their specified outcomes |
+| L1 client deadlines | Sync uses one 15-second total budget through final byte/string result preparation and async only a 15-second send budget; slot waiting uses the original budget and cancellation cannot send work after returning failure |
 | L1 terminal client loss | Retire unsent/pending work and uncommitted responses once; unresolved waiters get CLIENT_COMMUNICATION_ERROR, accepted async submissions retain CLIENT_OK without error callbacks; preserve committed/app-owned responses and reject new requests on the lost handle |
-| L1 explicit client disconnect | Close with queued sync/async/string calls; unresolved waiters return CLIENT_NOT_CONNECTED with cleared outputs, accepted async sends retain CLIENT_OK, pending IDs and undelivered responses retire once; cancelled actions never send later |
+| L1 explicit client disconnect | Close with sync/async/string calls waiting for or occupying the slot; unresolved waiters return CLIENT_NOT_CONNECTED with cleared outputs, accepted async sends retain CLIENT_OK, pending IDs and undelivered responses retire once; cancelled actions never send later |
 | L1 disconnect races and callbacks | Race close against send acceptance, timeout, response claim and transport loss; preserve one result, suppress intentional-close events, release every live-call guard and wait for claimed callbacks; no callback or state access after return |
-| L1 plain-string APIs | Both string methods copy to the first NUL with no size argument or caller encoding; exercise empty strings, whitespace and line breaks as data, text bounds, caller input reuse and allocation failures; append one response terminator and reject unrepresentable response text without truncation |
+| L1 plain-string APIs | Both string methods copy to the first NUL with no size argument or caller encoding; exercise empty strings, whitespace and line breaks as data, text bounds, caller input reuse and allocation failures; copy the received non-OK RpcStatus name with one response terminator; reject unknown/UNSPECIFIED status, unexpected OK and nonempty error payload |
 | L1 string completion races | Race response-text preparation with the synchronous deadline, explicit close and transport loss; no intermediate binary success escapes, the winning result is preserved, and any losing prepared string is freed |
-| L2 text/service mapping | Once TEXT-SERVICE-CONTRACT is defined, verify routing, request interpretation and text responses including Gateway/service errors over binary Protobuf IPC; never parse arbitrary text as a CryptoRequest |
-| L1 Gateway | Envelope/oneof validation; context lookup; queued/in-flight ownership; enum/presence mapping; allocation rollback |
+| L2 string rejection | Both string APIs send raw text in a service=0 RpcRequest; Gateway logs ERROR and returns correlated UNSUPPORTED_SERVICE with empty payload before worker admission; sync returns CLIENT_OK plus exact status text, async receives that text through its response callback; no ICrypto call or invented text service |
+| L1 Gateway | Envelope/oneof validation; context lookup; queued/in-flight ownership; enum/presence mapping; allocation rollback; the same numeric request ID on two authenticated connections is independent, while a duplicate of tracked work in one connection cannot replace its completion |
 | L1 Gateway rejection logging | Invalid service payload, buffer quota, competing buffer uses, uses after releasePending and invalid/repeated releases produce RPC_STATUS_INTERNAL with empty payload and an ERROR log identifying the exact cause and known request/connection context; a first valid release of a busy buffer succeeds; duplicate request IDs cannot dispatch twice or replace the original completion; unsafe correlation logs/drops without a fabricated reply; logs contain no payload or key material |
 | L1 Gateway queue | 1,024 global waiting slots include staged/pool-queued jobs; saturation rejects with RPC_STATUS_INTERNAL; allocation failure rolls back credit; control cleanup remains possible |
 | L1 Gateway dispatch deadline | Expire after 10,000 ms without starting; include pool queue time; race expiry against Dispatch; exactly one result and no backend execution after expiry; do not time out running calls |
@@ -5494,9 +5845,9 @@ contracts.
 | RECONNECT-LIFECYCLE | Future platform requirements, absent from the supplied ACs, for automatic reconnect, retry, reauthentication or session restoration and any use of RESTORED/TERMINATED. The initial delivery is already defined: cleanup and explicit fresh connect, no automatic reconnect, and only later unexpected loss emits CLIENT_CONNECTION_LOST |
 | CHECKPOINT-RESTORE | Platform-specific behavior when hibernation replaces a process or descriptors; ordinary connection loss already requires cleanup and explicit fresh reconnect, while an idle freeze preserving the connection does not |
 | CLIENT-MONITOR | Confirm the monitor-responsibility checklist in section 5.2 and whether PAIR plus the I/O owner satisfies the AC, or a distinct OS thread is mandatory |
-| TEXT-SERVICE-CONTRACT | Service selection for plain-string calls, Gateway payload identification/interpretation and response text including RpcStatus/service errors; NUL-terminated input/output and no caller encoding are already agreed |
+| FUTURE-TEXT-SERVICE | Successful execution of text commands needs a separately defined service route and request/response semantics. Current behavior is settled: service=0 is rejected by Gateway with UNSUPPORTED_SERVICE and exposed as status text; this future feature does not block the selected rejection path |
 | BUFFER-HELPER | Ownership of app-side shm_open/mmap helpers, output validation and release coordination |
-| RESOURCE-LIMITS | Validate and select product values from the [resource-sizing proposals in section 6.2](#proposed-initial-resource-sizing): message/response byte limits, queue byte budgets, libzmq high-water marks, worker count/stacks and shared-buffer quotas; the agreed Gateway waiting limit remains 1,024/10 seconds and response slots remain 128 per connection/1,024 globally; client queue has no fixed count cap |
+| RESOURCE-LIMITS | Validate and select product values from the [resource-sizing proposals in section 6.2](#proposed-initial-resource-sizing): message/response byte limits, queue byte budgets, libzmq high-water marks, worker count/stacks and shared-buffer quotas; the agreed Gateway waiting limit remains 1,024/10 seconds and response slots remain 128 per connection/1,024 globally; client uses one submission slot and has no fixed pending-response count cap |
 
 ### 7.3 Integration and validation work
 
@@ -5519,7 +5870,7 @@ health monitor is introduced. AppManager/RuntimeManager authentication and
 optional lifecycle integration remain at the marked TODO seams. The app-owned
 idle process-freeze preparation, 15-second connect/sync-request/async-send
 deadlines, no async response
-timeout and dynamic client queues with allocation-failure reporting are selected.
+timeout and a single client submission slot with allocation-failure reporting are selected.
 ZeroMQ transport heartbeats are disabled on both ends; application heartbeat and inactivity-watchdog
 logic are excluded. Connection loss retires old pending work and transport queues;
 automatic reconnect is disabled and explicit reconnect creates fresh state.
