@@ -1075,9 +1075,9 @@ Keep the proposal's app-namespace backend path for this version. The discussed
 `/proc/<gateway-pid>/fd/<fd>` alternative is not selected: it would require
 different procfs/open rules and still would not prove that the correct peer
 namespace was captured initially or prevent modification/truncation. The
-existing path remains subject to the process-instance and backend-access
-validation in section 7.1; the trusted-app cooperation rule does not prove
-those properties.
+existing path remains subject to backend-completion validation in section 7.1
+and process-instance binding under SHM-IDENTITY in section 7.2; the trusted-app
+cooperation rule does not prove those properties.
 Retain the original shared-memory directory FD and generated relative filename
 for Gateway cleanup, using unlinkat() against that directory after backend
 access ends. Close the directory reference after its last allocation is cleaned

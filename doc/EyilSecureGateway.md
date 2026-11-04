@@ -753,61 +753,35 @@ crash, authentication-time CONNECTED and owned response handoff with one send
 attempt are also selected. Crypto owns safe access, validation and its internal
 session/key/recovery implementation. Gateway forwards returned errors.
 
-Section 7.1 describes the abnormal backend-completion boundary and distinguishes
-it from the process-instance binding needed before namespace capture. Section
-7.2 lists remaining API/product choices and future platform requirements.
+Section 7.1 describes a backend-completion edge case and a potential backend
+contract. Section 7.2 lists remaining API/product choices and future platform
+requirements, including process-instance binding before namespace capture.
 Section 7.3 separates integration and verification from unresolved design decisions.
 
 ### 7.1 Abnormal backend completion: lifecycle integration boundary
 
-**Defined behavior:** a completed synchronous ICrypto invocation, including a
-returned service error, ends its buffer access under the backend contract.
-Gateway ends active-use accounting and triggers eligible pending release or
-connection cleanup. A valid release closes the ID to further use immediately
-and succeeds even while access is active; it retains the object and quota until
-physical cleanup. The trusted app requests release after errors when it knows
-the buffer ID and has a usable connection. App crash/disconnect needs no release
-RPC and transfers remaining reclamation to Gateway's normal drain/notification/
-cleanup path. Deferred release is selected behavior, not an unresolved policy.
+**Normal case:** the client times out after 15 seconds, but Crypto completes at
+20 seconds. Gateway observes that completion and can finish an accepted deferred
+release under the normal cleanup rules. A completed invocation returning a
+defined CryptoError also ends that operation's buffer access.
 
-A 15-second synchronous client timeout retires the client request ID without
-cancelling backend work. The Gateway still observes its own ICrypto invocation
-and handles its eventual result. An accepted release remains pending while that
-access continues, then completion triggers cleanup. Disconnect cleanup retains
-the same safety rule and notification ordering. A late response is discarded
-by the client without cancelling cleanup. None of these normal paths needs an
-additional completion protocol, release retry or fixed destruction deadline.
+**Potential backend/integration requirement — to confirm:** when an ICrypto
+call returns to Gateway, no backend work from that invocation may continue
+accessing its shared buffer. This guarantee should cover successful returns,
+service errors and invocation failures. A client-side timeout is not a return
+from Gateway's ICrypto call.
 
-**Remaining lifecycle question:** if an abnormal remote ICrypto invocation
-fails without establishing that backend memory access ended, what existing
-backend/platform evidence permits Gateway to finish retained-resource cleanup?
-A defined CryptoError is already a completed invocation; a communication failure
-with an uncertain remote outcome is the exceptional case. Do not infer safe
-completion merely because the client disconnected or its local wait expired.
+**Edge case to verify:** COM-RPC may return a communication error while the
+remote Crypto operation is still running. Confirm that the backend and COM-RPC
+integration can uphold the proposed guarantee. If they cannot, reliable evidence
+that access ended is required before cleanup. Until then, Gateway retains the
+buffer references, quota and pending cleanup; disconnect or a failed
+DISCONNECTED notification alone is not completion evidence. Deferral protects
+the buffer but does not prove that Crypto finished.
 
-Gateway accepts release and keeps affected references, quota and private cleanup
-state until access is known to have ended. Completion evidence makes the same
-deferred-cleanup path eligible; deferral itself is not evidence that a remote
-call finished. A failed DISCONNECTED notification also cannot end an unresolved
-access obligation. Gateway does not implement Crypto recovery, health polling,
-operation replay or forced termination of an in-process worker. A non-returning
-backend also remains subject to the platform's lifecycle policy. The required
-failure/termination evidence belongs at the backend/platform integration
-boundary, not in a new app-facing EyilClient API.
-
-Trusting the app closes the question about enforcing no-mutation/no-resize/
-no-unlink rules against that app in this version. Retained allocation/directory
-references protect objects already captured; they do not prove that the PID
-still identifies the original process when its namespace is first opened.
-That process-instance binding remains a platform validation/design boundary,
-separate from trusting the app and from parallel buffer ordering. No replacement
-namespace-capture mechanism is selected here.
-
-**Scope:** exceptional backend/platform lifecycle handling. The supplied ACs
-require notification and connection-resource cleanup; they do not prescribe a
-retry mechanism, health observer or forced cleanup deadline. This boundary is
-not an additional AC requirement or a claim that the defined normal cleanup
-flow fails AC1.12.
+This is a backend/platform lifecycle requirement to confirm, not a new AC or
+EyilClient API. The existing deferred-release and notification ordering remain
+defined in sections 6.13–6.16.
 **TODO:** SHM-COMPLETION.
 
 ### 7.2 Remaining API and platform decisions
@@ -829,6 +803,7 @@ contracts.
 | CLIENT-MONITOR | Confirm the monitor-responsibility checklist in section 5.2 and whether PAIR plus the I/O owner satisfies the AC, or a distinct OS thread is mandatory |
 | FUTURE-TEXT-SERVICE | Successful execution of text commands needs a separately defined service route and request/response semantics. Current behavior is settled: service=0 is rejected by Gateway with UNSUPPORTED_SERVICE and exposed as status text; this future feature does not block the selected rejection path |
 | BUFFER-HELPER | Ownership of app-side shm_open/mmap helpers, output validation and release coordination |
+| SHM-IDENTITY | Bind the peer's original process instance before first opening its shared-memory namespace. Retained directory/object references protect captured resources but do not prove that a PID has not been reused before capture. The trusted-app cooperation contract does not establish this binding; the mechanism remains to be selected/validated |
 
 ### 7.3 Integration and validation work
 
