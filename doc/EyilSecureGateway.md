@@ -126,9 +126,10 @@ WHEN Firebolt Apps and Eyil Gateway are running in the sytem
 
 The following implementation decisions and proposals describe the design; they
 are not additional acceptance criteria. The original separate-thread and
-nonblocking wording remains in AC1.7. Private-pool scheduling, queue/deadline
-limits, callback behavior, lifecycle ordering and protocol handling below must
-be reviewed against the unchanged ACs. The proposed client monitor consolidation
+nonblocking wording remains in AC1.7. Private-pool scheduling, receive pauses,
+worker-start deadlines, callback behavior, lifecycle ordering and protocol
+handling must be reviewed against the unchanged ACs. The proposed client monitor
+consolidation
 remains explicitly subject to the AC2-Client.4 confirmation in section 5.2.
 
 Each accepted request has an independent dispatch job on the fixed private
@@ -445,7 +446,7 @@ carry local ClientResult errors.
 
 | Situation | ClientResult | Response handling |
 | --- | --- | --- |
-| Invalid arguments, oversized string input or invalid caller-supplied binary request envelope | CLIENT_INVALID_ARGUMENT | No response |
+| Invalid arguments, lengths that the actual API cannot safely represent or invalid caller-supplied binary request envelope | CLIENT_INVALID_ARGUMENT | No response |
 | client_register_notifications is called | CLIENT_NOT_IMPLEMENTED | Reserved for future support; no handler is stored or invoked |
 | client_connect receives a valid, already allocated Client handle in the caller's slot | CLIENT_ALREADY_CONNECTED | Preserve the existing handle and connection state; create no new connection and invoke no callback |
 | Submission without a usable connection | CLIENT_NOT_CONNECTED | No response |
@@ -490,10 +491,12 @@ the one submission slot within their original deadline. There is no submission
 container or queue-full result. Allocation failure in owned request state or
 the dynamic pending-response map uses CLIENT_OUT_OF_MEMORY. A busy slot alone
 is not an allocation failure; expiry while waiting uses CLIENT_TIMEOUT.
-Gateway allows at most 1,024 requests waiting for a private-pool worker, with
-a 10-second deadline to start dispatch. Queue saturation, expiry before dispatch
-and request/job/response infrastructure allocation failure map to
-RPC_STATUS_INTERNAL when a correlated reply can be constructed and sent.
+Gateway retains one current admitted request and has no request waiting queue.
+If no private worker can start it, pause further ROUTER receives while continuing
+replies/control processing. A ten-second worker-start timeout logs ERROR
+worker_pool_exhausted and returns RPC_STATUS_INTERNAL with empty payload when
+deliverable; the expired request must never execute later. Request/job/response
+allocation failure uses the same RPC status with its own diagnostic reason.
 Shared-buffer allocation and validation failures use the CryptoError mapping
 below. Neither remote failure becomes a local CLIENT_OUT_OF_MEMORY result
 in EyilClient.
@@ -518,7 +521,7 @@ the operation automatically or claim that its shared buffer is safe to reuse.
 | UNSUPPORTED_SERVICE (4) | No registered service, including service=UNSPECIFIED used by the unsupported string path; log ERROR and return empty payload |
 | MALFORMED_REQUEST (5) | Cannot decode the outer RPC envelope or its framing; service-payload decoding failures use INTERNAL as specified below |
 | INVALID_CONNECTION (6) | Missing, stale or inadmissible authenticated connection context |
-| INTERNAL (7) | Gateway infrastructure or service-message decoding failure: full 1,024-entry waiting queue, 10-second dispatch-wait expiry, request/job/response allocation failure, null ICrypto lookup or failed invocation when a correlated reply is possible. Shared-buffer service outcomes use the CryptoError table below |
+| INTERNAL (7) | Gateway infrastructure or service-message decoding failure: ten-second current-request worker-start timeout, request/job/response allocation failure, null ICrypto lookup or failed invocation when a correlated reply is possible. Shared-buffer service outcomes use the CryptoError table below |
 
 #### Gateway faults, buffer service outcomes and explicit error logging
 
@@ -533,7 +536,8 @@ Gateway without ICrypto. Use the existing schema; no new error enum is required.
 | --- | --- | --- |
 | Duplicate ID still owned by an accepted request on the same connection generation | No second response; log and discard the duplicate | Duplicate ID and original request state; preserve the original completion |
 | Undecodable service message or operation/oneof mismatch | RPC_STATUS_INTERNAL, empty payload | Exact parse/structure failure; no service execution |
-| Request queue full, dispatch-wait expiry or request/job/response infrastructure allocation failure | RPC_STATUS_INTERNAL, empty payload | Failing stage, usage/limit, deadline or allocation result |
+| Current request cannot start on a private worker within 10 seconds | RPC_STATUS_INTERNAL, empty payload | ERROR worker_pool_exhausted; configured/running/reserved workers, elapsed wait, request ID/service and connection generation; never execute it later |
+| Request/job/response infrastructure allocation failure | RPC_STATUS_INTERNAL, empty payload | Failing allocation/preparation stage and result, distinct from worker saturation; preserve cleanup ownership |
 | Null ICrypto lookup or failed Core::hresult invocation | RPC_STATUS_INTERNAL, empty payload | Configured callsign, operation and lookup/invocation result; do not consume undefined outputs |
 | Invalid output region returned as a successful backend result | RPC_STATUS_INTERNAL, empty payload | Returned bounds and recorded capacity; expose no unusable output |
 
@@ -597,7 +601,7 @@ responses. Log any delivery failure separately and drop the reply without a
 retry. An error result does not acknowledge buffer release or prove that an
 earlier operation finished. Sections 6.10–6.13 define execution-time buffer
 checks, rejection of competing uses and deferred destruction after an accepted
-release. Gateway does not preserve queued buffer operations through a release
+release. Gateway does not preserve not-yet-started buffer uses through a release
 or replay rejected work.
 
 An accepted release returns RPC_STATUS_OK with CRYPTO_ERROR_NONE and the empty
@@ -644,7 +648,8 @@ ROUTER receives `[routing_id][RpcRequest bytes]` and replies with
 `[routing_id][RpcResponse bytes]`; DEALER receives the response body only.
 There is no empty REQ delimiter.
 Validate the frame count and consume/reject an entire malformed multipart
-message before accepting another. Define size and frame limits explicitly.
+message before accepting another. The required frame count is explicit; no
+additional message-byte cap applies. Retain representation and arithmetic checks.
 
 String API input does not change this framing: EyilClient constructs the binary
 RpcRequest internally and sends it with its serialized length. Gateway still
@@ -657,8 +662,9 @@ identity. ZAP's User-Id is a different identifier.
 
 Each DEALER and ROUTER has one socket-owning thread. Client API callers hand
 work to their owner through one synchronized submission slot and a wakeup.
-Gateway workers hand results to ROUTER through its completion queue. Neither
-application callers nor Gateway workers send or receive on the owner's socket. This follows the restrictions for these socket types in the
+Gateway workers hand owned results to ROUTER through its completion handoff.
+Neither application callers nor Gateway workers send or receive on the owner's
+socket. This follows the restrictions for these socket types in the
 [ZeroMQ socket API](https://libzmq.readthedocs.io/en/latest/zmq_socket.html).
 Socket options, connection, monitoring and closure follow the same ownership.
 
@@ -676,7 +682,7 @@ no new metrics service, app API or mandatory request-tracing system is required.
 
 | Severity | Events and required context |
 | --- | --- |
-| ERROR | Gateway faults and buffer/service failures from section 4.2; startup/configuration or required-libzmq-capability failure; ICrypto lookup/invocation failure; response allocation/send failure; shared-memory creation or deferred-cleanup failure. Record the failing stage and result/errno when available. |
+| ERROR | worker_pool_exhausted after the ten-second worker-start wait, with total/running/reserved counts and request identity; Gateway faults and buffer/service failures from section 4.2; startup/configuration or required-libzmq-capability failure; ICrypto lookup/invocation failure; response allocation/send failure; shared-memory creation or deferred-cleanup failure. Record the failing stage and result/errno when available. |
 | WARNING | Client deadline expiry, unexpected connection loss, an accepted async record retired without a deliverable response, and unresolved backend-access/cleanup obligations. Include the reason and number of affected records; normal idle connections and prepared process freeze are not warnings. |
 | INFO | One activation/readiness summary with relevant configured limits and libzmq version/capability-check outcome; one orderly stop/drain summary. Routine successful requests, buffer operations and explicit client disconnects need no per-operation INFO log. |
 | DEBUG / TRACE | Optional, disabled-by-default investigation of sequencing or individual successful operations. Never enable full request-flow tracing by default to compensate for missing error context. |
@@ -695,8 +701,8 @@ rejections, timeouts, dropped replies, outstanding async records and deferred
 cleanup at shutdown or on a diagnostic request. Do not add periodic polling,
 per-request INFO traces or a new externally exposed metrics contract.
 
-Diagnostics must not hold registry/queue locks, block a socket owner or require
-another allocation to finish an error/cleanup path. Failure to log cannot
+Diagnostics must not hold registry/dispatcher/completion locks, block a socket
+owner or require another allocation to finish an error/cleanup path. Failure to log cannot
 change a ClientResult/RpcStatus, cancel backend access or lose cleanup ownership.
 
 ## 5. EyilClient design and API flows
@@ -726,7 +732,7 @@ verification scenarios remain part of the specification.
 
 | Detailed guide | Content |
 | --- | --- |
-| Sections 6.1–6.3 | Component/API-call diagram, socket owners, private pool, queue/response limits, proposed sizing and synchronization |
+| Sections 6.1–6.3 | Component/API-call diagram, socket owners, private pool, current-request receive pause, resource policy and synchronization |
 | Sections 6.4–6.9 | Activation, ZAP, request dispatch, ICrypto ownership/configuration and service operations |
 | Sections 6.10–6.13 | Shared-memory identity, allocation, four Crypto flows, conflicting uses, accepted release and deferred destruction |
 | Sections 6.14–6.16 | Disconnect binding, required libzmq extension, capability checks, freeze, backend failures and plugin teardown/reactivation |
@@ -743,7 +749,7 @@ destruction, quota retention and disconnect/drain ordering are specified in
 sections 6.10–6.14. They are not open design questions.
 
 FD/lifetime binding, graceful plugin stop/reactivation, fresh startup after a
-crash, authentication-time CONNECTED and bounded response handoff with one send
+crash, authentication-time CONNECTED and owned response handoff with one send
 attempt are also selected. Crypto owns safe access, validation and its internal
 session/key/recovery implementation. Gateway forwards returned errors.
 
@@ -815,7 +821,7 @@ contracts.
 | --- | --- |
 | AUTH-APPMANAGER | Formal UID lookup via AppManager/RuntimeManager, authoritative app/app-instance identity, UID reuse guarantees and lookup failure behavior; no independent static UID-to-appId map. Interim appIds use reserved `eyil-interim:` prefix; agree Crypto's handling of that marker for identity-dependent key policy |
 | AUTHENTICATION-PROGRESS | Define a bound on waiting for authentication-time CONNECTED and lifecycle-worker capacity if needed. Platform startup ordering is selected; it does not bound an ICrypto call. A client timeout cannot cancel a running call, and any abandoned exchange must retain cleanup ownership for a late result |
-| ENDPOINT-OWNERSHIP | Implement and validate the selected native listener/ZMQ_USE_FD ownership and stale-path recovery rules. Select server identity protection for the target's user namespaces: the tested overflow UID/PID-0 tuple is ambiguous. Keep the AC endpoint unchanged; section 7.4 records the evidence and remaining deployment choices |
+| ENDPOINT-OWNERSHIP | Implement and validate the selected native listener/ZMQ_USE_FD ownership and stale-path recovery rules. Select server identity protection for the target's user namespaces: an overflow UID/PID-0 tuple is ambiguous. Keep the AC endpoint unchanged; section 7.4 defines the risks and remaining deployment choices |
 | API-AUTHORIZATION | Exact entitlement format and mapping from service/operation to allowed APIs; currently all supported APIs are allowed |
 | LIFECYCLE-EVENTS | Whether/how to integrate stop, destruction or platform hibernation events; application-owned freeze preparation is agreed, and transport heartbeats remain disabled independently of future observers |
 | RECONNECT-LIFECYCLE | Future platform requirements, absent from the supplied ACs, for automatic reconnect, retry, reauthentication or session restoration and any use of RESTORED/TERMINATED. The initial delivery is already defined: cleanup and explicit fresh connect, no automatic reconnect, and only later unexpected loss emits CLIENT_CONNECTION_LOST |
@@ -823,7 +829,6 @@ contracts.
 | CLIENT-MONITOR | Confirm the monitor-responsibility checklist in section 5.2 and whether PAIR plus the I/O owner satisfies the AC, or a distinct OS thread is mandatory |
 | FUTURE-TEXT-SERVICE | Successful execution of text commands needs a separately defined service route and request/response semantics. Current behavior is settled: service=0 is rejected by Gateway with UNSUPPORTED_SERVICE and exposed as status text; this future feature does not block the selected rejection path |
 | BUFFER-HELPER | Ownership of app-side shm_open/mmap helpers, output validation and release coordination |
-| RESOURCE-LIMITS | Validate and select product values from the [resource-sizing proposals in section 6.2](EyilGateway.md#proposed-initial-resource-sizing): message/response byte limits, queue byte budgets, libzmq high-water marks, worker count/stacks and platform memory/tmpfs sizing. Initial buffer limits are 32 MiB per buffer, 4 buffers and 128 MiB per connection, as specified by the shared-memory proposal, with no additional global shared-memory cap; the agreed Gateway waiting limit remains 1,024/10 seconds and response slots remain 128 per connection/1,024 globally; client uses one submission slot and has no fixed pending-response count cap |
 
 ### 7.3 Integration and validation work
 
@@ -834,7 +839,8 @@ unresolved Gateway architecture gaps.
 | --- | --- |
 | ZMQ-PLATFORM | Integrate the included [libzmq 4.3.4 patch](zmq_connection_lifetime.patch) into the product build and Gateway consumers; enable draft APIs, probe option 10001 and run the bounded private-IPC behavioral self-test before production bind/admission, validate ZAP/request metadata and version-2 FD/lifetime events, and guard ROUTER sends. Monitor version 2 alone does not identify the patch. Test the exact rootfs binary and activation failure with an incompatible library; section 6.14 defines the contract |
 | DEPLOYMENT | Configure and verify UDS mounts across endpoint recreation, permissions, procfs/user-namespace access, private /dev/shm and blocked direct Crypto communicator access. Confirm platform ownership of leftover storage after a crash; Gateway starts fresh and does not reconstruct or blindly unlink old allocations |
-| Private Thunder pool | Validate nonblocking job handoff, ownership transfer, capacity wakeups and drain against the target Thunder API; keep application jobs off the global pool and preserve the 1,024-entry/10-second waiting contract |
+| Resource policy | Apply the [initial resource policy in section 6.2](EyilGateway.md#initial-resource-policy): four private workers, default stacks, default libzmq HWM and kernel buffers; no additional message/text or response-count/byte caps. Shared memory follows 32 MiB per buffer, four buffers and 128 MiB per connection, with no global cap. No Gateway request queue exists; the current request pauses further receives while waiting up to ten seconds for a worker. Validate memory/representation behavior without inventing extra admission limits |
+| Private Thunder pool | Validate nonblocking transfer to reserved execution capacity, worker-start acknowledgement, wakeups and drain against Thunder; four private workers, no application backlog in the pool. While the current RPC waits, pause only new receives; after ten seconds return INTERNAL and log worker_pool_exhausted, with no later execution |
 | SDK and runtime dependencies | Supply the selected topic/crypto ICrypto headers/bindings, configured Crypto callsign and matching Thunder interfaces. Platform/Thunder coordination starts Crypto before Gateway and completes Gateway drain before stopping Crypto. Validate per-call references, authentication-time CONNECTED and ordered DISCONNECTED without a Crypto health observer |
 | Diagnostics | Verify section 4.5: actionable ERROR/WARNING context, bounded startup/stop INFO summaries, suppression counts for repeated errors, no sensitive content and no default full request-flow tracing |
 | Runtime acceptance | Exercise the L1/L2 scenarios in section 6.17 on the intended dependency set and device, including concurrent requests, response drops, stop/reactivation and prepared process freeze |
@@ -924,32 +930,17 @@ ZMQ_FD is a poll-notification descriptor and must not be used for SO_PEERCRED;
 do not use a possibly stale monitor FD for security checks either. Verify the
 actual connector and credential behavior on the target platform.
 
-**Target evidence, 2026-11-04:** the inspected Xione device runs Linux 4.9.119
-on ARMv7. Two sampled Dobby app user namespaces map app UID 0 to host UID 30003
-or 30007; host root is unmapped. An isolated kernel probe read credentials of
-two live test peers from each app's user/PID namespaces:
+An unmapped UID/GID and PID 0 can describe more than one peer outside the
+client's namespaces. Such a tuple must not be treated as a trusted server
+identity. A connector hook using the same namespace-relative credentials does
+not resolve that ambiguity.
 
-| Test peer's host identity | UID / GID / PID returned by SO_PEERCRED in either sampled app namespace |
-| --- | --- |
-| Host UID/GID 0 | 65534 / 65534 / 0 |
-| Unrelated host UID/GID 12345 | 65534 / 65534 / 0 |
-
-Accepting overflow UID plus PID 0 would accept both. A new connector hook using
-the same syscall cannot distinguish them. This matches Linux's
-[credential translation](https://github.com/torvalds/linux/blob/v4.9/net/core/sock.c)
-and rules out that tuple as server authentication on the inspected deployment.
-The probe used private test sockets/processes; it did not run EyilClient or
-communicate with the production Gateway endpoint.
-
-Separate native libzmq 4.3.4 probes received kernel UID/GID/PID in the client's
-reply `Peer-Address`, with stock and both reviewed patched builds. This supports
-evaluating a harmless startup request/reply for products where the trusted UID
-is distinguishable; it does not solve the target namespace ambiguity. No libzmq
-was found in the inspected target host or sampled app filesystem views, so
-its deployed message-metadata behavior remains unverified. A service=0 request
-would receive UNSUPPORTED_SERVICE, not invoke an existing no-op API. Such a
-startup exchange would change the current handshake-only readiness barrier and
-is not selected here. The current patch adds no server-verification hook.
+A harmless startup request/reply using native Peer-Address metadata is an
+alternative only if the configured trusted identity is distinguishable and
+the installed libzmq preserves that metadata. A service=0 request receives
+UNSUPPORTED_SERVICE; it is not an existing no-op API. Adding this exchange
+would change the selected handshake-only readiness barrier and is not selected
+here. The current connection-lifetime patch adds no server-verification hook.
 
 A root-controlled parent directory is an alternative when deployment can
 preserve the required URI in the relevant mount namespaces. Directly changing
@@ -961,7 +952,7 @@ endpoint creators, a namespace mapping exposing a distinct trusted service
 identity, or another authenticated bootstrap mechanism. This requires a platform
 deployment contract, not necessarily a RuntimeManager API call. Listener
 ownership is selected above; server identity protection remains open. These
-are design requirements and evidence, not claims of implemented Gateway code.
+are design requirements, not claims of implemented Gateway code.
 
 **Integration boundary:** Gateway has a required dependency on the topic/crypto
 ICrypto API and uses the deployed Crypto plugin through the CMake-configured

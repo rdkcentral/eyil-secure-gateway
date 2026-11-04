@@ -826,7 +826,7 @@ sequenceDiagram
             API->>C: Wait until startup result is terminal or deadline expires
             Note over API,IO: Caller waits, I/O owner continues running
             IO->>Z: Create context and DEALER
-            IO->>Z: Set PLAIN credentials, bounds, RECONNECT_IVL=-1, IMMEDIATE=1 and<br/>LINGER=0
+            IO->>Z: Set PLAIN credentials, default HWM, MAXMSGSIZE=-1,<br/>RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0
             IO->>Z: Set ZMQ_HEARTBEAT_IVL, TIMEOUT and TTL to 0 before connect
             Note over IO,GW: Transport heartbeats disabled on DEALER and ROUTER
             IO->>Z: Enable DEALER monitoring at the unique inproc endpoint
@@ -965,7 +965,7 @@ sequenceDiagram
     opt Pointer arguments valid
         API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
         opt Admitted on an allowed application thread
-            API->>API: F1 Parse and own RpcRequest, validate nonzero service and<br/>bounded input
+            API->>API: F1 Parse and own RpcRequest, validate nonzero service and<br/>safe length representation
             opt Preparation succeeds
                 API->>W: Initialize owned Request, mode, generation and completion state
             end
@@ -1068,10 +1068,11 @@ return releases the call guard and prepared storage, with NULL/0 outputs.
 
 Before dereferencing outputs, validate their addresses; clear every supplied
 output even if another required argument is missing. Require a non-NULL live
-Client, non-NULL input with nonzero bounded length, and both output pointers.
+Client, non-NULL input with nonzero representable length, and both output pointers.
 An empty/default envelope or RPC_SERVICE_UNSPECIFIED is invalid. Other numeric
 service values can reach Gateway, which determines support. Validate Protobuf
-parsing and common message limits without interpreting the service payload.
+parsing and safe length conversions without imposing a message-size policy cap
+or interpreting the service payload.
 Caller-supplied request_id and schema_version are ignored and overwritten.
 
 The request record owns its parsed data, completion state and connection
@@ -1367,8 +1368,10 @@ The 15-second synchronous deadline includes preparation and waiting for the
 single slot. The pending-response map grows dynamically; detected allocation
 failures use CLIENT_OUT_OF_MEMORY. A busy slot waits or times out, with no
 local queue-full result. Section 5.14 defines terminal loss and explicit reconnect.
-Section 5.13 defines explicit-close results and callback quiescence. Per-message
-size bounds remain under RESOURCE-LIMITS in section 7.2.
+Section 5.13 defines explicit-close results and callback quiescence. The
+[resource policy in section 6.2](EyilGateway.md#initial-resource-policy) applies
+no additional message-size cap and retains transport defaults; safe
+representation and arithmetic checks remain mandatory.
 
 ### 5.7 client_send_request_async()
 
@@ -1395,7 +1398,7 @@ sequenceDiagram
     opt Pointer arguments valid
         API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
         opt Admitted on an allowed application thread
-            API->>API: F1 Parse and own RpcRequest, validate nonzero service and<br/>bounded input
+            API->>API: F1 Parse and own RpcRequest, validate nonzero service and<br/>safe length representation
             opt Preparation succeeds
                 API->>W: Initialize owned Request, mode, generation and completion state
             end
@@ -1565,7 +1568,7 @@ sequenceDiagram
     opt Pointer arguments valid
         API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
         opt Admitted on an allowed application thread
-            API->>API: F1 Scan to first NUL within bound, copy text, build service<br/>UNSPECIFIED envelope
+            API->>API: F1 Copy valid text through the first NUL, check size arithmetic,<br/>build service UNSPECIFIED envelope
             opt Preparation succeeds
                 API->>W: Initialize owned Request, mode, generation and completion state
             end
@@ -1665,10 +1668,11 @@ sequenceDiagram
 
 #### Plain-string ownership and local failures
 
-The caller keeps input valid and unchanged until the API returns. Scan within
-the configured text bound, own the bytes before publication and keep explicit
-binary lengths during Protobuf serialization and ZMQ transmission. The first
-NUL ends input: "abc\0def" supplies "abc" only. Empty input still reaches the
+The caller supplies a valid NUL-terminated string and keeps it unchanged until
+the API returns. Scan to the first NUL without an additional text-size cap, own
+the bytes before publication and use checked lengths during Protobuf
+serialization and ZMQ transmission. The first NUL ends input: "abc\0def"
+supplies "abc" only. Empty input still reaches the
 same unsupported-service response. Never measure a serialized envelope using
 strlen(), decode caller text as Protobuf, or infer a Crypto operation from it.
 
@@ -1678,7 +1682,8 @@ client_free_response. CLIENT_OK means the remote error response was delivered;
 it does not mean the text operation succeeded. A successful string result is
 never NULL and is never binary Protobuf disguised as a C string.
 
-Invalid arguments or oversized input return CLIENT_INVALID_ARGUMENT. Allocation
+Invalid arguments or lengths that the actual API cannot safely represent return
+CLIENT_INVALID_ARGUMENT; there is no additional size-policy threshold. Allocation
 failure in copying, request creation, serialization, pending-map insertion or
 final status-string preparation returns CLIENT_OUT_OF_MEMORY. Slot waiting,
 send attempts and final response preparation share the original 15-second
@@ -1714,7 +1719,7 @@ sequenceDiagram
     opt Pointer arguments valid
         API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
         opt Admitted on an allowed application thread
-            API->>API: F1 Scan to first NUL within bound, copy text, build service<br/>UNSPECIFIED envelope
+            API->>API: F1 Copy valid text through the first NUL, check size arithmetic,<br/>build service UNSPECIFIED envelope
             opt Preparation succeeds
                 API->>W: Initialize owned Request, mode, generation and completion state
             end
@@ -2064,12 +2069,16 @@ container is not a total client memory bound. The pending map can retain
 unanswered async requests indefinitely because there is no response timeout.
 No FIFO guarantee is made among callers competing for the slot.
 
-Per-message bounds and libzmq high-water marks remain separate transport
-settings under RESOURCE-LIMITS. EAGAIN retains the occupied slot while the owner
-continues polling; it is not a local queue-full error. Gateway retains its own
-1,024 waiting-request limit and 10-second dispatch deadline. Client-side slot
-waiting is unrelated to that Gateway queue. App-owned delivered responses
-remain valid until freed.
+There is no additional message/text-size cap. Use ZMQ_MAXMSGSIZE=-1 and default
+libzmq HWM (1000 send/receive messages per peer in 4.3.4), with safe length
+conversion/arithmetic and normal allocation-failure handling. EAGAIN retains
+the occupied client slot while the I/O owner continues polling.
+
+Gateway has no request waiting queue. It retains one admitted current request,
+pauses further receives while waiting for a private worker and returns
+RPC_STATUS_INTERNAL if Dispatch has not started within ten seconds. That timer
+does not cover unread libzmq traffic and does not replace the client's own
+deadlines. App-owned delivered responses remain valid until freed.
 
 #### Terminal connection loss and explicit reconnect
 

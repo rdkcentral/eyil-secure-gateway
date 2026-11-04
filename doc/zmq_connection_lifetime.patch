@@ -25,7 +25,7 @@ implement Gateway session cleanup. Enable draft APIs in the library build.
 Includes a Linux CMake regression test and integration documentation.
 
 ---
- doc/connection-lifetime-extension.md | 374 +++++++++++++++++++++++++++
+ doc/connection-lifetime-extension.md | 375 +++++++++++++++++++++++++++
  include/zmq.h                        |   5 +
  src/i_engine.hpp                     |   6 +
  src/router.cpp                       |  46 ++++
@@ -39,14 +39,14 @@ Includes a Linux CMake regression test and integration documentation.
  src/zmq_draft.h                      |   5 +
  tests/CMakeLists.txt                 |  10 +
  tests/test_connection_lifetime.cpp   | 478 +++++++++++++++++++++++++++++++++++
- 14 files changed, 1027 insertions(+), 18 deletions(-)
+ 14 files changed, 1028 insertions(+), 18 deletions(-)
 
 diff --git a/doc/connection-lifetime-extension.md b/doc/connection-lifetime-extension.md
 new file mode 100644
-index 0000000..8f92d64
+index 0000000..5a8a07a
 --- /dev/null
 +++ b/doc/connection-lifetime-extension.md
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,375 @@
 +<!--
 +Copyright (c) 2026 RDK Management.
 +This documentation is distributed under libzmq's component license and
@@ -405,22 +405,23 @@ index 0000000..8f92d64
 +bindings, decode the extended monitor values and set/check the reply guard.
 +The patch does not implement Gateway connection-context cleanup by itself.
 +
-+## Native validation scope
++## Regression requirements
 +
-+Validation used Linux x86-64 and GCC 9.4 in the RDK development container, with
-+the checksum-verified 4.3.4 source and shared Debug builds. Results:
++Validate the patched library against the matching upstream source and selected
++build configuration. Keep observed test results in separate validation reports,
++not in this implementation specification.
 +
-+- Draft build: the new lifetime test and 13 existing tests passed, covering
-+  PLAIN, NULL, ZAP, bundled CURVE, metadata, monitors, ROUTER behavior and IPC.
-+- The new test passed 25 additional runs: 950 connections, with actual FD reuse,
-+  three I/O threads, both monitor formats and recreated contexts.
-+- Draft-disabled build: PLAIN, metadata, SRCFD and stable monitor tests passed.
-+- No deployment, BitBake product build, ARM execution or Gateway runtime test
-+  is claimed. The native build used bundled crypto instead of optional libsodium;
-+  verify the product's selected libsodium build on the target.
-+- AddressSanitizer validation could not be completed in this container: even
-+  an independent empty C program repeatedly failed inside its ASan runtime.
-+  No successful sanitizer result is claimed.
++Required coverage includes:
++
++- Draft-enabled metadata, guarded replies and both monitor formats, including
++  independent connections from one process, closure before the first request,
++  actual FD reuse and recreated contexts.
++- Existing PLAIN, NULL, ZAP, metadata, monitor, ROUTER and IPC behavior, plus the
++  selected cryptographic dependency configuration.
++- Draft-disabled builds retaining the unchanged stable API and monitor behavior.
++- Product build integration and the installed runtime: option-10001 probing,
++  the private-IPC startup self-test, fail-closed admission and Gateway consumers
++  of authentication/message/event metadata.
 diff --git a/include/zmq.h b/include/zmq.h
 index d05659f..aab5d20 100644
 --- a/include/zmq.h

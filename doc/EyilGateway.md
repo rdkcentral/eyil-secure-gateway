@@ -71,12 +71,12 @@ are no framework/backend interfaces internally.
 | AuthenticationProvider | Interim acceptance; future authoritative lookup | TODO(AUTH-APPMANAGER), separate from transport |
 | ConnectionRegistry | Map User-Id to retained context; serialize admission/closing | Never key ownership solely by UID/PID/routing ID |
 | RequestDispatcher | Envelope/service validation, routing and nonblocking handoff to the private pool | Service-neutral at outer boundary |
-| PendingRequestQueue | std::queue<Action> with a global 1,024-request waiting limit and 10-second dispatch deadline | Mutex-protected admission/counting; includes jobs submitted to the pool but not started |
+| Current request / dispatcher | One retained admitted request awaiting a worker, no request queue | Pause further ROUTER reception; worker-start deadline is 10 seconds, with atomic timeout/start arbitration |
 | RequestJob | One retained dispatch object per accepted request | Immutable input plus explicit context/resource references |
 | PrivateRequestPool | Own a Core::ThreadPool with a configured worker count | No replacement of Thunder's global worker singleton; internal capacity must not block ROUTER |
 | CryptoServiceAdapter | Decode Crypto operations and query/invoke/release ICrypto per call | No cached ICrypto pointer, global Crypto session, health observer or duplicated key policy |
 | SharedBufferManager | Create/track allocations, quotas, active-use leases and deferred release; finalize once access ends | Gateway-local; no dependency on ICrypto types |
-| CompletionQueue | Bounded worker-to-ROUTER handoff for newly completed responses | At most one send attempt; release on success/failure, no per-connection retry queue and no delivery to a replacement route |
+| CompletionHandoff | Transfer completed owned records to the ROUTER owner, without count/byte caps | At most one send attempt; release on success/failure, no reply retry queue or delivery to a replacement route |
 | MonitorCollector | Own PAIR and post normalized transport events | Correlation is a prerequisite for targeted cleanup |
 | Optional lifecycle observer | Future app lifecycle events | TODO(LIFECYCLE-EVENTS), no current platform subscription |
 
@@ -106,11 +106,11 @@ flowchart TB
                 MON["MonitorCollector worker<br/>Monitor PAIR"]
             end
             REG["ConnectionRegistry<br/>User-Id + FD / transport lifetime<br/>Context, route and admission state"]
-            Q["PendingRequestQueue<br/>1024 waiting requests globally<br/>10-second dispatch deadline"]
-            POOL["Private Thunder pool<br/>RequestJob::Dispatch + lifecycle jobs<br/>4 workers proposed, configurable"]
+            CURRENT["Current request - no waiting queue<br/>Pause further receives while awaiting a worker<br/>10 seconds to start, otherwise INTERNAL + ERROR"]
+            POOL["Private Thunder pool<br/>RequestJob::Dispatch + lifecycle jobs<br/>4 workers"]
             AD["CryptoServiceAdapter<br/>Decode and map Crypto operations<br/>Scoped ICrypto reference per call"]
             BUF["SharedBufferManager<br/>Connection-owned allocations<br/>Active-use leases and deferred release"]
-            OUT["Bounded CompletionQueue<br/>RpcResponse + original generation<br/>Worker-to-I/O handoff"]
+            OUT["CompletionHandoff<br/>RpcResponse + original generation<br/>No response count/byte cap"]
         end
     end
     CRYPTO["Crypto plugin / ICrypto<br/>Configured cryptocallsign"]
@@ -130,8 +130,10 @@ flowchart TB
 
     IO <-->|"Resolve User-Id and original route"| REG
     IO -- "Unregistered service including string calls<br/>UNSUPPORTED_SERVICE, no worker dispatch" --> CLIENT
-    IO -- "Admit supported request job" --> Q
-    Q -- "Nonblocking pool handoff" --> POOL
+    IO -- "Retain current supported request" --> CURRENT
+    CURRENT -- "Reserve worker and hand off without blocking" --> POOL
+    POOL -- "Start/capacity wakeup: resume receiving" --> IO
+    CURRENT -- "10-second timeout: INTERNAL and exhaustion log" --> IO
     POOL <-->|"Crypto operations and NotifyAppState"| AD
     POOL <-->|"AllocateSharedBuffer / ReleaseSharedBuffer<br/>Deferred cleanup"| BUF
     AD <-->|"TryUse / FinishUse for bulk operations"| BUF
@@ -150,15 +152,16 @@ The three transport owners are separate Gateway threads. RequestDispatcher
 runs on the ROUTER owner; request and lifecycle jobs run on the private pool.
 The monitor collector posts events to the I/O owner, which correlates them and
 serializes the registry's disconnect transition.
-The adapter, registry, buffer manager and queues are shared runtime components,
-not additional threads. Four request workers remain a sizing proposal in
-section 6.2, in addition to the transport owners and libzmq's internal threads.
+The adapter, registry, buffer manager and completion handoff are shared runtime
+components, not additional threads. The private pool has four workers, in
+addition to the transport owners and libzmq's internal threads. A worker wait
+pauses only further request reception; responses and control handling continue.
 
 | Call or event entering Gateway | Internal path and result | Detailed flow |
 | --- | --- | --- |
 | Thunder Initialize / Deinitialize | Wrapper acquires/configures the implementation; deactivation awaits StopAndWait before releasing it | Sections 6.4 and 6.16 |
 | client_connect | DEALER handshake reaches ZAP; bind a unique User-Id to the transport/context and complete the worker-side NotifyAppState(CONNECTED) before ZAP success | Section 6.5 |
-| client_send_request / client_send_request_async carrying a Crypto RpcRequest | ROUTER owner validates/adopts the request, queues a distinct job and returns its correlated completion through the same owner | Sections 6.6–6.9 |
+| client_send_request / client_send_request_async carrying a Crypto RpcRequest | ROUTER owner validates/adopts the current request, pauses further receives while waiting up to 10 seconds for a worker, then dispatches or returns INTERNAL; completions use the same owner | Sections 6.6–6.9 |
 | client_send_request_string / client_send_request_string_async | ROUTER rejects the unrouted service=0 envelope with RPC_STATUS_UNSUPPORTED_SERVICE before worker admission; client exposes the received status as text | Sections 5.8–5.9 and 6.6 |
 | ALLOCATE_SHARED_BUFFER / RELEASE_SHARED_BUFFER | Worker calls SharedBufferManager locally. Allocation returns buffer_id, name and size; release acceptance blocks new use and defers physical cleanup while access remains active or unresolved | Sections 6.10–6.11 and 6.13 |
 | ENCRYPT / DECRYPT / SIGN / VERIFY | Worker-side adapter acquires an execution-time buffer lease, calls ICrypto using trusted context/object metadata, and ends the lease when backend access is definitively complete | Section 6.12 |
@@ -171,7 +174,8 @@ lifecycle results, not unsolicited RPCs. A response gets at most one
 nonblocking send attempt. An undeliverable response is logged and dropped,
 without retry or a second error reply. Admission rejections use the same owner
 and delivery policy without creating a service job. Lifecycle work uses the
-separate control path and does not consume the 1,024 application waiting slots.
+separate retained control path; it does not depend on the current RPC ingress
+record or on receiving another application message.
 
 There is no application heartbeat service, heartbeat worker or inactivity
 watchdog in the Gateway runtime. The registry has no last-request-age expiry
@@ -197,149 +201,145 @@ Coverage: **AC1.1–AC1.3, AC1.7**.
 | Execution context | Owns / performs | Must not do |
 | --- | --- | --- |
 | Thunder framework thread | Initialize/Deinitialize and framework notifications | Run application requests synchronously |
-| Gateway I/O owner | ROUTER, request validation/enqueueing, event/completion draining | Wait for Crypto, worker-pool capacity or a slow client |
+| Gateway I/O owner | ROUTER, the current request, worker-capacity/deadline handling and completion draining | Block while waiting for Crypto, a worker or a slow client |
 | ZAP worker | REP and authentication exchange | Use ROUTER or modify another thread's socket |
 | Monitor worker | PAIR events, normalized disconnect records | Guess a session from a non-unique PID |
 | Private Thunder workers | RequestJob::Dispatch, buffer operations and scoped ICrypto calls | Send a ROUTER reply or own transport state |
 | libzmq internal threads | Transport machinery | Replace Gateway request/session coordination |
 
-Create a Gateway-owned `Core::ThreadPool` instance with an explicit worker
-count and stack budget. Keep waiting request jobs in std::queue<Action> under
-a mutex, with a global limit of **1,024 waiting requests** across connections.
-The accounting includes both Gateway-staged jobs and jobs submitted to the
-private pool that have not begun Dispatch. Running jobs are bounded separately
-by the worker count; moving a job into Thunder's queue does not release a waiting
-slot. Each action retains its context, generation, original dispatch deadline
-and completion state before publication. Roll back partial allocations on
-failure; pop under the mutex and process after unlocking.
+Create a Gateway-owned Core::ThreadPool with **four workers** and the
+Thunder/platform default stack size. Application request work must not use
+Core::IWorkerPool::Assign(), Core::IWorkerPool::Instance().Submit(), or helper
+jobs that implicitly submit to Thunder's global pool. The wrapper's framework
+deactivation job may still use the global pool.
 
-A new request at the limit is rejected with RPC_STATUS_INTERNAL. A queued request
-has **10,000 ms from Gateway admission to the start of Dispatch**, measured with
-a monotonic clock. This is neither a backend execution timeout nor the client's
-15-second deadline. EyilClient uses a single submission slot; its pending-response map remains dynamic.
+#### Current request, receive pause and worker timeout
 
-Atomically arbitrate WAITING -> RUNNING against WAITING -> EXPIRED. The worker
-checks the original deadline before executing any service logic; expiry wins
-at/after the deadline, produces one correlated RPC_STATUS_INTERNAL response and
-prevents later execution. Include time spent in Thunder's internal queue. The
-ROUTER owner processes deadlines without blocking while other requests proceed.
+Gateway has **no request waiting queue**. The ROUTER owner retains at most one
+current admitted request that has not started Dispatch. This is the current
+ingress operation, with its immutable input, connection generation, request ID,
+completion bookkeeping and absolute deadline; it is not a growing container.
+Already running jobs are independent of that current-request record.
 
-Remove expired staged work and release its resources. If an already submitted
-wrapper cannot be removed immediately, it retains an expired/cancelled marker
-and becomes a no-op when dispatched. Return its capacity credit only when the
-queued record is reclaimed; do not accumulate uncounted cancelled wrappers.
-Errors and response delivery use the normal I/O completion path. No new
-Protobuf status or client error code is introduced.
+1. When there is no current request awaiting dispatch, receive and validate one
+   complete RPC. Invalid or unsupported requests use the normal owner-side
+   rejection path. For a supported admitted request, establish an absolute
+   monotonic deadline at admission plus **10,000 ms**.
+2. Try to reserve an available private worker and hand over this distinct job
+   without blocking. Use one synchronized capacity account for all jobs on that
+   pool, including lifecycle jobs; a request must not assume a worker remains
+   available merely because an earlier count was nonzero.
+3. If a worker cannot start the current request yet, **pause further ROUTER
+   request reception**. Disable its receive-readiness interest while paused so
+   unread traffic cannot cause a busy loop. Continue draining worker completions,
+   transport/control events and the current request's timer. ZAP and monitor
+   owners also continue; never sleep or block the I/O owner for ten seconds.
+4. Worker capacity/start/completion transitions signal the existing pollable
+   wakeup. Attempt handoff when capacity changes, retaining the original
+   deadline. Before service execution, Dispatch atomically claims
+   WAITING -> RUNNING only if the deadline has not expired. That claim disarms
+   the worker-wait timer and lets the I/O owner resume receiving the next RPC.
+5. If the deadline wins, atomically claim WAITING -> EXPIRED, log ERROR
+   `worker_pool_exhausted`, and produce **RPC_STATUS_INTERNAL with empty payload**
+   through the normal single-attempt response path. The expired request must
+   never invoke Crypto or perform a buffer operation. Resume reception after
+   the current record's handoff ownership is settled.
 
-Shutdown, disconnect and authentication lifecycle control use a separate retained
-control path, so the full request queue cannot prevent cleanup. A private worker
-never waits for a reply to reach the client before releasing its execution slot.
+Keep the record alive across timer/handoff races. If a job has been handed to
+Thunder but has not started, the worker must observe EXPIRED and return without
+service execution or another response. Do not reuse its worker reservation or
+lose its retained references before that handoff is reclaimed. In particular,
+do not turn Thunder's internal dispatch queue into another application backlog:
+submit only against reserved available execution capacity, and keep the current
+ingress record until Dispatch claims it or its expired handoff is reclaimed.
+There is no second Gateway queue or queue-full error.
 
-Submit a distinct `Core::IDispatch` object for each queued request when the
-private pool can accept it. A busy pool leaves admitted work pending only
-within its original deadline; queue saturation rejects new work immediately.
-Do not call `Core::IWorkerPool::Assign()`
-or use `Core::IWorkerPool::Instance().Submit()` for application request work.
-Some Thunder helper job classes submit implicitly to that global instance;
-select the explicit private-pool path. Never implement the 10-second wait as a
-blocking pool submission from the ROUTER thread.
+The timeout log must make saturation explicit: reason `worker_pool_exhausted`,
+configured worker count, running/reserved counts, wait duration, request_id,
+service and connection generation. It means the pool could not start the
+request within ten seconds under the current load. Include lifecycle-worker
+usage where relevant; slow or stuck backend calls can occupy the pool too.
+Do not hide the condition behind a generic allocation error. Log any failure to
+deliver the error separately; no second reply or service replay is attempted.
 
-The local Thunder R4.4 implementation supports independently owned thread pools.
-Its submission APIs must be wrapped carefully: not every version returns an
-enqueue-success result, and infinite submission waits would block the ROUTER.
-The dynamic staging queue does not change Thunder's internal queue behavior.
-Use a version-appropriate nonblocking handoff with tracked submission ownership;
-if the pool cannot accept work yet, retain it and resume on capacity becoming
-available. Never spin on a busy pool, drop an unconfirmed submission or block
-the ROUTER. The exact handoff and worker-completion wakeup must be validated
-against the target Thunder release. Reference:
+For example, `reason=worker_pool_exhausted workers=4 running=4 reserved=0
+wait_ms=10000`, followed by request ID, service and connection generation,
+identifies a request that could not start while all four workers were occupied.
+
+The timer starts when Gateway admits this current request, **not** when the
+client submits it or when libzmq first buffers it. Unread messages can remain
+in libzmq/kernel buffers while reception is paused. They have no Gateway job or
+Gateway worker-wait timer yet. Transport high-water marks and the client's
+existing deadlines apply there. Removing the Gateway queue does not remove
+libzmq's transport buffers or promise an end-to-end ten-second response time.
+
+The ten-second timer is not a backend execution timeout. A request that already
+claimed RUNNING completes through the usual execution/lease rules. Disconnect
+or deactivation preserves accepted-work ownership; the one current request
+keeps its original worker-start deadline, while running work drains normally.
+Lifecycle control uses retained context state and its own wakeups; it must not
+depend on receiving another application request or obtaining an ingress slot.
+
+Use a version-appropriate nonblocking handoff with explicit ownership and
+worker-start acknowledgement. Not every Thunder Submit overload reports enqueue
+success; validate the adapter against the selected release. Never block ROUTER,
+spin on a full pool, lose an unacknowledged job, or submit additional waiting
+jobs behind the current one. Reference:
 [Thunder pool implementation](https://github.com/rdkcentral/Thunder/blob/2c0fcc5529e7da734be558ca6efa05d934dcce31/Source/core/ThreadPool.h).
 
-The wrapper submits its framework deactivation job to Thunder's global pool.
-Application request jobs use the Gateway's private pool.
+Detectable request/job/completion allocation failure returns RPC_STATUS_INTERNAL
+when a correlated response can be constructed and sent. Release partial state
+without leaving a request that can execute later. After execution begins, a
+failure does not undo backend effects or end an unresolved buffer lease.
+Client-local allocation failures remain CLIENT_OUT_OF_MEMORY.
 
-Catch detectable request/job/queue allocation failures and release partial
-state without publishing a job that could later execute. For a trustworthy
-request ID and route, report RPC_STATUS_INTERNAL if the error reply can be
-constructed and sent. If memory or transport failure prevents that reply, do
-not claim it was delivered, fabricate success or retry the service operation.
-After execution starts, an error response does not undo backend effects or
-authorize early release of leased buffers. Client-local allocation failures
-continue to use CLIENT_OUT_OF_MEMORY; these are separate error layers.
+#### Initial resource policy
 
-#### Proposed initial resource sizing
+This table states the implementation policy. **Unlimited** means no additional
+EyilClient/Gateway count or byte admission cap for that resource. Memory
+allocation can still fail; representation limits and overflow-safe arithmetic
+in the C API, Protobuf, libzmq and service interfaces still apply.
 
-The following values are **proposals for target-device validation**, not adopted
-production defaults or changes to runtime configuration. Rows marked **Agreed**
-record the existing limits; the additional byte budgets and transport/worker
-settings remain subject to product sizing under TODO(RESOURCE-LIMITS).
-The shared-memory proposal supplies the initial 32 MiB / 4 buffers / 128 MiB
-per-connection limits. Quotas count the entire allocation, including input, output and any
-alignment space. The proposal's 22 MiB allocation for a 10 MiB encrypt input
-fits the per-buffer limit; a 32 MiB allocation does not imply a 32 MiB plaintext
-limit. Crypto's output requirements and all applicable aggregate quotas still apply.
+| Resource | Initial value / policy |
+| --- | --- |
+| Maximum complete request / response | Unlimited; bulk Crypto data uses shared memory |
+| Reserved/completed response slots | Unlimited |
+| Reserved/completed response data | Unlimited |
+| ZeroMQ send/receive high-water marks | Keep libzmq defaults: ZMQ_SNDHWM = 1000 and ZMQ_RCVHWM = 1000 messages per peer in libzmq 4.3.4, on ROUTER and DEALER |
+| Private request workers | 4, configured independently of Thunder's global pool |
+| Worker stack size | Keep the Thunder/platform default |
+| Shared memory per buffer/connection | 32 MiB per buffer, up to 4 buffers and 128 MiB per connection, from shared-memory proposal section 6.3 |
+| Global shared memory | Unlimited; no additional Gateway-wide shared-memory quota |
+| Kernel socket buffers | Keep OS defaults: ZMQ_SNDBUF = -1 and ZMQ_RCVBUF = -1 |
 
-| Resource | Initial value / policy | Status |
-| --- | --- | --- |
-| Maximum complete request / response | 1 MiB each, including the outer RPC envelope; bulk Crypto data uses shared memory | Proposed |
-| Gateway waiting requests | 1,024 globally, with at most 10 seconds from admission to the start of Dispatch | Agreed |
-| Queued request data | 16 MiB globally, alongside the waiting-entry limit | Proposed |
-| Reserved/completed response slots | 128 per connection / 1,024 globally, including reservations for running jobs | Agreed |
-| Reserved/completed response data | 4 MiB per connection / 16 MiB globally, alongside the response-slot limits | Proposed |
-| ZeroMQ send/receive high-water marks | ZMQ_SNDHWM = 32 and ZMQ_RCVHWM = 32 messages per peer on ROUTER and DEALER; tune through burst/load tests | Proposed |
-| Private request workers | 4, configured independently of Thunder's global pool | Proposed |
-| Worker stack size | Keep the Thunder/platform default initially; measure before reducing it, including when Crypto executes in process | Proposed |
-| Shared memory per buffer/connection | 32 MiB per buffer, up to 4 buffers and 128 MiB per connection | Agreed initial limits, shared-memory proposal section 6.3 |
-| Kernel socket buffers | Keep OS defaults with ZMQ_SNDBUF = -1 and ZMQ_RCVBUF = -1 | Proposed |
+There are no Gateway waiting-request-count or queued-request-byte settings.
+Section 6.2's single-current-request pause and ten-second worker-start deadline
+provide overload handling instead. HWM is a transport message-count threshold
+per peer, not a byte budget or a private-worker count. It does not create a
+Gateway request queue. The libzmq defaults are specified in
+[ZeroMQ 4.3.4 socket options](https://github.com/zeromq/libzmq/blob/v4.3.4/doc/zmq_setsockopt.txt).
 
-Apply the proposal's shared-memory limits per connection. There is no additional
-Gateway-wide shared-memory cap in this design. These limits do not reserve
-backing capacity: each allocation still depends on available tmpfs space and
-system memory, and preallocation failure returns CRYPTO_ERROR_OPERATION_FAILED.
-Size the platform for its expected number of simultaneous connections; do not
-introduce an additional global buffer quota in the implementation.
+Apply no configurable maximum RPC/message/text size; set ZMQ_MAXMSGSIZE=-1 on
+DEALER and ROUTER. Preserve required framing, schema, enum, numeric-conversion
+and service-parameter validation. Reject an input that cannot be represented
+by the actual parsing/transport API safely; do not truncate lengths or bypass
+integer-overflow checks. Invalid client input uses CLIENT_INVALID_ARGUMENT;
+detected client allocation failure uses CLIENT_OUT_OF_MEMORY. Gateway failures
+use the existing infrastructure/service error layers in section 4.2.
 
-All applicable count and byte limits apply together. A 1,024-entry queue holding
-1 MiB requests would otherwise consume 1 GiB for payloads alone. Fast dequeueing
-does not prevent accumulation while backend workers are occupied. Inline
-results, including GenerateRandom and ExportKey, must fit the complete response
-limit with Protobuf overhead; the maximum payload is therefore smaller than
-the maximum envelope.
+Response bookkeeping/storage grows as needed without slot or byte reservations
+against policy limits. Publishing a completed job must not wait for client
+receipt. On allocation failure, log the stage and use the existing error/drop
+path; never retry the backend operation to recover response storage.
 
-System limits are a final boundary, not a per-plugin or per-connection budget.
-Gateway initially shares Thunder's process, so exhausting memory can affect
-other plugins. Keep OS socket-buffer and platform stack defaults where suitable,
-but explicitly account for Gateway-owned queues, responses and shared memory.
-libzmq 4.3.4 defaults to high-water marks of 1,000 messages per peer and an
-unlimited maximum inbound message size. These settings alone do not define a
-predictable Gateway memory budget.
-[ZeroMQ 4.3.4 socket options](https://github.com/zeromq/libzmq/blob/v4.3.4/doc/zmq_setsockopt.txt)
-
-The proposed budgets are not a total-process RAM limit. Protobuf copies,
-bookkeeping, stacks, kernel buffers and libzmq queues add storage. In particular,
-libzmq's queues are per peer and separate from Gateway's completion handoff;
-validate sizing against simultaneous connections, peak message sizes and
-backend latency. Shared-memory accounting enforces the selected per-connection
-limits; request and response queue budgets are separate.
-
-Expose adopted values through product configuration supplied by CMake/BitBake;
-no public client API change is needed. Keep the existing error and delivery
-contracts: request/response infrastructure rejection emits an ERROR log and
-returns RPC_STATUS_INTERNAL when a correlated reply is possible. Buffer
-allocation/size/quota outcomes instead use RPC_STATUS_OK with the CryptoError
-specified in section 4.2, also with an ERROR log. Each response has one
-send attempt. EyilClient uses one submission slot and a dynamic pending-response
-map; local allocation failures use CLIENT_OUT_OF_MEMORY. Transport high-water
-marks can delay slot release through backpressure but do not create a local
-queue-full result.
-
-Apply message bounds at the client API and Gateway validation boundaries as
-well as in transport configuration. A libzmq ZMQ_MAXMSGSIZE rejection disconnects
-the oversized sender before an RPC error can be constructed; it follows normal
-connection-loss handling. It must not be described as a guaranteed
-RPC_STATUS_INTERNAL reply. The configured complete-message and text bounds must
-also allow for envelope overhead and the local string terminator.
-[ZeroMQ maximum message size](https://github.com/zeromq/libzmq/blob/v4.3.4/doc/zmq_setsockopt.txt)
+Shared-memory quotas count the entire allocation, including input, output and
+alignment space, and remain charged through deferred cleanup. The proposal's
+22 MiB allocation for a 10 MiB encrypt input fits the 32 MiB per-buffer limit;
+32 MiB of allocation does not imply 32 MiB of plaintext capacity. There is no
+global shared-memory cap. Each allocation still needs successful backing-space
+preallocation; failure returns CRYPTO_ERROR_OPERATION_FAILED. The worker count,
+default stack/socket settings and proposal-defined shared-memory quotas are the
+resource settings; do not add request/response byte or count caps in code.
 
 ### 6.3 Runtime records and synchronization
 
@@ -351,9 +351,9 @@ Each connection context contains:
 | Transport binding | Gateway-side accepted FD plus immutable transport lifetime, bound to User-Id before ZAP success; FD is metadata owned by libzmq |
 | Peer | Trusted host UID/GID/PID; process-instance evidence if available |
 | Routing | Binary ROUTER routing ID plus a proven binding to this connection generation |
-| Admission | AUTHENTICATING, ACTIVE, DRAINING, CLOSING or RETIRED; admission policy and accepted/queued/in-flight bookkeeping |
+| Admission | AUTHENTICATING, ACTIVE, DRAINING, CLOSING or RETIRED; admission policy and current/handoff/in-flight bookkeeping |
 | Crypto context | Per-connection initialization/drain state and last observed call outcome; no ICrypto pointer or background plugin-health state |
-| Resources | Owned buffer IDs, execution-time active-use leases, pending releases and cleanup accounting; queued jobs do not reserve buffers |
+| Resources | Owned buffer IDs, execution-time active-use leases, pending releases and cleanup accounting; jobs awaiting execution do not reserve buffers |
 | Lifecycle | Correlated closing reason and exactly-once cleanup/notification state |
 
 Preserve runtime app-instance identity separately when a future platform API
@@ -369,14 +369,14 @@ do not look up "whatever connection now has this routing ID."
 Required synchronization rules:
 
 - The Gateway ROUTER I/O owner serializes admission, route publication and
-  terminal connection transitions. ZAP/monitor workers submit bounded control
+  terminal connection transitions. ZAP/monitor workers submit normalized control
   events.
 - ZAP must publish its context before returning acceptance; an acknowledgement
   or a protected registry insertion is needed so the first request cannot race
   ahead of its record. No backend call runs under the registry lock.
 - SharedBufferManager protects lookup, ownership, active-use state and quota
   accounting with short locks. A worker checks and acquires an idle buffer
-  atomically when it executes; queuing a request reserves no buffer dependency.
+  atomically when it executes; retaining a request before execution reserves no buffer dependency.
   Release atomically sets releasePending on a valid owned allocation, including
   one in use, and prevents subsequent use. Competing uses of a busy buffer and
   uses of an unavailable/release-pending buffer fail under section 4.2.
@@ -388,9 +388,9 @@ Required synchronization rules:
   and ZAP returns success. RPC workers never perform lazy session creation.
   Keep notification bookkeeping, not internal Crypto key state or health data.
 - Closing new admission does not cancel accepted jobs. During deactivation or
-  a correlated peer disconnect, queued jobs either start within their original
-  10-second worker-wait deadline
-  or expire with an error; started jobs complete before resources are released.
+  a correlated peer disconnect, the current admitted request starts within its
+  original 10-second worker-wait deadline
+  or expires with an error; started jobs complete before resources are released.
 - Accepted jobs use their retained context and original generation during drain;
   removal from new-request lookup must not make them resolve a replacement
   context or fail solely because admission is now closed. Buffer dependencies
@@ -400,7 +400,7 @@ Required synchronization rules:
   retain only what those jobs and cleanup need.
 
 These rules require synchronized records, not an ordering guarantee between
-queued operations. Section 6.13 defines the outcome when release overtakes use.
+accepted operations. Section 6.13 defines the outcome when release overtakes use.
 The client's DEALER I/O owner cannot enforce Gateway buffer ownership or stop
 an application from writing through its own mapping.
 
@@ -427,7 +427,7 @@ sequenceDiagram
     I->>W: Construct/start private request pool
     I->>Z: Start REP, bind inproc ZAP endpoint
     Z-->>I: Authenticator ready or startup failure
-    I->>R: Create ROUTER, check required libzmq capability, set PLAIN server and limits
+    I->>R: Create ROUTER, check required libzmq capability, set PLAIN server, default HWM and MAXMSGSIZE=-1
     R->>R: Set heartbeat IVL/TIMEOUT/TTL=0, HANDOVER=0, MANDATORY=1 and LINGER=0
     Note over I,R: Transport heartbeats disabled, matching the client
     R->>R: Enable Gateway monitor endpoint
@@ -602,159 +602,132 @@ sequenceDiagram
     participant C as Client DEALER
     participant R as Gateway ROUTER I/O owner
     participant REG as ConnectionRegistry
-    participant Q as Waiting requests / dispatcher
+    participant CURRENT as Current request, no queue
     participant P as Private Thunder pool
     participant J as RequestJob
     participant S as Service adapter / buffer manager
-    participant OUT as Completion queue
+    participant OUT as Completion handoff
+    Note over R,CURRENT: Receive a new RPC only when no current request awaits dispatch
     C->>R: Routing frame plus RpcRequest
     R->>REG: Resolve ACTIVE context, transport binding and runtime admission
     REG-->>R: Retained context or rejection
     R->>R: Validate framing, envelope, schema, service and request ID
-    alt Duplicate ID on this authenticated connection generation
-        R->>R: Log ERROR with duplicate ID and original state, reject duplicate
-        Note over R,C: Keep original completion, no competing reply under the same ID
+    alt Duplicate ID on this connection generation
+        R->>R: Log ERROR, keep original completion and discard duplicate
     else Invalid request or admission closed
-        R->>R: Log ERROR with exact rejection reason and available request context
-        R-->>C: Mapped RpcStatus error when safely correlatable
-    else Service is UNSPECIFIED or has no registered handler
-        R->>R: Log ERROR unsupported_service with ID and connection, no payload logging
-        R-->>C: RPC_STATUS_UNSUPPORTED_SERVICE, echoed ID/service, schema 1, empty payload
-        Note over R,Q: One nonblocking error-response attempt, no worker or buffer/Crypto operation
-    else Waiting-request count is already 1024
-        R->>R: Log ERROR with waiting count and limit
-        R-->>C: RPC_STATUS_INTERNAL, no accepted job
-    else Admission available
-        R->>Q: Atomically reserve slot and publish owned job with deadline now plus 10 seconds
-        alt Allocation/publication fails
-            Q->>Q: Roll back slot and partial state
-            Q->>Q: Log ERROR with allocation/publication failure and request context
-            Q-->>R: RPC_STATUS_INTERNAL
-            R-->>C: Error response when deliverable
-        else Queued
-            Q->>P: Nonblocking handoff when pool capacity permits
-            Note over Q,P: Waiting count/deadline continue until Dispatch actually starts
-            alt Original deadline expires before Dispatch
-                R->>Q: Atomically mark WAITING as EXPIRED
-                R->>R: Log ERROR with dispatch deadline and request context
-                Q-->>R: One RPC_STATUS_INTERNAL completion
-                R-->>C: Error response when deliverable
-                Note over Q,J: Remove staged job or retain submitted no-op marker, never execute service
+        R->>R: Log exact rejection reason
+        R-->>C: Mapped RpcStatus when safely correlatable and deliverable
+    else Service has no registered handler, including service 0
+        R->>R: Log unsupported_service, no worker or service call
+        R-->>C: UNSUPPORTED_SERVICE, echoed ID/service, schema 1, empty payload
+    else Supported request
+        R->>CURRENT: Retain owned job/context/completion state, deadline admission plus 10 seconds
+        alt Preparation allocation fails
+            R->>R: Release partial state and log ERROR
+            R-->>C: RPC_STATUS_INTERNAL when deliverable, no service execution
+        else Current request ready
+            R->>P: Try reserve available worker and hand off without blocking
+            opt No worker can start yet
+                R->>R: Pause further ROUTER receives, disable receive poll interest
+                Note over R,P: Continue replies, control/monitor events and deadline processing
+                P-->>R: Capacity change signals existing wakeup
+                R->>P: Retry eligible handoff within the original deadline
+            end
+            alt Deadline wins before Dispatch claims RUNNING
+                R->>CURRENT: Atomically mark EXPIRED
+                R->>R: Log worker_pool_exhausted with worker counts, wait and request identity
+                R-->>C: One RPC_STATUS_INTERNAL response attempt, empty payload
+                Note over CURRENT,J: A late handoff observes EXPIRED and never calls the service
+                R->>CURRENT: Retire after handoff ownership settles
+                R->>R: Resume receiving the next request
             else Worker claims RUNNING before deadline
-                P->>J: Dispatch distinct job, release waiting slot
-                J->>J: Validate payload/dependencies, then reserve bounded response slot/bytes
-                alt Invalid service payload or rejected buffer state
-                    J->>J: Log ERROR with exact reason, request context and buffer state
-                    J->>OUT: RPC_STATUS_INTERNAL with empty payload if bounded error storage is available
-                    Note over J,S: Otherwise drop, no service execution or invalidation of existing leases
-                else Response capacity unavailable
-                    J->>J: Log ERROR with response usage and limit
-                    J->>OUT: RPC_STATUS_INTERNAL if bounded error storage is available
-                    Note over J,OUT: Otherwise local resource error and drop, no service execution
-                else Response capacity reserved
-                    J->>S: Gateway operation or scoped ICrypto call
-                    S-->>J: Result
-                    J->>OUT: Completion with original activation/context/generation
+                P->>J: Dispatch distinct job, disarm worker-wait timer
+                J-->>R: Start acknowledgement, current ingress record can be released
+                R->>R: Resume receiving another request
+                J->>J: Validate service payload and operation/oneof
+                alt Invalid service structure
+                    J->>OUT: RPC_STATUS_INTERNAL with empty payload
+                else Service request valid
+                    J->>S: Gateway-local operation or scoped ICrypto invocation
+                    S-->>J: Service result or mapped invocation failure
+                    J->>OUT: Owned response with original context/generation
                 end
-                OUT-->>R: Wake response drain
-                R->>REG: Verify original authenticated transport lifetime at send handoff
-                alt Original connection still safely routable
-                    R->>R: Set expected original transport lifetime, attempt multipart response once with DONTWAIT
-                    alt libzmq accepts the complete response
-                        R-->>C: Queued transport delivery, client receipt is not guaranteed
-                        R->>R: Release completion storage/accounting
-                    else EAGAIN, EHOSTUNREACH or another send failure
-                        R->>R: Record send error, drop response and release capacity, no retry
-                        Note over R,C: No second error response, client may receive nothing
+                Note over J,OUT: No response slot/byte cap<br/>Allocation failure uses existing error/drop rules
+                OUT-->>R: Wake completion drain
+                R->>REG: Verify original authenticated transport lifetime
+                alt Original route remains usable
+                    R->>R: Set expected lifetime and attempt multipart response once with DONTWAIT
+                    alt Complete response accepted by libzmq
+                        R-->>C: Queued transport delivery, no receipt guarantee
+                    else Send fails
+                        R->>R: Log send error and drop, no retry or second response
                     end
-                else Closed or replaced connection
-                    R->>R: Retire response storage without sending to a replacement
+                else Original route closed or replaced
+                    R->>R: Discard stale response
                 end
+                R->>R: Release completion storage/accounting once
             end
         end
     end
 ```
 
-Stage accepted work while private workers are occupied, within the global
-1,024 waiting-request limit and original 10-second dispatch deadline. Saturation,
-expiry and request/job infrastructure allocation failure produce
-RPC_STATUS_INTERNAL when deliverable. Parsed buffer/service outcomes use
-RPC_STATUS_OK plus the CryptoError from section 4.2.
-Expired/rejected work never invokes Crypto or performs a buffer operation.
-Requests that started Dispatch complete normally; this timer cannot cancel them.
+Section 6.2 defines the single-current-request state and timer/handoff races.
+Pause reception of subsequent requests while that record awaits a worker;
+the I/O owner must continue sending earlier completions and handling control
+events. The ten-second deadline produces RPC_STATUS_INTERNAL and an explicit
+worker_pool_exhausted ERROR, not a queue-full result. Actual request/job/response
+allocation failures are logged separately and use RPC_STATUS_INTERNAL when
+deliverable. Buffer service outcomes use RPC_STATUS_OK plus CryptoError.
 
-The Gateway ROUTER owner serializes new admission with deactivation. Already
-accepted work settles during drain while replies and control events continue.
-Per-message bounds, shared-buffer quotas and completion-storage policy remain
-separate. Process ingress, completions and deadlines fairly in bounded batches.
+The ROUTER owner serializes admission with deactivation. Accepted work remains
+owned during drain. Validate framing, safe message-length representation,
+trusted metadata, live context, schema 1, service, request ID, service structure,
+operation/oneof agreement, enum/range validity and allocation ownership. There
+is no additional request/response byte cap. Preserve the original completion
+when a request ID is duplicated. Independent operations may finish out of order.
 
-Validate at least: frame count, message size, trusted metadata, live context,
-schema 1, supported service, request-ID rules, service parse, operation/oneof
-agreement, enum/range validity and allocation ownership. Apply the generic
-rejection and ERROR-log contract in section 4.2, including preservation of an
-original request when its ID is duplicated. Independent requests can finish in
-any order; dependent operations must follow the resource-ordering contract.
+Prepare owned job/completion bookkeeping before execution, without reserving
+capacity against count/byte budgets. Complete buffer validation before committing
+release; a rejection before that point creates no releasePending transition.
+If a job acquired an active-use lease but fails before calling Crypto, FinishUse
+ends that unused lease and may enable deferred cleanup. Response preparation or
+delivery failure after release acceptance cannot undo the accepted release.
 
-Complete validation and reserve response capacity before committing buffer
-release. A rejection before that point creates no releasePending transition.
-If execution has already acquired an active-use lease and a later check fails
-before calling Crypto, end that lease through FinishUse; a concurrently accepted
-release may then become eligible for cleanup. Once release is accepted, later
-response preparation/delivery failure cannot undo it, as defined in section 6.13.
+String calls carry service=RPC_SERVICE_UNSPECIFIED, schema 1, a nonzero ID and
+raw text payload. Once received and structurally validated, Gateway logs ERROR
+unsupported_service and returns RPC_STATUS_UNSUPPORTED_SERVICE with echoed
+ID/service/schema and empty payload. No worker, Crypto call or buffer operation
+is needed. A receive pause can delay reading this request too; Gateway cannot
+classify an unread message. Common invalid-context/schema/duplicate-ID rules
+take precedence. Do not sniff formats or translate text into Crypto operations.
 
-String APIs build a binary RpcRequest with service=RPC_SERVICE_UNSPECIFIED,
-schema 1, an assigned nonzero ID and raw text payload. After context/framing/
-schema/ID validation, reject that unregistered service with
-RPC_STATUS_UNSUPPORTED_SERVICE and log ERROR unsupported_service. Echo the ID,
-service=0 and schema 1, with empty payload. Do not parse CryptoRequest, acquire
-ICrypto, mutate buffers or consume a waiting-request slot for this rejection.
-The same rule handles other unregistered service values. CRYPTO still requires
-its normal serialized CryptoRequest; no format sniffing or text translation is
-performed. Common invalid-context/schema/duplicate-ID rules take precedence.
+All admission errors use normal response allocation, original-transport
+validation and one send attempt. If allocation or delivery fails, log/drop;
+the sync caller may time out and an accepted async call may receive no callback.
 
-The rejected string request uses the same bounded error-response allocation,
-original-transport validation and one-attempt send policy as other admission
-errors. If it cannot be delivered, log/drop rather than retry or send a second
-error. The client may then time out (sync) or receive no callback (async).
-Sections 5.8–5.9 define the response text only when a valid reply arrives.
+#### Response ownership and completion handoff
 
-A job publishes completion rather than touching ROUTER. The handoff queue exists
-to transfer the result to its socket owner; it is not a retry queue. Process
-new completions promptly in bounded batches so replies, ingress, monitor events
-and deadlines all progress. The storage and send rules below are selected
-behavior, not an outstanding architecture gap.
+Private workers publish completed owned records to the ROUTER owner through
+a synchronized handoff and existing wakeup. This holds results awaiting their
+single send attempt; it is not an application request waiting queue or a reply
+retry queue. **Response record count and response bytes are unlimited by policy.**
+There are no per-connection/global slot credits, response-byte budgets or
+configured serialized-response maximum.
 
-#### Bounded response handoff
+Allocate completion bookkeeping with the request so publishing a completed
+record does not need another queue-node allocation. Grow response storage as
+needed, with checked size arithmetic and the underlying API representation
+limits. Allocation/serialization failure uses RPC_STATUS_INTERNAL if a valid
+correlated error can be prepared; otherwise log the local failure and retire
+the response. Never rerun the operation, undo an accepted release or free an
+unresolved backend lease to recover response storage.
 
-Use a bounded completion handoff from private workers to the ROUTER owner.
-Initial response-slot defaults are **128 per connection and 1,024 globally**,
-separate from the 1,024 requests waiting for workers. Count reserved slots for
-running jobs as well as completed records. These limits do not introduce a
-per-connection response-retry queue.
-
-Before executing a service operation, reserve its completion slot and response
-byte allowance atomically against the connection/global budgets. Use a finite
-configured maximum serialized response size and finite per-connection/global
-byte budgets; counts alone do not bound variable-size output. Validate the
-configuration and size arithmetic before opening admission. Product sizing is
-a resource configuration task, not a choice of delivery policy. Section 6.2
-lists [proposed initial byte budgets](#proposed-initial-resource-sizing) for
-target-device validation.
-
-If reservation is unavailable, do not execute the operation or block a worker.
-Publish RPC_STATUS_INTERNAL through the owner if bounded error storage is
-available; otherwise record the local resource error and drop. Likewise,
-allocation/publication failure cannot create unbounded overflow storage or
-trigger another backend execution. Validate requested output lengths before
-calling the backend where possible, and enforce the serialized-response limit
-before publishing a completion.
-
-Release the reservation exactly once when the single send attempt succeeds,
-fails, or the response is discarded as stale. Configure a finite ROUTER
-ZMQ_SNDHWM as well: libzmq's accepted output is separate from Gateway handoff
-storage. Apply platform connection/message limits when sizing that storage.
-Process a bounded batch of new completions per I/O-loop iteration, then return
-to ingress, monitor events and deadlines.
+Workers do not wait for clients or ROUTER sends. The owner processes finite
+batches of ingress/completions between checks of control events and timers,
+including while receiving is paused for worker capacity. This scheduling rule
+adds no request-count or storage admission limit. Release each result once on send acceptance, failed send
+or stale-route disposal. libzmq's default HWM applies to its separate transport
+queues; it is not a completion-storage budget.
 
 #### One response send attempt
 
@@ -787,7 +760,7 @@ failure paths. Success confirms local libzmq acceptance, not peer receipt.
 [Send and multipart contract](https://libzmq.readthedocs.io/en/latest/zmq_send.html)
 
 Apply this policy to successful results and all Gateway error replies, including
-queue-saturation and 10-second dispatch-expiry errors. Do not attempt to send a
+ten-second worker-capacity timeout errors. Do not attempt to send a
 second RPC_STATUS_INTERNAL to report the failure of the first response.
 Record the request ID, connection generation and local send error in bounded
 diagnostics/counters, without logging Crypto payloads. Drop releases response
@@ -801,19 +774,17 @@ a response callback. A monitor reports connection events, not individual
 dropped replies. This policy does not introduce an async error callback or
 unsolicited notification.
 
-The 10-second Gateway deadline bounds waiting for a worker, not backend
-execution or reply delivery. Adding a backend execution deadline would not
-make a dropped error reply observable to the client, cancel an in-process
+The 10-second Gateway deadline bounds the current admitted request's wait for
+a worker, not backend execution or reply delivery. Adding a backend execution
+deadline would not make a dropped error reply observable to the client, cancel an in-process
 ICrypto call or prove that shared memory is no longer in use. The selected
 contract introduces no such execution deadline. Bounded retention after an
 undelivered async response would require a separately agreed client retirement
 policy or connection teardown; it cannot be guaranteed by a Gateway timer alone.
 
-Finite libzmq output high-water marks and response byte limits are still
-required: accepted messages can remain queued inside libzmq, and concurrent
-workers can produce handoff records before the I/O owner consumes them.
-The client request-submission retry behavior within its existing deadline is
-separate from this Gateway response policy.
+libzmq's default output HWM applies to accepted transport messages separately
+from the unlimited-by-policy completion handoff. Gateway does not reserve a
+response slot/byte allowance or wait for a frozen peer to read a reply.
 
 ### 6.7 Crypto adapter: per-call ICrypto references and per-connection sessions
 
@@ -879,10 +850,10 @@ caller-owned storage; check Core::hresult before consuming them, then map and
 serialize them after releasing the interface. Release exactly once on every
 path, including errors and unwinding; later response-allocation failure must
 not leave an interface retained. Do not hold ICrypto while waiting in the
-request queue, waiting for a session-initialization barrier or delivering a response.
+worker-wait phase, waiting for a session-initialization barrier or delivering a response.
 
 No ICrypto pointer is cached in GatewayRuntime, CryptoServiceAdapter, a
-connection context or a queued job. Concurrent invocations own independent
+connection context or a job waiting for execution. Concurrent invocations own independent
 references, even if Thunder returns the same underlying object. Crypto owns
 its internal synchronization under the ICrypto contract; reference counting
 does not serialize calls. Use the same query/invoke/release scope for
@@ -1078,7 +1049,7 @@ client name, backend path, actual capacity, object FD, a retained directory
 reference, active-use count, releasePending flag and finalization/cleanup state.
 The active-use count is initially limited to zero or one. A pending release may
 coexist with active or unresolved access. Directory references may be
-shared by the connection's allocations. Queued requests retain their context
+shared by the connection's allocations. The current request and handed-off jobs retain their context
 and buffer ID, but reserve no
 buffer use. Per-connection count/byte quotas require
 atomic reservation and rollback on every failure path.
@@ -1134,8 +1105,8 @@ Required invariants:
   under the Crypto contract. Every definitive lease-ending path checks for a
   pending release and triggers eligible cleanup, including failure before a
   backend invocation. Release/disconnect must not invalidate Gateway's own live
-  records. Queued operations have no lease: release may overtake them, and their
-  execution-time lookup then fails without calling Crypto.
+  records. Operations that have not claimed a buffer have no lease: release may
+  overtake them, and their execution-time lookup then fails without calling Crypto.
 - The app must not resize, unlink or modify participating regions while an
   operation is outstanding. This is the selected cooperation contract; hard
   enforcement against a violating app is outside this version's scope.
@@ -1150,9 +1121,9 @@ Required invariants:
 The initial limits are 32 MiB per allocation, four allocations and 128 MiB
 per connection, following the shared-memory proposal. Keep these values
 configurable and account for release-pending allocations until cleanup.
-Section 6.2 lists these [per-connection limits](#proposed-initial-resource-sizing).
+Section 6.2 lists these [per-connection limits](#initial-resource-policy).
 There is no additional global shared-memory quota. Validate platform memory
-and tmpfs sizing under TODO(RESOURCE-LIMITS).
+and tmpfs sizing as part of the resource-policy validation in section 7.3.
 
 #### Application cleanup after completion or error
 
@@ -1353,7 +1324,7 @@ limits belong to the Crypto adapter/backend, not SharedBufferManager. Preserve
 CRYPTO_ERROR_OVERSIZED_INPUT_DATA when an input exceeds the operation maximum,
 using the same RPC_STATUS_OK service envelope. Any adapter rejection after
 claiming a buffer must finish its unused lease. Do not reserve buffers for
-queued jobs, wait for a conflict to clear or replay failed work. After a
+jobs before execution, wait for a conflict to clear or replay failed work. After a
 successful claim, Gateway passes the trusted backend path and regions to the
 Crypto adapter. Crypto independently
 opens the object, checks its actual size, maps it, performs the operation and
@@ -1703,13 +1674,13 @@ established; returning an invocation error or releasing ICrypto is not itself
 that evidence. It may coexist with releasePending. Section 7.1 describes this
 exceptional lifecycle boundary.
 
-**Queued operations have no buffer reservation.** Check the buffer when a job
+**Operations awaiting execution have no buffer reservation.** Check the buffer when a job
 executes. Gateway does not promise request-arrival ordering, delay release to
-preserve queued work or replay a rejected operation.
+preserve a not-yet-started use or replay a rejected operation.
 
 | Race at the buffer manager | Result |
 | --- | --- |
-| Release is accepted before a queued Encrypt claims the buffer | The ID becomes unavailable; Encrypt returns RPC_STATUS_OK with CRYPTO_ERROR_INVALID_SESSION_STATE without calling Crypto |
+| Release is accepted before an admitted Encrypt claims the buffer | The ID becomes unavailable; Encrypt returns RPC_STATUS_OK with CRYPTO_ERROR_INVALID_SESSION_STATE without calling Crypto |
 | Encrypt claims the buffer before Release executes | Encrypt retains its lease; Release is accepted immediately, with destruction deferred until that use ends |
 | Two operations try to claim the same idle buffer | One claims it; the other returns RPC_STATUS_OK with CRYPTO_ERROR_INVALID_SESSION_STATE if it observes active use |
 | A later operation executes after the previous use ends, without an accepted release | It may claim the still-live buffer and proceed normally |
@@ -1719,7 +1690,7 @@ preserve queued work or replay a rejected operation.
 The application submits dependent operations sequentially when it needs a
 particular order. Different buffers and connections can execute concurrently.
 Deferred destruction protects an existing active use; it does not add a buffer
-dependency queue or promise that queued operations will succeed.
+dependency queue or promise that an admitted operation will succeed.
 
 #### Release request sequence
 
@@ -1808,13 +1779,13 @@ The release-before-use case is also intentionally allowed:
 ```mermaid
 sequenceDiagram
     participant A as Application
-    participant R as Gateway ROUTER and waiting queue
+    participant R as Gateway ROUTER / current request
     participant E as Encrypt worker
     participant F as Release worker
     participant B as SharedBufferManager
     A->>R: Encrypt(B), request ID 10
     A->>R: ReleaseSharedBuffer(B), request ID 11
-    R->>E: Dispatch Encrypt, no queued buffer reservation
+    R->>E: Dispatch Encrypt, no buffer reservation before execution
     R->>F: Dispatch Release
     Note over E,F: Worker scheduling does not guarantee arrival order
     F->>B: RequestRelease(B), mark idle allocation releasePending
@@ -1857,7 +1828,7 @@ periodic cleanup poller or client-driven replay requirement.
 | Failure / outcome | Response and resource handling |
 | --- | --- |
 | Release rejected for unknown/unowned/already-released ID | RPC_STATUS_OK with CRYPTO_ERROR_INVALID_SESSION_STATE and ERROR log; no new releasePending transition |
-| Release rejected before dispatch because of queue/dispatch-wait/infrastructure failure | RPC_STATUS_INTERNAL with empty payload and ERROR log; no releasePending transition for this request |
+| Release rejected before dispatch because of worker-wait timeout or infrastructure failure | RPC_STATUS_INTERNAL with empty payload and ERROR log; no releasePending transition for this request |
 | Valid release accepted while idle, busy or awaiting definitive backend completion | Successful release response acknowledges acceptance; keep resources and quota until eligible physical cleanup completes |
 | Filesystem cleanup fails after acceptance, even during the immediate idle-buffer path | Log ERROR and retain private cleanup/accounting; the accepted-release result stays successful, with no second response |
 | Release response allocation/serialization fails after acceptance | Preserve pending cleanup; report RPC_STATUS_INTERNAL if a correlated fallback can be built before any send attempt, otherwise log/drop; no rollback or automatic replay |
@@ -1883,7 +1854,7 @@ connection cleanup after the notification stage. Last-use completion records
 readiness and wakes that cleanup path without blocking a worker.
 
 Closing admission alone does not mark every buffer released: previously
-accepted queued operations may still use allocations without releasePending,
+accepted operations that have not started may still use allocations without releasePending,
 subject to their execution-time checks and original dispatch budget. An accepted
 explicit release still rejects later uses of its ID. Release jobs admitted before
 the cutoff may record acceptance during drain without waiting for physical
@@ -2250,12 +2221,12 @@ invalid identity evidence without accepting an unbound connection or sending
 an unguarded reply. Stock or mismatched libzmq must fail activation without
 leaking partially started resources.
 
-The extension's native Linux/GCC 9 regression covers independent connections
-from one process, no-request disconnects, rejected/in-progress authentication,
-closure before ZAP, actual FD reuse, context recreation, monitor-v1 compatibility
-and stale reply rejection after forced route reuse. It also checks that ZAP
-metadata cannot replace native transport identity. This validates the source
-extension, not the EyilGateway implementation or the deployed device binary.
+The extension regression must cover independent connections from one process,
+no-request disconnects, rejected/in-progress authentication, closure before ZAP,
+FD reuse, context recreation, monitor-v1 compatibility and stale reply rejection
+after route reuse. It must also reject replacement of native transport identity
+by ZAP metadata. Run it against the selected dependency and runtime configuration;
+this specification records required scenarios, not execution results.
 
 **TODO(ZMQ-PLATFORM):** integrate the extension into the product recipe, consume
 its properties/events and guarded-send option in Gateway, and verify the
@@ -2267,8 +2238,9 @@ events and explicitly retire its contexts during local shutdown.
 
 On correlated disconnect, mark that context CLOSING immediately, close its
 admission and remove public authentication/routing visibility. Retain resources
-for accepted work. Queued requests start within their original worker deadline
-or expire; started operations finish before destructive connection cleanup.
+for accepted work. The one current admitted request starts within its original
+worker deadline or expires; handed-off records retain ownership until reclaimed,
+and running operations finish before destructive connection cleanup.
 There is no reconnect grace period or idle/process-responsiveness timeout.
 
 At that cutoff, establish SharedBufferManager's lifecycle finalization gate as
@@ -2291,9 +2263,9 @@ Gateway responsibility. Actual target behavior is verified by the crash and
 disconnect scenarios in section 6.17.
 
 Discard completed responses waiting for the closed route and release their
-response capacity. Later completions from retained old jobs are discarded on
+response storage. Later completions from retained old jobs are discarded on
 the same generation check. An explicit client reconnect authenticates a new
-context; never transfer the old queue, response storage or buffer ownership to
+context; never transfer the old current request, response storage or buffer ownership to
 it. Old resources remain retained only as needed for safe backend completion
 and cleanup, independently of the new context.
 
@@ -2481,10 +2453,12 @@ violates its preparation contract:
 - EAGAIN is output pressure, not proof of death or a reason to expire a frozen
   connection. Drop only the failed response and continue processing other work.
   The client may receive nothing and no connection monitor event is implied.
-- A frozen client must not occupy workers waiting to deliver replies. Bound the
-  completion handoff and libzmq output storage. The 1,024 waiting-request limit
-  and 10-second dispatch deadline do not limit bytes already queued by libzmq.
-  Client submission uses one slot; its pending-response map remains dynamic.
+- A frozen client must not occupy workers waiting to deliver replies. Workers
+  publish owned completion records without count/byte admission caps; ROUTER
+  makes one nonblocking send attempt. libzmq retains its default HWM. The
+  ten-second worker-wait timer does not expire completed responses or messages
+  still buffered in libzmq. Client submission uses one slot; its pending-response
+  map remains dynamic.
 - If an operation is still executing, retain its context and buffer leases
   until its actual completion. Freezing, an undelivered reply or a local timeout
   must not invalidate backend memory access. On thaw, a synchronous request whose
@@ -2495,8 +2469,8 @@ violates its preparation contract:
   about the transport failure after it resumes; preservation is not guaranteed
   across that independent failure.
 
-The response policy is defined in section 6.6: bounded handoff, one attempt,
-local error and drop. Resource sizes are configured for the platform. No freeze
+The response policy is defined in section 6.6: owned completion handoff without
+count/byte caps, one send attempt, local error and drop. No freeze
 timeout or forced disconnect for EAGAIN is introduced.
 
 #### Platform validation requirements
@@ -2632,10 +2606,11 @@ callback that initiated teardown.
 - Block new RPC and authentication admission. Reply to a trustworthy rejected
   RPC with RPC_STATUS_INVALID_CONNECTION when its route permits; otherwise
   discard it safely. Do not invent a disconnect message or new status.
-- Continue every accepted queued/active job. The original 10-second worker-wait
-  deadline still applies: an expired waiting job produces RPC_STATUS_INTERNAL
-  and never executes later. Started jobs are not cancelled by this deadline or
-  by deactivation.
+- Continue running jobs and retain the one current admitted request. Its
+  original ten-second worker-start deadline still applies; expiry logs
+  worker_pool_exhausted, produces RPC_STATUS_INTERNAL when deliverable and
+  prevents later execution. Reclaim any expired handoff before releasing its
+  ownership. This deadline and deactivation do not cancel running jobs.
 - At the admission cutoff, establish each context's buffer-finalization gate.
   Previously claimed explicit-release cleanup finishes with its job; other
   pending releases retain their records and quota for cleanup after DISCONNECTED.
@@ -2644,15 +2619,15 @@ callback that initiated teardown.
   finalize, as in section 6.13.
 - Keep ROUTER, ZAP, monitor processing, dispatcher and private pool running while
   draining. Do not unbind/close ROUTER or shut down its context at drain start.
-  Queue empty is insufficient: account for submitted/active jobs, authentication
+  An empty current-request record is insufficient: account for handed-off/active jobs, authentication
   already in progress, lifecycle jobs, completions, buffer leases and claimed
   finalizers. A release response being sent is not proof of completed cleanup.
 - Preserve routes for existing responses. If a peer disconnects, retire its
   route but finish its accepted work and cleanup obligations. A late ZAP result
   cannot publish a new ACTIVE context after the cutoff.
-- Wait without registry/queue locks. Schedule lifecycle cleanup only when its
+- Wait without registry/dispatcher/completion locks. Schedule lifecycle cleanup only when its
   prerequisites finish, rather than occupying every worker waiting for work
-  still queued behind them.
+  still awaiting those workers.
 - Apply the normal one-attempt response rule during drain. Give each routable
   completion its single nonblocking attempt, then release it on acceptance or
   local failure. Completion means execution/ownership settled, not app receipt.
@@ -2685,9 +2660,9 @@ sequenceDiagram
     Note over I,B: Normal path requires definitive backend completion and completed resource cleanup<br/>Unresolved access or cleanup errors keep teardown pending
     I->>I: RUNNING to DRAINING under admission lock
     I->>B: Establish lifecycle finalization gates, retain pending releases and quota
-    I->>R: Reject new RPCs, keep replies/control processing
+    I->>R: Close new admission, preserve receive pause and replies/control processing
     I->>Z: Reject new authentication, resolve in-progress setup
-    I->>W: Drain accepted work within original dispatch deadlines
+    I->>W: Drain running work and current request with its original start deadline
     loop Until accepted work settles
         alt Job starts before its deadline
             W->>CP: Scoped query, operation and Release
@@ -2695,9 +2670,9 @@ sequenceDiagram
             W-->>R: Original-generation completion
             W->>B: FinishUse, record pending-release readiness without gated destruction
             W-->>I: Settle job, lease and any already-claimed finalizer accounting
-        else Waiting job reaches its original deadline
-            R->>R: Atomically expire request, prepare RPC_STATUS_INTERNAL
-            R->>I: Settle accounting after queued wrapper is reclaimed
+        else Current request reaches its original worker-start deadline
+            R->>R: Atomically expire request, log worker_pool_exhausted, prepare RPC_STATUS_INTERNAL
+            R->>I: Settle accounting after the expired handoff is reclaimed
         end
         R->>R: Attempt reply once, release on acceptance or log and drop on failure
     end
@@ -2723,7 +2698,7 @@ sequenceDiagram
     X-->>I: Context and libzmq internal threads terminated
     I->>W: Stop and join drained private pool
     I->>I: Check saved filesystem socket identity, remove only the owned pathname
-    I->>I: Release queues, registries and endpoint ownership, publish STOPPED
+    I->>I: Release current request, completion records, registry and endpoint ownership, publish STOPPED
     I-->>P: StopAndWait complete
     P->>P: Release implementation/control references, reset activation flags
     P->>T: Unregister remaining notifications and release IShell
@@ -2796,7 +2771,8 @@ sequenceDiagram
 ```
 
 Reactivate only after normal stop reaches STOPPED. Reset per-activation flags
-and recreate queues, registry, identities, pool, sockets and context. Old events
+and recreate the current-request state, completion handoff, registry, identities,
+pool, sockets and context. Old events
 or completions must not affect the new generation even if FD numbers or routing
 IDs repeat. Rebinding can create a new socket inode; container mounts must
 expose the new endpoint as required in section 3.3.
@@ -2844,12 +2820,14 @@ routing and lifecycle work without deferring the ICrypto dependency:
 3. Implement startup, ZAP/interim identities, authentication-time CONNECTED,
    the registry and monitor binding. Prove multiple connections from one PID
    remain independent, including closure before the first request.
-4. Add private-pool jobs, the 1,024-entry waiting-request limit, 10-second
-   dispatch deadline and completion routing. Validate per-call ICrypto
-   acquisition/release, errors and nonblocking pool handoff.
+4. Add four private workers and one current ingress record, with no request
+   queue. Pause further receives while that record awaits a worker, continue
+   replies/control processing, and return INTERNAL with worker_pool_exhausted
+   ERROR if Dispatch has not started within ten seconds. Validate capacity/start
+   wakeups, timeout races, per-call ICrypto ownership and completion routing.
 5. Add Gateway-local allocations, atomic execution-time ownership/state
    checks and active-use leases. Reject competing uses and uses of retired IDs
-   without reserving queued uses or replaying an operation. Accept valid release
+   without reserving uses before execution or replaying an operation. Accept valid release
    immediately, defer destruction until active access ends, and retain quota
    through cleanup. Apply the trusted-app cooperation contract, retained directory
    references and exactly-once finalization across release/disconnect/stop.
@@ -2883,23 +2861,23 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 terminal client loss | Retire unsent/pending work and uncommitted responses once; unresolved waiters get CLIENT_COMMUNICATION_ERROR, accepted async submissions retain CLIENT_OK without error callbacks; preserve committed/app-owned responses and reject new requests on the lost handle |
 | L1 explicit client disconnect | Close with sync/async/string calls waiting for or occupying the slot; unresolved waiters return CLIENT_NOT_CONNECTED with cleared outputs, accepted async sends retain CLIENT_OK, pending IDs and undelivered responses retire once; cancelled actions never send later |
 | L1 disconnect races and callbacks | Race close against send acceptance, timeout, response claim and transport loss; preserve one result, suppress intentional-close events, release every live-call guard and wait for claimed callbacks; no callback or state access after return |
-| L1 plain-string APIs | Both string methods copy to the first NUL with no size argument or caller encoding; exercise empty strings, whitespace and line breaks as data, text bounds, caller input reuse and allocation failures; copy the received non-OK RpcStatus name with one response terminator; reject unknown/UNSPECIFIED status, unexpected OK and nonempty error payload |
+| L1 plain-string APIs | Both string methods copy to the first NUL with no size argument or caller encoding; exercise empty strings, whitespace and line breaks as data, representable large inputs, caller input reuse and allocation failures; copy the received non-OK RpcStatus name with one response terminator; reject unknown/UNSPECIFIED status, unexpected OK and nonempty error payload |
 | L1 string completion races | Race response-text preparation with the synchronous deadline, explicit close and transport loss; no intermediate binary success escapes, the winning result is preserved, and any losing prepared string is freed |
 | L2 string rejection | Both string APIs send raw text in a service=0 RpcRequest; Gateway logs ERROR and returns correlated UNSUPPORTED_SERVICE with empty payload before worker admission; sync returns CLIENT_OK plus exact status text, async receives that text through its response callback; no ICrypto call or invented text service |
-| L1 Gateway | Envelope/oneof validation; context lookup; queued/in-flight ownership; enum/presence mapping; allocation rollback; the same numeric request ID on two authenticated connections is independent, while a duplicate of tracked work in one connection cannot replace its completion |
+| L1 Gateway | Envelope/oneof validation; context lookup; current/handoff/in-flight ownership; enum/presence mapping; allocation rollback; the same numeric request ID on two authenticated connections is independent, while a duplicate of tracked work in one connection cannot replace its completion |
 | L1 Gateway rejection logging | Undecodable service payloads, operation/oneof mismatches and infrastructure failures use RPC_STATUS_INTERNAL with empty payload. Buffer/service errors follow the CryptoError table in section 4.2 under RPC_STATUS_OK. Both log ERROR with the exact cause and known request/connection context; duplicate IDs cannot dispatch twice or replace the original completion; unsafe correlation logs/drops; logs contain no payload or key material |
 | L1 buffer error mapping | Zero size/invalid regions: INVALID_PARAMETERS; size/input maximum: OVERSIZED_INPUT_DATA; allocation or quota failure: OPERATION_FAILED; missing/wrong-session/released/busy/release-pending buffer and repeated release: INVALID_SESSION_STATE; output capacity: BUFFER_OVERFLOW. Assert RPC_STATUS_OK, the matching CryptoResponse oneof, unusable success outputs on error, exact diagnostics and cleanup ownership. A first valid release while busy still succeeds |
-| L1 Gateway queue | 1,024 global waiting slots include staged/pool-queued jobs; saturation rejects with RPC_STATUS_INTERNAL; allocation failure rolls back credit; control cleanup remains possible |
-| L1 Gateway dispatch deadline | Expire after 10,000 ms without starting; include pool queue time; race expiry against Dispatch; exactly one result and no backend execution after expiry; do not time out running calls |
-| L1 Gateway drain | Atomic admission cutoff; queued work starts or expires under original deadline; active work finishes; callbacks and stop state require no new shutdown queue allocation |
-| L1 Gateway response capacity | Reserve at most 128 slots per connection and 1,024 globally plus configured byte allowances before execution; reject without service execution on exhaustion; no blocking/overflow queue; release each reservation once |
-| L1 resource configuration | Check initial 32 MiB per buffer, four buffers and 128 MiB per connection, including a 22 MiB allocation and per-buffer/count/per-connection aggregate rejection cases. Two connections can exceed 128 MiB combined when backing resources permit; no global buffer-quota rejection exists. Separately exercise configured request/response byte budgets and arithmetic. Assert the correct infrastructure/service error layer and release reservations once |
+| L1 Gateway receive pause | Occupy all four workers, admit one current request and verify further ROUTER receives pause without a request queue. Replies, monitor/control events and timers continue; worker-capacity wakeup resumes dispatch/reception without spinning |
+| L1 Gateway worker timeout | After 10,000 ms from current-request admission, return INTERNAL with empty payload and worker_pool_exhausted ERROR containing total/running/reserved workers and request identity. Race expiry against Dispatch, including a handed-off job; one result, no execution after expiry, no timeout of running calls. Unread libzmq messages have no Gateway timer yet |
+| L1 Gateway drain | Atomic admission cutoff; the current request starts or expires under its original deadline, handed-off ownership settles, running work finishes; stop/control handling requires no new RPC or request queue |
+| L1 Gateway response storage | Response storage grows when allocations succeed, with no response-count/byte budget rejection. Inject actual bookkeeping/serialization allocation failure; preserve one completion/error and cleanup ownership without blocking a worker or replaying service work |
+| L1 resource configuration | Four private workers, default stack size, default HWM 1000/1000 and kernel socket buffers, MAXMSGSIZE=-1, no additional message/text/response storage cap. Check proposal limits of 32 MiB per buffer, four buffers and 128 MiB per connection, including a 22 MiB allocation. Multiple connections may exceed 128 MiB combined when backing resources permit. Preserve arithmetic, representation and service-specific validation |
 | L1 Gateway response send | At most one logical response attempt; EAGAIN/EHOSTUNREACH/EINTR cause local error and drop; no requeue, second error response or backend replay; storage released once; multipart frames never cross responses |
-| L1 buffer concurrency | Queued jobs reserve no buffer; release winning before TryUse returns RPC_STATUS_OK with CRYPTO_ERROR_INVALID_SESSION_STATE and no Crypto call; use winning rejects a competing use through the same service error but permits release acceptance; race release with last-use completion and verify one finalization claim, no use after releasePending and no lost cleanup |
+| L1 buffer concurrency | Admitted jobs reserve no buffer before TryUse; release winning before TryUse returns RPC_STATUS_OK with CRYPTO_ERROR_INVALID_SESSION_STATE and no Crypto call; use winning rejects a competing use through the same service error but permits release acceptance; race release with last-use completion and verify one finalization claim, no use after releasePending and no lost cleanup |
 | L1 deferred release | Release during active access returns RPC_STATUS_OK, CRYPTO_ERROR_NONE and the empty release response before that access ends; retain object, record, directory reference and quota; definitive completion triggers cleanup once; duplicate release cannot clear state or create another finalizer |
 | L1 buffer completion errors | Null lookup/pre-invocation failure, defined CryptoError and post-call validation/serialization/allocation failure end the lease exactly once when access is definitively over and trigger eligible pending cleanup; ambiguous remote failure retains access and releasePending until completion evidence arrives |
 | L1 release and cleanup failures | Idle and deferred cleanup failures log ERROR and keep the ID unavailable with retained cleanup/accounting; accepted release is not retroactively failed and produces no second response; ENOENT permits remaining cleanup; partial allocation rollback failure retains a private record without publishing an ID |
-| L1 release response loss and deadlines | Response-construction failure, the single-send drop policy and a 15-second client timeout do not undo accepted release; 10-second pre-dispatch expiry creates no releasePending state; active cleanup has no forced 10/15-second destruction deadline and does not depend on response delivery |
+| L1 release response loss and deadlines | Response preparation/send failure and a client timeout do not undo accepted release; expiry of the current release request before Dispatch creates no releasePending state. Deferred cleanup has no forced destruction deadline and does not depend on response delivery |
 | L2 transport | Real DEALER/ROUTER IPC, ZAP metadata, reverse-order completion and simultaneous sync/async callers |
 | L2 connect readiness | CONNECTED alone cannot complete connect; HANDSHAKE_SUCCEEDED returns CLIENT_OK; explicit rejection returns CLIENT_AUTH_FAILED; unresolved/stalled attempt reaches CLIENT_TIMEOUT; each failure wakes the waiter and rolls back resources; no startup outcome invokes a callback, and immediate subsequent loss cannot expose an unpublished handle |
 | L2 explicit reconnect | Verify RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0; after loss and Gateway return, no automatic handshake or old queued send occurs; explicit close/new connect creates an empty client runtime and new Gateway session, rejects old buffer IDs and never delivers old replies to new requests |
@@ -2911,10 +2889,10 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 interim identity | appId has reserved eyil-interim: prefix and a unique token; separate sessionId is stable through CONNECTED, operations and DISCONNECTED. Two connections from one PID differ; app payloads cannot replace either identity. Marker recognition alone is not proof of Crypto key-policy enforcement |
 | L1/L2 buffer preallocation | ftruncate success followed by fallocate failure returns RPC_STATUS_OK plus CRYPTO_ERROR_OPERATION_FAILED without publishing an ID. Cover ENOSPC/ENOMEM/unsupported operation and partial rollback failure; verify object/FD/quota ownership. On an isolated test tmpfs using the product configuration, exhaust capacity and verify allocation fails before Crypto accesses the buffer; record cgroup charging and remaining truncation risk |
 | L2 endpoint ownership | Keep the exact AC URI. A live listener, unknown owner, symlink, probe timeout/error or replaced inode is never unlinked. Serialize bind-before-listen with the lifecycle lock; recover only a trusted unchanged stale socket after ECONNREFUSED. Exercise ZMQ_USE_FD adoption/rollback/close without double-close, and pathname cleanup only after shutdown with the saved filesystem identity |
-| L2 buffers | Container-private mapping, cross-connection rejection, release before queued use and deferred release during active use; buffer remains accessible to the active backend until definitive completion, new uses fail, and quota becomes available only after cleanup; Crypto errors are forwarded; size/region failures and lost replies; a result after a synchronous timeout is discarded |
+| L2 buffers | Container-private mapping, cross-connection rejection, release before an admitted use claims the buffer and deferred release during active use; buffer remains accessible to the active backend until definitive completion, new uses fail, and quota becomes available only after cleanup; Crypto errors are forwarded; size/region failures and lost replies; a result after a synchronous timeout is discarded |
 | Shared-memory platform validation | Verify app permissions, directory/object reference lifetime and namespace/process reuse under the selected cooperation contract; cleanup does not reopen an exited or reused PID's path |
 | L2 app crash cleanup | Allocate buffers, then terminate the owning app without release RPCs; correlated disconnect settles accepted work, sends DISCONNECTED and reclaims all remaining objects/FDs/quotas through retained directory references; repeat with an active Crypto call, accepted pending release, lost allocation/release replies and notification failure, without early destruction or lost cleanup ownership |
-| L2 lifecycle | Fail every startup stage; stop idle/busy/full-queue runtimes; race CONNECTED, explicit release, finalization and disconnect/deactivation; drain already-claimed finalizers, gate other destruction until accepted work settles and DISCONNECTED runs; pending-release records do not block the notification that enables cleanup; unresolved access/cleanup cannot report successful teardown |
+| L2 lifecycle | Fail every startup stage; stop idle/busy/receive-paused runtimes; race CONNECTED, explicit release, finalization and disconnect/deactivation; drain already-claimed finalizers, gate other destruction until accepted work settles and DISCONNECTED runs; pending-release records do not block the notification that enables cleanup; unresolved access/cleanup cannot report successful teardown |
 | L2 socket teardown | ROUTER closes on its owner after drain; slow/frozen reader cannot block; REP/PAIR close on stop/ETERM; no final monitor-event dependency; all threads/context retire |
 | L2 reactivation | Repeated activation cycles rebind in host/container views; fresh identities/generations; stale callbacks/events cannot reach new clients; no FD/thread leaks |
 | L2 crash restart | Start with empty state; client monitor observes loss; no old replay/session restoration; fresh connection performs authentication and CONNECTED |
