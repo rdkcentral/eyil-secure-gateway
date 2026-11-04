@@ -321,67 +321,68 @@ already committed while that preparation ran. A send-acceptance arrow records
 the actual attempt outcome; for sync it is distinct from the final response
 result. Only an accepted async send fixes the public result at CLIENT_OK.
 
+#### Shared submission diagram (F1–F6)
+
+This diagram is the common submission path for all four request APIs. The API
+diagrams in sections 5.6–5.9 draw it as one "F2-F5 Submit" step and show only
+their own differences. Early exits use `break`: once a `break` block runs, the
+call ends there.
+
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Calling application thread
     participant API as Any request C API
     participant S as ClientRuntime / single slot
-    participant IO as I/O owner
+    participant IO as Client I/O owner
     participant P as Pending map
-    participant Z as DEALER
+    participant Z as Client DEALER
     A->>API: Request call
     API->>API: Validate required pointers before accessing the Client
     API->>S: F1 RetainCall, check thread and READY, start absolute deadline
-    API->>API: PrepareRequest with owned input and result state
-    alt Preparation fails
-        API-->>A: CLIENT_INVALID_ARGUMENT, CLIENT_NOT_CONNECTED or<br/>CLIENT_OUT_OF_MEMORY
-    else Prepared
-        API->>S: F2 WaitAndPublish(request, deadline)
-        opt Slot occupied
-            S->>S: Wait on slotAvailable, release mutex while waiting
+    API->>API: F1 PrepareRequest with owned input and result state
+    break Invalid argument, I/O-owner thread, not READY or preparation allocation failure
+        API-->>A: CLIENT_INVALID_ARGUMENT, CLIENT_NOT_CONNECTED or<br/>CLIENT_OUT_OF_MEMORY, nothing sent, no callback
+    end
+    API->>S: F2 WaitAndPublish(request, deadline)
+    opt Slot occupied
+        S->>S: Wait on slotAvailable, mutex released while waiting
+    end
+    break Deadline, close or loss wins before publication
+        S-->>API: CLIENT_TIMEOUT, CLIENT_NOT_CONNECTED or<br/>CLIENT_COMMUNICATION_ERROR
+        API-->>A: Exact local result, nothing sent, no callback
+    end
+    S->>S: Store retained Request, mark PUBLISHED, unlock
+    API->>IO: F3 Signal pollable wakeup
+    API->>S: F6 Wait for this request's result, mutex released
+    IO->>S: F3 ClaimSubmission: lock, read, retain, mark CLAIMED, unlock
+    IO->>IO: F4 Recheck eligibility, assign ID and schema 1, serialize outside lock
+    IO->>P: F4 Insert expected response target before the first send
+    break Allocation failure, cancellation, deadline, close or loss before sending
+        IO->>P: Retire unsent entry if installed
+        IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY or winning error),<br/>clear matching slot, notify all waiters
+        S-->>API: F6 Committed send failure, no callback
+    end
+    loop Until accepted or terminal send outcome
+        IO->>S: F5 TryBeginSend: recheck cancellation, generation and deadline
+        break Request no longer eligible
+            IO->>P: Retire unsent entry, it is never sent later
+            IO->>S: CompleteSend(request, exact error), clear matching slot, notify
         end
-        alt Deadline / close / loss wins before publication
-            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED /<br/>CLIENT_COMMUNICATION_ERROR
-            API-->>A: Exact local result, no send or response callback
-        else EMPTY and eligible
-            S->>S: Store retained Request, mark PUBLISHED, unlock
-            S-->>API: Published
-            API->>IO: F3 Signal pollable wakeup
-            API->>S: Wait for this request result, release mutex
-            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
-            S-->>IO: Owned Request, mode, generation and deadline
-            IO->>IO: F4 Assign ID/schema, serialize
-            IO->>P: Insert expected response target before send
-            alt Allocation / cancellation / deadline / close / loss
-                IO->>P: Retire unsent entry if installed
-                IO->>S: CompleteSend(request, error), clear matching slot, notify all<br/>waiters
-            else Prepared and eligible
-                loop Until acceptance or terminal failure
-                    IO->>S: TryBeginSend, recheck cancellation, generation and deadline
-                    alt Request no longer eligible
-                        IO->>P: Retire unsent entry
-                        IO->>S: CompleteSend(request, exact error), clear matching slot, notify
-                    else Send attempt admitted
-                        IO->>Z: F5 zmq_send(DONTWAIT)
-                        alt EAGAIN or EINTR
-                            IO->>S: End SEND_IN_PROGRESS, check cancellation under state lock
-                            opt Still eligible
-                                IO->>IO: Keep CLAIMED slot, poll replies/monitor and writable readiness
-                            end
-                        else Terminal send failure
-                            IO->>P: Retire unsent entry
-                            IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY or<br/>CLIENT_COMMUNICATION_ERROR), clear matching slot, notify
-                        else Accepted by libzmq
-                            IO->>S: F5 CompleteSend(request, CLIENT_OK), clear matching slot, notify
-                            Note over S,P: Slot is reusable, response record remains pending
-                        end
-                    end
-                end
-            end
-            S-->>API: F6 Send result, or continue synchronous response wait
-            API-->>A: Async send result / final synchronous result
+        IO->>Z: F5 zmq_send(one frame, DONTWAIT)
+        alt EAGAIN or EINTR
+            IO->>S: End SEND_IN_PROGRESS, keep CLAIMED slot
+            IO->>IO: Poll replies, monitor events and writable readiness, then retry
+        else Memory failure or other terminal send error
+            IO->>P: Retire unsent entry
+            IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY or<br/>CLIENT_COMMUNICATION_ERROR), clear matching slot, notify
+        else Accepted by libzmq
+            IO->>S: F5 CompleteSend(request, CLIENT_OK), clear matching slot, notify
+            Note over S,P: Slot is reusable, response record stays pending in P
         end
     end
+    S-->>API: F6 Send result
+    API-->>A: Async: return send result. Sync: continue with the response wait in 5.6
 ```
 
 ### 5.3 General routing: concurrent requests on one connection
@@ -410,6 +411,7 @@ result condition does not prevent the owner from claiming or sending work.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as App thread A / async
     participant B as App thread B / sync
     participant S as ClientRuntime / single slot
@@ -796,6 +798,7 @@ and nonblocking sends; do not add responsiveness probes or heartbeat expiry.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Application
     participant API as client_connect
     participant C as Startup coordinator / result
@@ -950,121 +953,58 @@ API signature change is needed for this agreed envelope handling.
 
 #### Submission and synchronous wait
 
+The shared submission (F2–F5) is drawn in section 5.2 and the shared receive
+pipeline (F7–F8) below. This diagram shows only what is specific to the
+synchronous byte API.
+
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Application
     participant API as client_send_request
     participant S as ClientRuntime / single slot
     participant W as Retained request / result condition
-    participant IO as I/O owner
-    participant P as Pending map
-    participant Z as DEALER
-    participant G as Gateway ROUTER
+    participant IO as Client I/O owner
+    participant G as Gateway I/O owner (ROUTER)
     A->>API: Client, serialized RpcRequest and size, out response and size
-    API->>API: Clear every supplied output and validate required argument<br/>pointers
-    opt Pointer arguments valid
-        API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
-        opt Admitted on an allowed application thread
-            API->>API: F1 Parse and own RpcRequest, validate nonzero service and<br/>safe length representation
-            opt Preparation succeeds
-                API->>W: Initialize owned Request, mode, generation and completion state
-            end
-        end
-    end
-    alt Invalid arguments / own I/O-thread request call / no usable<br/>connection / preparation allocation failure
+    API->>API: Clear every supplied output, validate required pointers
+    API->>S: F1 RetainCall, check caller thread and READY, start original deadline
+    API->>W: F1 Parse and own RpcRequest, require nonzero service and<br/>safe length representation
+    break Invalid argument, I/O-owner thread, not READY or preparation allocation failure
         API->>API: Release partial state and any retained call guard
-        API-->>A: CLIENT_INVALID_ARGUMENT / CLIENT_NOT_CONNECTED /<br/>CLIENT_OUT_OF_MEMORY, no response callback
-    else Prepared request
-        API->>S: F2 WaitAndPublish(request, original deadline)
-        opt Slot occupied
-            S->>S: Wait on slotAvailable, release mutex, recheck predicate after<br/>wake
-        end
-        alt Deadline, close or terminal runtime failure wins before<br/>publication
-            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED / stored failure reason
-            API->>API: Free unpublished state and release live-call guard
-            API-->>A: Exact local result, cleared outputs if any, no callback
-        else Slot EMPTY and call still eligible
-            S->>S: Publish retained request, mark PUBLISHED, unlock
-            S-->>API: Published
-            API->>IO: F3 WakeIo through existing pollable wakeup
-            API->>W: F6 WaitForResponse within original deadline, no runtime mutex<br/>held
-            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
-            S-->>IO: Owned Request, mode, generation and deadline
-            IO->>IO: F4 Recheck eligibility, assign ID/schema, serialize outside lock
-            IO->>P: F4 Insert expected response target before sending
-            alt Serialization or pending-map allocation fails
-                IO->>P: Retire partial unsent entry
-                IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching<br/>slot, notify slotAvailable
-                S-->>W: Notify committed send failure, normally CLIENT_OUT_OF_MEMORY
-            else Prepared and tracked
-                loop Until accepted or terminal send outcome
-                    IO->>S: F5 TryBeginSend, check cancellation, generation and deadline
-                    alt Deadline / explicit close / unexpected loss wins
-                        IO->>P: Retire unsent entry, prevent later send
-                        IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
-                        S-->>W: Notify winning timeout, close or stored failure result
-                    else Send attempt admitted
-                        IO->>Z: F5 zmq_send(one frame, DONTWAIT)
-                        alt EAGAIN or EINTR without acceptance
-                            IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
-                            opt Still eligible within original deadline
-                                IO->>IO: Retain CLAIMED slot, poll replies, monitor and writable<br/>readiness
-                            end
-                            Note over S,IO: If ineligible, next eligibility check retires without sending
-                        else Terminal send error
-                            IO->>P: Retire unsent entry
-                            IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
-                            S-->>W: Notify winning send error, preserve any earlier cancellation
-                        else libzmq accepts message
-                            IO->>S: CompleteSend(request, CLIENT_OK), clear matching slot, notify<br/>slotAvailable
-                            Note over S,W: Send acceptance recorded, sync result remains pending unless<br/>timeout or close already won
-                            Z->>G: Transport RpcRequest over UDS
-                        end
-                    end
-                end
-            end
-            opt Send accepted and synchronous result still pending
-                Note over S,P: Slot is free for other callers during response wait
-                alt Response is delivered
-                    G-->>Z: RpcResponse with original ID/service/schema and Gateway status
-                    IO->>Z: F7 zmq_msg_recv(DONTWAIT), consume complete message
-                    Z-->>IO: Response frame
-                    IO->>P: F7 Match an accepted ID/generation and validate expected<br/>service/schema/status
-                    Note over IO,P: Unknown or premature replies follow the common pipeline, without<br/>completing this request
-                    alt Matched response validation fails
-                        IO->>P: Retire only the matched response record
-                        IO->>W: TryComplete(CLIENT_COMMUNICATION_ERROR), preserve earlier result
-                    else Matched response is valid
-                        IO->>IO: F8 Allocate and copy validated response bytes
-                        alt Response allocation fails
-                            IO->>P: Retire record and free temporary storage
-                            IO->>W: TryComplete(CLIENT_OUT_OF_MEMORY), preserve earlier result
-                        else Final response ready
-                            IO->>P: F8 TryComplete response against close and original deadline
-                            alt Delivery claim succeeds
-                                IO->>P: Retire record once, do not change the submission slot
-                                IO->>W: CLIENT_OK and owned serialized RpcResponse and size
-                            else Another terminal path already won
-                                IO->>IO: Free uncommitted response, preserve winning result
-                            end
-                        end
-                    end
-                else Original deadline, connection loss or explicit close wins
-                    IO->>P: Retire pending record and uncommitted response storage
-                    IO->>W: TryComplete with winning timeout/loss/close result, cleared<br/>outputs
-                end
-            end
-            W-->>API: F6 One final result and response outputs
-            API->>S: Release live-call guard
-            API-->>A: ClientResult and response outputs
-        end
+        API-->>A: CLIENT_INVALID_ARGUMENT, CLIENT_NOT_CONNECTED or<br/>CLIENT_OUT_OF_MEMORY, NULL/0 outputs
     end
+    API->>S: F2-F5 Submit through the single slot (section 5.2)
+    break Send not accepted
+        S-->>API: CLIENT_TIMEOUT, CLIENT_NOT_CONNECTED,<br/>CLIENT_COMMUNICATION_ERROR or CLIENT_OUT_OF_MEMORY
+        API->>S: Free unpublished state, release live-call guard
+        API-->>A: Same result, NULL/0 outputs
+    end
+    Note over S,IO: Send accepted, slot is free for other callers during the response wait
+    API->>W: F6 WaitForResponse within the original deadline, no runtime mutex held
+    alt Valid response claimed before the deadline
+        G-->>IO: RpcResponse, shared receive pipeline F7-F8
+        IO->>W: CLIENT_OK and owned serialized RpcResponse and size
+    else Matched response invalid
+        G-->>IO: RpcResponse with wrong service, schema or status
+        IO->>W: TryComplete(CLIENT_COMMUNICATION_ERROR)
+    else Response allocation fails
+        G-->>IO: RpcResponse
+        IO->>W: TryComplete(CLIENT_OUT_OF_MEMORY)
+    else Deadline, connection loss or explicit close wins first
+        IO->>W: TryComplete(CLIENT_TIMEOUT, CLIENT_COMMUNICATION_ERROR<br/>or CLIENT_NOT_CONNECTED)
+        Note over IO,G: A later reply for this ID is discarded
+    end
+    W-->>API: F6 One final result and response outputs
+    API->>S: Release live-call guard
+    API-->>A: ClientResult and response outputs, NULL/0 on every error
 ```
 
-F2/F3 explicitly show publication and the owner's read of the single slot.
-CompleteSend releases the slot at F5, so the synchronous response wait does
-not serialize other requests behind the remote operation. Every local-error
-return releases the call guard and prepared storage, with NULL/0 outputs.
+The single slot is released at F5, so the synchronous response wait does not
+serialize other requests behind the remote operation. Every local-error return
+releases the call guard and prepared storage, with NULL/0 outputs. Races between
+the response, the deadline and close are drawn in "Synchronous timeout,
+disconnect and response races" below.
 
 Before dereferencing outputs, validate their addresses; clear every supplied
 output even if another required argument is missing. Require a non-NULL live
@@ -1089,10 +1029,11 @@ whether its caller waits for a synchronous result or only for async send
 acceptance. Sync requests retain their total deadline after send; async requests
 disarm their submission deadline once libzmq accepts the message.
 
-The send half below shows one attempt. After EAGAIN/EINTR, resume at
-TryBeginSend on the same tracked Request; do not assign another ID, reinsert
-the pending entry or claim another submission. Receive processing can run on
-any owner iteration, including while the slot waits for writable readiness.
+The send half (F3–F5) is the shared submission diagram in section 5.2. After
+EAGAIN/EINTR, resume at TryBeginSend on the same tracked Request; do not assign
+another ID, reinsert the pending entry or claim another submission. The diagram
+below is the shared receive half (F7–F8). Receive processing can run on any
+owner iteration, including while the slot waits for writable readiness.
 
 CompleteSend updates the retained Request's send result and releases only its
 matching slot in the single transition defined in section 5.2. Arrows to result
@@ -1108,114 +1049,55 @@ after the local-close cutoff; section 5.13 covers an attempt already in progress
 
 ```mermaid
 sequenceDiagram
-    participant S as ClientRuntime / single slot
+    autonumber
+    participant G as Gateway I/O owner (ROUTER)
+    participant Z as Client DEALER
     participant IO as Client I/O owner
-    participant P as Pending requests
-    participant W as Sync result or async send waiter
-    participant Z as Client libzmq / DEALER
-    participant G as Gateway ROUTER
+    participant S as ClientRuntime / single slot
+    participant P as Pending map
+    participant W as Sync result or unaccepted send waiter
     participant H as Async response handler
-    IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
-    S-->>IO: Owned request, mode, generation and active deadline
-    alt Cancelled, expired before send or generation unusable
-        IO->>P: Retire unsent request
-        IO->>S: CompleteSend(request, error), clear matching slot and notify<br/>slotAvailable
-        IO-->>W: CLIENT_TIMEOUT or mapped connection error
-    else Request can proceed
-        IO->>IO: Assign nonzero request_id and schema 1, serialize envelope
-        IO->>P: Install response target before first send
-        alt Serialization, message storage or pending-map allocation fails
-            IO->>P: Roll back partial insertion and retire unsent record
-            IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching slot<br/>and notify slotAvailable
-            IO-->>W: CLIENT_OUT_OF_MEMORY, no response callback
-        else Prepared and tracked
-            IO->>S: F5 TryBeginSend, recheck cancellation, generation and deadline
-            alt Timeout, close or terminal runtime failure wins
-                IO->>P: Retire unsent entry, prevent later send
-                IO->>S: CompleteSend(request, error), clear matching slot and notify<br/>slotAvailable
-                IO-->>W: CLIENT_TIMEOUT, CLIENT_NOT_CONNECTED or stored terminal error
-            else Send attempt admitted
-                IO->>Z: zmq_send(DEALER, one frame, DONTWAIT)
-                alt Message accepted into libzmq queue
-                    IO->>S: F5 CompleteSend(request, CLIENT_OK), record ACCEPTED, clear<br/>matching slot and notify
-                    opt Async request
-                        IO-->>W: CLIENT_OK, immutable async send result
-                    end
-                    Note over S,P: Accepted response target remains pending unless local retirement<br/>already won
-                    Z->>G: Transport queued request over UDS
-                else EAGAIN or EINTR, no acceptance
-                    IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
-                    alt Cancellation, deadline or runtime cutoff now applies
-                        IO->>P: Retire unsent entry
-                        IO->>S: CompleteSend(request, winning error), clear matching slot and<br/>notify
-                        S-->>W: Committed failure, no response callback
-                    else Still eligible
-                        IO->>S: Retain CLAIMED slot and owned bytes, no attempt in progress
-                        Note over IO,Z: Service replies/events, resume at TryBeginSend when eligible
-                    end
-                else Detected memory failure before acceptance
-                    IO->>P: Retire unsent record and free temporary storage
-                    IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching slot<br/>and notify slotAvailable
-                    IO-->>W: CLIENT_OUT_OF_MEMORY, no response callback
-                else Other terminal send error
-                    IO->>P: Retire request
-                    IO->>S: CompleteSend(request, CLIENT_COMMUNICATION_ERROR), clear<br/>matching slot and notify slotAvailable
-                    IO-->>W: CLIENT_COMMUNICATION_ERROR, no response callback
-                end
-            end
-        end
+    G-->>Z: RpcResponse
+    Z-->>IO: Readable
+    IO->>Z: F7 zmq_msg_recv(DONTWAIT), consume the complete message
+    IO->>IO: F7 Check framing and parse envelope
+    break Receive/decode allocation fails before trustworthy correlation
+        IO->>S: Latch CLIENT_OUT_OF_MEMORY, close admission, notify slotAvailable
+        IO->>P: Retire affected records, clear occupied slot safely
+        IO-->>W: Resolve pending sync and unaccepted send waiters with<br/>CLIENT_OUT_OF_MEMORY
+        Note over IO,H: Connection-state path reports LOST, no async error callback
     end
-    opt A response becomes readable
-        G-->>Z: RpcResponse
-        Z-->>IO: Readable, zmq_msg_recv(DONTWAIT)
-        IO->>IO: Check framing and parse envelope
-        alt Receive/decode allocation fails before trustworthy correlation
-            IO->>S: Latch CLIENT_OUT_OF_MEMORY terminal reason, close admission,<br/>notify slotAvailable
-            IO->>P: Retire affected records and clear occupied slot safely
-            IO-->>W: Resolve still-pending API results with CLIENT_OUT_OF_MEMORY
-            Note over IO,H: Close through connection-state path, no accepted-async error<br/>callback
-        else Unparseable response, invalid framing or zero request_id
-            IO->>S: Latch CLIENT_COMMUNICATION_ERROR, close admission, notify<br/>slotAvailable
-            IO->>P: Retire affected records and clear occupied slot safely
-            IO-->>W: Resolve still-pending API results with<br/>CLIENT_COMMUNICATION_ERROR
-            Note over IO,H: Connection event handling, no accepted-async error callback
-        else Parsed response
-            IO->>P: Match request_id and generation
-            alt Unknown or retired nonzero ID
-                IO->>IO: Discard without invoking another request's handler
-            else Matching entry exists but send is not accepted
-                IO->>IO: Log and discard premature response, keep request and slot<br/>unchanged
-                Note over IO,P: No completion or callback before send acceptance
-            else Matching accepted request
-                IO->>IO: Validate service, schema and RpcStatus, prepare owned response
-                alt Response allocation or response-text preparation allocation<br/>fails
-                    IO->>P: Retire record once and free temporary storage
-                    alt Synchronous request
-                        IO-->>W: TryComplete(CLIENT_OUT_OF_MEMORY), preserve prior result
-                    else Async send already accepted
-                        IO->>IO: Record diagnostics, no response callback
-                        Note over IO,H: Already-published send result remains CLIENT_OK
-                    end
-                else Matched metadata or non-memory response-text error
-                    IO->>P: Retire record once
-                    Note over IO,H: Sync TryComplete(CLIENT_COMMUNICATION_ERROR) preserves prior<br/>results, async records diagnostics without callback
-                else Valid response ready before any applicable deadline
-                    IO->>P: Try claiming final delivery against local close and any deadline
-                    alt Claim succeeds
-                        IO->>P: Retire record and accounting once
-                        alt Synchronous request
-                            IO-->>W: CLIENT_OK and owned final byte/string response
-                        else Async request
-                            IO->>IO: Release internal locks
-                            IO-->>H: handler(Client, owned response[, size])
-                        end
-                    else Timeout or close already won
-                        IO->>P: Retire record and accounting once
-                        IO->>IO: Free uncommitted response, preserve winning result, no callback
-                    end
-                end
-            end
-        end
+    break Unparseable response, invalid framing or zero request_id
+        IO->>S: Latch CLIENT_COMMUNICATION_ERROR, close admission, notify slotAvailable
+        IO->>P: Retire affected records, clear occupied slot safely
+        IO-->>W: Resolve pending sync and unaccepted send waiters with<br/>CLIENT_COMMUNICATION_ERROR
+        Note over IO,H: Connection-state path reports LOST, no async error callback
+    end
+    IO->>P: F7 Match request_id and generation
+    break Unknown or retired nonzero ID
+        IO->>IO: Discard, no other request's handler is invoked
+    end
+    break Entry exists but its send is not yet accepted
+        IO->>IO: Log and discard premature response, request and slot unchanged
+    end
+    IO->>IO: F7 Validate service, schema and RpcStatus
+    IO->>IO: F8 Prepare owned bytes, or the status-name string for string APIs
+    break Metadata invalid or response preparation fails
+        IO->>P: Retire record once, free temporary storage
+        IO-->>W: Sync: TryComplete(CLIENT_COMMUNICATION_ERROR or CLIENT_OUT_OF_MEMORY)
+        Note over IO,H: Async: diagnostics only, no callback, send result stays CLIENT_OK
+    end
+    IO->>P: F8 Claim final delivery against close and any sync deadline
+    break Timeout or close already won
+        IO->>P: Retire record once
+        IO->>IO: Free uncommitted response, keep winning result, no callback
+    end
+    IO->>P: Retire record and accounting once
+    alt Synchronous request
+        IO-->>W: CLIENT_OK with owned byte or string response
+    else Async request
+        IO->>IO: Release internal locks
+        IO-->>H: handler(Client, owned response[, size]) on the Client I/O owner
     end
 ```
 
@@ -1296,10 +1178,11 @@ slotAvailable; later explicit teardown cannot overwrite that reason.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Synchronous caller / waiter
     participant R as Runtime lock / retained Request
-    participant IO as I/O owner / pending map
-    participant G as Gateway
+    participant IO as Client I/O owner / pending map
+    participant G as Gateway I/O owner (ROUTER)
     alt Response is validated and wins terminal transition before<br/>deadline
         G-->>IO: RpcResponse
         IO->>R: TryComplete(CLIENT_OK, owned response)
@@ -1379,120 +1262,48 @@ Coverage: **AC2-Client.1, AC2-Client.2–AC2-Client.3, AC2-Client.5**.
 
 The caller waits for slot availability and libzmq acceptance within one total
 15-second send budget. Publishing the slot or waking the owner does not complete
-the API. The owner's explicit claim, pending-map insertion and send are shown
-as separate calls below. A valid response may arrive before the submitting
-thread resumes, so application callback state must be ready before API entry.
+the API. The shared submission (F2–F5) is drawn in section 5.2 and the shared
+receive pipeline (F7–F8) in section 5.6; the diagram below shows only what is
+specific to the async byte API. A valid response may arrive before the
+submitting thread resumes, so application callback state must be ready before
+API entry.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Application
     participant API as client_send_request_async
     participant S as ClientRuntime / single slot
-    participant W as Retained request / result condition
-    participant IO as I/O owner
-    participant P as Pending map
-    participant Z as DEALER
-    participant G as Gateway ROUTER
+    participant IO as Client I/O owner
+    participant G as Gateway I/O owner (ROUTER)
+    participant H as Response handler
     A->>API: Client, serialized RpcRequest and size, response handler
-    API->>API: Validate required argument pointers and handler
-    opt Pointer arguments valid
-        API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
-        opt Admitted on an allowed application thread
-            API->>API: F1 Parse and own RpcRequest, validate nonzero service and<br/>safe length representation
-            opt Preparation succeeds
-                API->>W: Initialize owned Request, mode, generation and completion state
-            end
-        end
-    end
-    alt Invalid arguments / own I/O-thread request call / no usable<br/>connection / preparation allocation failure
+    API->>API: Validate required pointers and handler
+    API->>S: F1 RetainCall, check caller thread and READY, start original deadline
+    API->>API: F1 Parse and own RpcRequest, require nonzero service and<br/>safe length representation
+    break Invalid argument or handler, I/O-owner thread, not READY or preparation allocation failure
         API->>API: Release partial state and any retained call guard
-        API-->>A: CLIENT_INVALID_ARGUMENT / CLIENT_NOT_CONNECTED /<br/>CLIENT_OUT_OF_MEMORY, no response callback
-    else Prepared request
-        API->>S: F2 WaitAndPublish(request, original deadline)
-        opt Slot occupied
-            S->>S: Wait on slotAvailable, release mutex, recheck predicate after<br/>wake
-        end
-        alt Deadline, close or terminal runtime failure wins before<br/>publication
-            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED / stored failure reason
-            API->>API: Free unpublished state and release live-call guard
-            API-->>A: Exact local result, cleared outputs if any, no callback
-        else Slot EMPTY and call still eligible
-            S->>S: Publish retained request, mark PUBLISHED, unlock
-            S-->>API: Published
-            API->>IO: F3 WakeIo through existing pollable wakeup
-            API->>W: F6 WaitForSend, no runtime mutex held
-            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
-            S-->>IO: Owned Request, mode, generation and deadline
-            IO->>IO: F4 Recheck eligibility, assign ID/schema, serialize outside lock
-            IO->>P: F4 Insert expected response target before sending
-            alt Serialization or pending-map allocation fails
-                IO->>P: Retire partial unsent entry
-                IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching<br/>slot, notify slotAvailable
-                S-->>W: Notify committed send failure, normally CLIENT_OUT_OF_MEMORY
-            else Prepared and tracked
-                loop Until accepted or terminal send outcome
-                    IO->>S: F5 TryBeginSend, check cancellation, generation and deadline
-                    alt Deadline / explicit close / unexpected loss wins
-                        IO->>P: Retire unsent entry, prevent later send
-                        IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
-                        S-->>W: Notify winning timeout, close or stored failure result
-                    else Send attempt admitted
-                        IO->>Z: F5 zmq_send(one frame, DONTWAIT)
-                        alt EAGAIN or EINTR without acceptance
-                            IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
-                            opt Still eligible within original deadline
-                                IO->>IO: Retain CLAIMED slot, poll replies, monitor and writable<br/>readiness
-                            end
-                            Note over S,IO: If ineligible, next eligibility check retires without sending
-                        else Terminal send error
-                            IO->>P: Retire unsent entry
-                            IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
-                            S-->>W: Notify winning send error, preserve any earlier cancellation
-                        else libzmq accepts message
-                            IO->>S: CompleteSend(request, CLIENT_OK), clear matching slot, notify<br/>slotAvailable
-                            S-->>W: Notify immutable CLIENT_OK already committed by CompleteSend
-                            Z->>G: Transport RpcRequest over UDS
-                        end
-                    end
-                end
-            end
-            W-->>API: F6 One send result
-            API->>S: Release live-call guard
-            API-->>A: ClientResult, no response wait
-            opt Send accepted with CLIENT_OK
-                Note over S,P: Slot is free, pending response has no deadline
-                alt Response is delivered
-                    G-->>Z: RpcResponse with original ID/service/schema and Gateway status
-                    IO->>Z: F7 zmq_msg_recv(DONTWAIT), consume complete message
-                    Z-->>IO: Response frame
-                    IO->>P: F7 Match an accepted ID/generation and validate expected<br/>service/schema/status
-                    Note over IO,P: Unknown or premature replies follow the common pipeline, without<br/>completing this request
-                    alt Matched response validation fails
-                        IO->>P: Retire only the matched response record
-                        IO->>IO: Record diagnostics, no callback, send result stays CLIENT_OK
-                    else Matched response is valid
-                        IO->>IO: F8 Allocate and copy validated response bytes
-                        alt Response allocation fails
-                            IO->>P: Retire record and free temporary storage
-                            IO->>IO: Log allocation failure, no callback, send result stays CLIENT_OK
-                        else Final response ready
-                            IO->>P: F8 Claim callback delivery against explicit close
-                            alt Delivery claim succeeds
-                                IO->>P: Retire record once, do not change the submission slot
-                                IO->>IO: Release internal locks
-                                IO-->>A: handler(Client, owned serialized RpcResponse, size), on I/O<br/>thread
-                            else Another terminal path already won
-                                IO->>IO: Free uncommitted response, preserve winning result
-                            end
-                        end
-                    end
-                else Connection loss or explicit close
-                    IO->>P: Retire pending record and uncommitted response storage
-                    Note over IO,A: No response callback, accepted send result remains CLIENT_OK
-                end
-            end
-        end
+        API-->>A: CLIENT_INVALID_ARGUMENT, CLIENT_NOT_CONNECTED or<br/>CLIENT_OUT_OF_MEMORY, no callback
     end
+    API->>S: F2-F5 Submit through the single slot (section 5.2)
+    S-->>API: F6 Send result
+    API->>S: Release live-call guard
+    break Send not accepted
+        API-->>A: CLIENT_TIMEOUT, CLIENT_NOT_CONNECTED,<br/>CLIENT_COMMUNICATION_ERROR or CLIENT_OUT_OF_MEMORY, no callback
+    end
+    API-->>A: CLIENT_OK, libzmq accepted the message, no response wait
+    Note over S,IO: Slot is free, the pending response has no deadline
+    alt Valid response claimed
+        G-->>IO: RpcResponse, shared receive pipeline F7-F8
+        IO->>IO: Retire record, release internal locks
+        IO-->>H: handler(Client, owned serialized RpcResponse, size)<br/>on the Client I/O owner
+    else Matched response invalid or its allocation fails
+        G-->>IO: RpcResponse
+        IO->>IO: Retire record, log diagnostics, no callback, CLIENT_OK stays
+    else Connection loss or explicit close
+        IO->>IO: Retire record and uncommitted storage, no callback, CLIENT_OK stays
+    end
+    Note over A,H: A fast response can invoke the handler before the API call returns
 ```
 
 There is no response timeout after acceptance. All pre-acceptance failures
@@ -1555,115 +1366,47 @@ responses are outside this version's scope.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Application
     participant API as client_send_request_string
     participant S as ClientRuntime / single slot
     participant W as Retained request / result condition
-    participant IO as I/O owner
-    participant P as Pending map
-    participant Z as DEALER
-    participant G as Gateway ROUTER
+    participant IO as Client I/O owner
+    participant G as Gateway I/O owner (ROUTER)
     A->>API: Client, NUL-terminated text, out response
-    API->>API: Clear every supplied output and validate required argument<br/>pointers
-    opt Pointer arguments valid
-        API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
-        opt Admitted on an allowed application thread
-            API->>API: F1 Copy valid text through the first NUL, check size arithmetic,<br/>build service UNSPECIFIED envelope
-            opt Preparation succeeds
-                API->>W: Initialize owned Request, mode, generation and completion state
-            end
-        end
-    end
-    alt Invalid arguments / own I/O-thread request call / no usable<br/>connection / preparation allocation failure
+    API->>API: Clear the supplied output, validate required pointers
+    API->>S: F1 RetainCall, check caller thread and READY, start original deadline
+    API->>W: F1 Copy text through the first NUL, check size arithmetic,<br/>build envelope with service UNSPECIFIED (0)
+    break Invalid argument, I/O-owner thread, not READY or preparation allocation failure
         API->>API: Release partial state and any retained call guard
-        API-->>A: CLIENT_INVALID_ARGUMENT / CLIENT_NOT_CONNECTED /<br/>CLIENT_OUT_OF_MEMORY, no response callback
-    else Prepared request
-        API->>S: F2 WaitAndPublish(request, original deadline)
-        opt Slot occupied
-            S->>S: Wait on slotAvailable, release mutex, recheck predicate after<br/>wake
-        end
-        alt Deadline, close or terminal runtime failure wins before<br/>publication
-            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED / stored failure reason
-            API->>API: Free unpublished state and release live-call guard
-            API-->>A: Exact local result, cleared outputs if any, no callback
-        else Slot EMPTY and call still eligible
-            S->>S: Publish retained request, mark PUBLISHED, unlock
-            S-->>API: Published
-            API->>IO: F3 WakeIo through existing pollable wakeup
-            API->>W: F6 WaitForResponse within original deadline, no runtime mutex<br/>held
-            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
-            S-->>IO: Owned Request, mode, generation and deadline
-            IO->>IO: F4 Recheck eligibility, assign ID/schema, serialize outside lock
-            IO->>P: F4 Insert expected response target before sending
-            alt Serialization or pending-map allocation fails
-                IO->>P: Retire partial unsent entry
-                IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching<br/>slot, notify slotAvailable
-                S-->>W: Notify committed send failure, normally CLIENT_OUT_OF_MEMORY
-            else Prepared and tracked
-                loop Until accepted or terminal send outcome
-                    IO->>S: F5 TryBeginSend, check cancellation, generation and deadline
-                    alt Deadline / explicit close / unexpected loss wins
-                        IO->>P: Retire unsent entry, prevent later send
-                        IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
-                        S-->>W: Notify winning timeout, close or stored failure result
-                    else Send attempt admitted
-                        IO->>Z: F5 zmq_send(one frame, DONTWAIT)
-                        alt EAGAIN or EINTR without acceptance
-                            IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
-                            opt Still eligible within original deadline
-                                IO->>IO: Retain CLAIMED slot, poll replies, monitor and writable<br/>readiness
-                            end
-                            Note over S,IO: If ineligible, next eligibility check retires without sending
-                        else Terminal send error
-                            IO->>P: Retire unsent entry
-                            IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
-                            S-->>W: Notify winning send error, preserve any earlier cancellation
-                        else libzmq accepts message
-                            IO->>S: CompleteSend(request, CLIENT_OK), clear matching slot, notify<br/>slotAvailable
-                            Note over S,W: Send acceptance recorded, sync result remains pending unless<br/>timeout or close already won
-                            Z->>G: Transport RpcRequest over UDS
-                        end
-                    end
-                end
-            end
-            opt Send accepted and synchronous result still pending
-                Note over S,P: Slot is free for other callers during response wait
-                G->>G: Validate context, envelope and ID, find service UNSPECIFIED<br/>unsupported
-                G->>G: Log ERROR unsupported_service, no Crypto or worker dispatch
-                alt Response is delivered
-                    G-->>Z: RpcResponse with matching ID, service UNSPECIFIED, schema 1,<br/>UNSUPPORTED_SERVICE, empty payload
-                    IO->>Z: F7 zmq_msg_recv(DONTWAIT), consume complete message
-                    Z-->>IO: Response frame
-                    IO->>P: F7 Match an accepted ID/generation and validate expected<br/>service/schema/status
-                    Note over IO,P: Unknown or premature replies follow the common pipeline, without<br/>completing this request
-                    alt Matched response validation fails
-                        IO->>P: Retire only the matched response record
-                        IO->>W: TryComplete(CLIENT_COMMUNICATION_ERROR), preserve earlier result
-                    else Matched response is valid
-                        IO->>IO: F8 Copy validated non-OK RpcStatus name plus NUL
-                        alt Response allocation fails
-                            IO->>P: Retire record and free temporary storage
-                            IO->>W: TryComplete(CLIENT_OUT_OF_MEMORY), preserve earlier result
-                        else Final response ready
-                            IO->>P: F8 TryComplete response against close and original deadline
-                            alt Delivery claim succeeds
-                                IO->>P: Retire record once, do not change the submission slot
-                                IO->>W: CLIENT_OK and owned NUL-terminated status name
-                            else Another terminal path already won
-                                IO->>IO: Free uncommitted response, preserve winning result
-                            end
-                        end
-                    end
-                else Original deadline, connection loss or explicit close wins
-                    IO->>P: Retire pending record and uncommitted response storage
-                    IO->>W: TryComplete with winning timeout/loss/close result, cleared<br/>outputs
-                end
-            end
-            W-->>API: F6 One final result and response outputs
-            API->>S: Release live-call guard
-            API-->>A: ClientResult and response outputs
-        end
+        API-->>A: CLIENT_INVALID_ARGUMENT, CLIENT_NOT_CONNECTED or<br/>CLIENT_OUT_OF_MEMORY, NULL output
     end
+    API->>S: F2-F5 Submit through the single slot (section 5.2)
+    break Send not accepted
+        S-->>API: CLIENT_TIMEOUT, CLIENT_NOT_CONNECTED,<br/>CLIENT_COMMUNICATION_ERROR or CLIENT_OUT_OF_MEMORY
+        API->>S: Free unpublished state, release live-call guard
+        API-->>A: Same result, NULL output
+    end
+    API->>W: F6 WaitForResponse within the original deadline, no runtime mutex held
+    alt Gateway reply arrives before the deadline
+        G->>G: Validate context, envelope and ID, service 0 has no handler
+        G->>G: Log ERROR unsupported_service, no worker or Crypto call
+        G-->>IO: RpcResponse: same ID, service 0, schema 1,<br/>UNSUPPORTED_SERVICE, empty payload
+        IO->>IO: F7-F8 Shared receive pipeline, expect a known non-OK status<br/>and empty payload
+        alt Valid and status-name allocation succeeds
+            IO->>W: CLIENT_OK and owned text RPC_STATUS_UNSUPPORTED_SERVICE
+        else Unexpected OK, unknown status or nonempty payload
+            IO->>W: TryComplete(CLIENT_COMMUNICATION_ERROR)
+        else Status-name allocation fails
+            IO->>W: TryComplete(CLIENT_OUT_OF_MEMORY)
+        end
+    else Deadline, connection loss or explicit close wins first
+        IO->>W: TryComplete(CLIENT_TIMEOUT, CLIENT_COMMUNICATION_ERROR<br/>or CLIENT_NOT_CONNECTED)
+        Note over IO,G: A later reply for this ID is discarded
+    end
+    W-->>API: F6 One final result
+    API->>S: Release live-call guard
+    API-->>A: ClientResult and owned status text, NULL on every error
 ```
 
 #### Plain-string ownership and local failures
@@ -1706,116 +1449,41 @@ and does not return CLIENT_NOT_IMPLEMENTED locally.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Application
     participant API as client_send_request_string_async
     participant S as ClientRuntime / single slot
-    participant W as Retained request / result condition
-    participant IO as I/O owner
-    participant P as Pending map
-    participant Z as DEALER
-    participant G as Gateway ROUTER
+    participant IO as Client I/O owner
+    participant G as Gateway I/O owner (ROUTER)
+    participant H as String response handler
     A->>API: Client, NUL-terminated text, response handler
-    API->>API: Validate required argument pointers and handler
-    opt Pointer arguments valid
-        API->>S: F1 RetainCall, check caller thread and READY, start original<br/>deadline
-        opt Admitted on an allowed application thread
-            API->>API: F1 Copy valid text through the first NUL, check size arithmetic,<br/>build service UNSPECIFIED envelope
-            opt Preparation succeeds
-                API->>W: Initialize owned Request, mode, generation and completion state
-            end
-        end
-    end
-    alt Invalid arguments / own I/O-thread request call / no usable<br/>connection / preparation allocation failure
+    API->>API: Validate required pointers and handler
+    API->>S: F1 RetainCall, check caller thread and READY, start original deadline
+    API->>API: F1 Copy text through the first NUL, check size arithmetic,<br/>build envelope with service UNSPECIFIED (0)
+    break Invalid argument or handler, I/O-owner thread, not READY or preparation allocation failure
         API->>API: Release partial state and any retained call guard
-        API-->>A: CLIENT_INVALID_ARGUMENT / CLIENT_NOT_CONNECTED /<br/>CLIENT_OUT_OF_MEMORY, no response callback
-    else Prepared request
-        API->>S: F2 WaitAndPublish(request, original deadline)
-        opt Slot occupied
-            S->>S: Wait on slotAvailable, release mutex, recheck predicate after<br/>wake
-        end
-        alt Deadline, close or terminal runtime failure wins before<br/>publication
-            S-->>API: CLIENT_TIMEOUT / CLIENT_NOT_CONNECTED / stored failure reason
-            API->>API: Free unpublished state and release live-call guard
-            API-->>A: Exact local result, cleared outputs if any, no callback
-        else Slot EMPTY and call still eligible
-            S->>S: Publish retained request, mark PUBLISHED, unlock
-            S-->>API: Published
-            API->>IO: F3 WakeIo through existing pollable wakeup
-            API->>W: F6 WaitForSend, no runtime mutex held
-            IO->>S: F3 ClaimSubmission, lock/read/retain, mark CLAIMED, unlock
-            S-->>IO: Owned Request, mode, generation and deadline
-            IO->>IO: F4 Recheck eligibility, assign ID/schema, serialize outside lock
-            IO->>P: F4 Insert expected response target before sending
-            alt Serialization or pending-map allocation fails
-                IO->>P: Retire partial unsent entry
-                IO->>S: CompleteSend(request, CLIENT_OUT_OF_MEMORY), clear matching<br/>slot, notify slotAvailable
-                S-->>W: Notify committed send failure, normally CLIENT_OUT_OF_MEMORY
-            else Prepared and tracked
-                loop Until accepted or terminal send outcome
-                    IO->>S: F5 TryBeginSend, check cancellation, generation and deadline
-                    alt Deadline / explicit close / unexpected loss wins
-                        IO->>P: Retire unsent entry, prevent later send
-                        IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
-                        S-->>W: Notify winning timeout, close or stored failure result
-                    else Send attempt admitted
-                        IO->>Z: F5 zmq_send(one frame, DONTWAIT)
-                        alt EAGAIN or EINTR without acceptance
-                            IO->>S: End SEND_IN_PROGRESS under lock, check cancellation and<br/>eligibility
-                            opt Still eligible within original deadline
-                                IO->>IO: Retain CLAIMED slot, poll replies, monitor and writable<br/>readiness
-                            end
-                            Note over S,IO: If ineligible, next eligibility check retires without sending
-                        else Terminal send error
-                            IO->>P: Retire unsent entry
-                            IO->>S: CompleteSend(request, error), clear matching slot, notify<br/>slotAvailable
-                            S-->>W: Notify winning send error, preserve any earlier cancellation
-                        else libzmq accepts message
-                            IO->>S: CompleteSend(request, CLIENT_OK), clear matching slot, notify<br/>slotAvailable
-                            S-->>W: Notify immutable CLIENT_OK already committed by CompleteSend
-                            Z->>G: Transport RpcRequest over UDS
-                        end
-                    end
-                end
-            end
-            W-->>API: F6 One send result
-            API->>S: Release live-call guard
-            API-->>A: ClientResult, no response wait
-            opt Send accepted with CLIENT_OK
-                Note over S,P: Slot is free, pending response has no deadline
-                G->>G: Validate context, envelope and ID, find service UNSPECIFIED<br/>unsupported
-                G->>G: Log ERROR unsupported_service, no Crypto or worker dispatch
-                alt Response is delivered
-                    G-->>Z: RpcResponse with matching ID, service UNSPECIFIED, schema 1,<br/>UNSUPPORTED_SERVICE, empty payload
-                    IO->>Z: F7 zmq_msg_recv(DONTWAIT), consume complete message
-                    Z-->>IO: Response frame
-                    IO->>P: F7 Match an accepted ID/generation and validate expected<br/>service/schema/status
-                    Note over IO,P: Unknown or premature replies follow the common pipeline, without<br/>completing this request
-                    alt Matched response validation fails
-                        IO->>P: Retire only the matched response record
-                        IO->>IO: Record diagnostics, no callback, send result stays CLIENT_OK
-                    else Matched response is valid
-                        IO->>IO: F8 Copy validated non-OK RpcStatus name plus NUL
-                        alt Response allocation fails
-                            IO->>P: Retire record and free temporary storage
-                            IO->>IO: Log allocation failure, no callback, send result stays CLIENT_OK
-                        else Final response ready
-                            IO->>P: F8 Claim callback delivery against explicit close
-                            alt Delivery claim succeeds
-                                IO->>P: Retire record once, do not change the submission slot
-                                IO->>IO: Release internal locks
-                                IO-->>A: handler(Client, owned NUL-terminated status name), on I/O thread
-                            else Another terminal path already won
-                                IO->>IO: Free uncommitted response, preserve winning result
-                            end
-                        end
-                    end
-                else Connection loss or explicit close
-                    IO->>P: Retire pending record and uncommitted response storage
-                    Note over IO,A: No response callback, accepted send result remains CLIENT_OK
-                end
-            end
-        end
+        API-->>A: CLIENT_INVALID_ARGUMENT, CLIENT_NOT_CONNECTED or<br/>CLIENT_OUT_OF_MEMORY, no callback
     end
+    API->>S: F2-F5 Submit through the single slot (section 5.2)
+    S-->>API: F6 Send result
+    API->>S: Release live-call guard
+    break Send not accepted
+        API-->>A: CLIENT_TIMEOUT, CLIENT_NOT_CONNECTED,<br/>CLIENT_COMMUNICATION_ERROR or CLIENT_OUT_OF_MEMORY, no callback
+    end
+    API-->>A: CLIENT_OK, libzmq accepted the message, no response wait
+    Note over S,IO: Slot is free, the pending response has no deadline
+    alt Gateway reply arrives and is valid
+        G->>G: Validate context, envelope and ID, service 0 has no handler,<br/>log ERROR unsupported_service, no worker
+        G-->>IO: RpcResponse: same ID, service 0, schema 1,<br/>UNSUPPORTED_SERVICE, empty payload
+        IO->>IO: F7-F8 Shared receive pipeline, copy status name plus NUL,<br/>retire record, release internal locks
+        IO-->>H: handler(Client, owned text RPC_STATUS_UNSUPPORTED_SERVICE)<br/>on the Client I/O owner
+    else Unexpected OK, unknown status, nonempty payload or status-name allocation fails
+        G-->>IO: RpcResponse
+        IO->>IO: Retire record, log diagnostics, no callback, CLIENT_OK stays
+    else Connection loss or explicit close
+        IO->>IO: Retire record and uncommitted storage, no callback, CLIENT_OK stays
+    end
+    Note over A,H: A fast response can invoke the handler before the API call returns
 ```
 
 The wire envelope and exact status-text representation are defined in section
@@ -1944,11 +1612,12 @@ can execute for that Client after client_disconnect returns.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Application lifecycle thread
     participant API as client_disconnect
     participant C as ClientRuntime / single slot
     participant W as In-progress calls, slot and result waiters
-    participant IO as Serving thread and callbacks
+    participant IO as Client I/O owner and callbacks
     participant Z as libzmq / DEALER and monitor
     participant G as Gateway monitor
     A->>A: Stop new API entry and coordinate ownership of the handle
@@ -2145,8 +1814,9 @@ cannot be used in the new session.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Application thread
-    participant IO as Old client I/O owner
+    participant IO as Old Client I/O owner
     participant H as Connection handler on old I/O thread
     participant W as Pending waiters and records
     participant Z as Old DEALER and monitor

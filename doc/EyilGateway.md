@@ -410,13 +410,14 @@ Coverage: **AC1.1–AC1.3, AC1.7**.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant T as Thunder
     participant P as EyilGateway wrapper
     participant I as EyilGatewayImplementation
     participant W as Private pool
     participant Z as ZAP worker
     participant M as Monitor worker
-    participant R as ROUTER owner
+    participant R as Gateway I/O owner (ROUTER)
     T->>P: Initialize(IShell)
     P->>T: AddRef shell, Register notification
     P->>T: Root(IConfiguration, EyilGatewayImplementation)
@@ -488,6 +489,7 @@ Coverage: **AC1.2, AC1.4–AC1.6; AC2-Client.2–AC2-Client.3**.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant C as Client DEALER
     participant L as Gateway libzmq
     participant Z as ZAP REP worker
@@ -495,7 +497,7 @@ sequenceDiagram
     participant AM as AppManager - future
     participant RM as RuntimeManager - future
     participant REG as ConnectionRegistry
-    participant W as Private-pool lifecycle job
+    participant W as Worker (private pool), lifecycle job
     participant T as Thunder IShell
     participant CP as Crypto plugin / ICrypto
     C->>L: Direct UDS connection, dummy PLAIN credentials
@@ -515,6 +517,9 @@ sequenceDiagram
     alt Valid peer and runtime admission open
         Z->>REG: Bind transport lifetime to User-Id, create AUTHENTICATING context
         Z->>W: Schedule CONNECTED, no registry lock held
+        opt No private worker is free yet
+            Note over Z,W: ZAP waits for a worker, bound pending under<br/>AUTHENTICATION-PROGRESS, later handshakes wait behind it
+        end
         W->>T: Query ICrypto using configured callsign
         T-->>W: Scoped interface reference or nullptr
         alt Lookup returns nullptr
@@ -599,12 +604,13 @@ Coverage: **AC1.1, AC1.5–AC1.11; AC2-Client.5**.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant C as Client DEALER
-    participant R as Gateway ROUTER I/O owner
+    participant R as Gateway I/O owner (ROUTER)
     participant REG as ConnectionRegistry
     participant CURRENT as Current request, no queue
     participant P as Private Thunder pool
-    participant J as RequestJob
+    participant J as Worker (private pool), RequestJob
     participant S as Service adapter / buffer manager
     participant OUT as Completion handoff
     Note over R,CURRENT: Receive a new RPC only when no current request awaits dispatch
@@ -629,6 +635,7 @@ sequenceDiagram
             R->>P: Try reserve available worker and hand off without blocking
             opt No worker can start yet
                 R->>R: Pause further ROUTER receives, disable receive poll interest
+                Note over C,R: While paused, no connection's requests are read,<br/>including requests that would need no worker
                 Note over R,P: Continue replies, control/monitor events and deadline processing
                 P-->>R: Capacity change signals existing wakeup
                 R->>P: Retry eligible handoff within the original deadline
@@ -867,7 +874,7 @@ so they can safely perform their own lookups.
 
 ```mermaid
 sequenceDiagram
-    participant J as Private-pool operation or lifecycle job
+    participant J as Worker (private pool), operation or lifecycle job
     participant A as CryptoServiceAdapter
     participant T as Thunder IShell
     participant C as Crypto plugin / ICrypto
@@ -986,10 +993,11 @@ separate flows.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant F as Firebolt Crypto / consumer
     participant L as EyilClient
-    participant R as Gateway ROUTER
-    participant J as Private request job / adapter
+    participant R as Gateway I/O owner (ROUTER)
+    participant J as Worker (private pool), Crypto adapter
     participant T as Thunder IShell
     participant C as Crypto plugin / ICrypto
     F->>F: Serialize CryptoRequest inside RpcRequest with service CRYPTO
@@ -1245,10 +1253,11 @@ objects.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as App-side Crypto / buffer helper
     participant L as EyilClient
-    participant R as Gateway ROUTER
-    participant J as Private request job
+    participant R as Gateway I/O owner (ROUTER)
+    participant J as Worker (private pool)
     participant B as SharedBufferManager
     participant K as Linux / peer private dev-shm
     A->>A: Put AllocateSharedBufferRequest in CryptoRequest and RpcRequest
@@ -1256,33 +1265,33 @@ sequenceDiagram
     L->>R: RpcRequest through DEALER IPC
     R->>J: Dispatch with retained connection context
     J->>B: Allocate(owner, requested_size)
-    B->>B: Validate size, prepare cleanup record, reserve count/byte quota
+    B->>B: Validate requested size
     alt Requested size is zero
         B->>B: Log ERROR, create no object
         B-->>J: CRYPTO_ERROR_INVALID_PARAMETERS
     else Requested size exceeds 32 MiB per-buffer limit
         B->>B: Log ERROR with size and limit, create no object
         B-->>J: CRYPTO_ERROR_OVERSIZED_INPUT_DATA
-    else Count/byte quota or allocation bookkeeping unavailable
-        B->>B: Roll back partial reservation and log ERROR
-        B-->>J: CRYPTO_ERROR_OPERATION_FAILED
-    else Validation and quota reservation succeed
-        B->>K: Retain peer shm directory FD, create exclusive object relative to it
-        B->>K: ftruncate then fallocate full capacity with Gateway-only access
-        B->>K: Set approved peer ownership/permissions, verify final size
-        alt Creation, sizing, preallocation or ownership/permission setup fails
-            B->>B: Log ERROR, roll back object/FD/quota before publication
-            opt Physical rollback cannot finish
-                B->>B: Retain private cleanup record and unreclaimed quota
+    else Size valid
+        B->>B: Prepare cleanup record, reserve count/byte quota atomically
+        alt Count/byte quota or allocation bookkeeping unavailable
+            B->>B: Roll back partial reservation and log ERROR
+            B-->>J: CRYPTO_ERROR_OPERATION_FAILED
+        else Quota reserved
+            B->>K: Retain peer shm directory FD, create exclusive object relative to it
+            B->>K: ftruncate then fallocate full capacity with Gateway-only access
+            B->>K: Set approved peer ownership/permissions, verify final size
+            alt Creation, sizing, preallocation or ownership/permission setup fails
+                B->>B: Log ERROR, roll back object/FD/quota, keep cleanup record if rollback fails
+                B-->>J: CRYPTO_ERROR_OPERATION_FAILED, no published buffer ID
+            else Connection closed before publication
+                B->>B: Roll back unpublished object, retain cleanup state on failure
+                B-->>J: No usable allocation, retire through connection-close handling
+            else Object prepared and connection still admits publication
+                K-->>B: Retained object/directory references and verified capacity
+                B->>B: Publish buffer_id, client name, host path, capacity and owner
+                B-->>J: CRYPTO_ERROR_NONE and AllocateSharedBufferResponse
             end
-            B-->>J: CRYPTO_ERROR_OPERATION_FAILED, no published buffer ID
-        else Object prepared and connection still admits publication
-            K-->>B: Retained object/directory references and verified capacity
-            B->>B: Publish buffer_id, client name, host path, capacity and owner
-            B-->>J: CRYPTO_ERROR_NONE and AllocateSharedBufferResponse
-        else Connection closed before publication
-            B->>B: Roll back unpublished object, retain cleanup state on failure
-            B-->>J: No usable allocation, retire through connection-close handling
         end
     end
     opt Service result is safely correlatable and response storage is available
@@ -1356,261 +1365,84 @@ and return RPC_STATUS_INTERNAL without exposing that region as usable output.
 Definitive backend return still ends the lease and can complete pending release;
 response validation or serialization must not leave completed access active.
 
-The following diagrams expand the four operation-specific calls using the
-deployed Crypto plugin. Each invocation acquires its own scoped ICrypto
-reference. CONNECTED has already completed during authentication; null lookup
-and invocation failures follow sections 6.7 and 6.15.
-
-#### Encrypt
-
-Coverage: **AC1.8–AC1.11; AC2-Firebolt.1–AC2-Firebolt.2**.
-
-```mermaid
-sequenceDiagram
-    participant A as App-side Crypto / mapped buffer
-    participant L as EyilClient
-    participant R as Gateway ROUTER
-    participant J as Private job / Crypto adapter
-    participant B as SharedBufferManager
-    participant T as Thunder IShell
-    participant C as Crypto plugin / ICrypto
-    A->>A: Write init_data and plaintext input_data
-    A->>A: Wrap EncryptRequest(buffer_id, algorithm, key_id, regions) in CryptoRequest and RpcRequest
-    A->>L: Byte request API with serialized RpcRequest, service CRYPTO
-    L->>R: RpcRequest over DEALER IPC
-    R->>J: Dispatch independent job
-    J->>B: TryUse(owner, buffer_id, regions) at execution time
-    alt Missing, unowned, released, release-pending or busy buffer
-        B->>B: Log ERROR with exact cause, owner and request ID
-        B-->>J: CRYPTO_ERROR_INVALID_SESSION_STATE, no active-use lease
-        J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call or retry
-    else Invalid caller-supplied region
-        B->>B: Log ERROR for invalid bounds or region parameters
-        B-->>J: CRYPTO_ERROR_INVALID_PARAMETERS, no active-use lease
-        J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call
-    else Idle owned allocation claimed atomically
-        B-->>J: Retained object identity and capacity
-        J->>T: Query ICrypto using configuration.cryptocallsign
-        T-->>J: Scoped reference or nullptr
-        alt Lookup returns nullptr
-            J->>B: FinishUse for unused lease, finalize pending release if eligible
-            J->>J: Log ERROR for unavailable ICrypto
-            J-->>R: RPC_STATUS_INTERNAL
-        else Scoped reference acquired
-            J->>C: Encrypt(context, buffer, algorithm, keyId, initData, inputData)
-            C->>C: Open/check/map, enforce key policy, write ciphertext
-            C->>C: Unmap and close before normal return
-            C-->>J: Invocation result, CryptoError, encryptedData region
-            alt Core invocation failed
-                J->>C: Release scoped reference after call returns
-                alt Backend access remains uncertain
-                    J->>B: Retain lease and any pending release
-                else Access definitively ended or was never started
-                    J->>B: FinishUse, finalize pending release if eligible
-                end
-                J->>J: Log ERROR and ignore undefined outputs
-                J-->>R: RPC_STATUS_INTERNAL, no automatic replay
-            else Invocation completed
-                J->>C: Release immediately after invocation
-                J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
-                J->>J: Validate successful output or preserve overflow result
-                J->>B: FinishUse after definitive completion, finalize pending release if eligible
-                J-->>R: Completion with EncryptResponse
-            end
-        end
-    end
-    R-->>L: RpcResponse
-    L-->>A: Matched RpcResponse bytes through waiter or callback
-    A->>A: Check RpcStatus and CryptoError, decode region, read ciphertext only on success
-```
-
-#### Decrypt
+The four shared-memory operations follow one flow, drawn once below. Each
+invocation acquires its own scoped ICrypto reference. CONNECTED has already
+completed during authentication; null lookup and invocation failures follow
+sections 6.7 and 6.15. The table lists what differs per operation. Each
+`break` block ends the job early; its error completion still reaches the client
+through the same single send attempt as the final response.
 
 Coverage: **AC1.8–AC1.11; AC2-Firebolt.1–AC2-Firebolt.2**.
 
-```mermaid
-sequenceDiagram
-    participant A as App-side Crypto / mapped buffer
-    participant L as EyilClient
-    participant R as Gateway ROUTER
-    participant J as Private job / Crypto adapter
-    participant B as SharedBufferManager
-    participant T as Thunder IShell
-    participant C as Crypto plugin / ICrypto
-    A->>A: Write init_data and encrypted_data
-    A->>A: Wrap DecryptRequest(buffer_id, algorithm, key_id, regions) in CryptoRequest and RpcRequest
-    A->>L: Byte request API with serialized RpcRequest, service CRYPTO
-    L->>R: RpcRequest over DEALER IPC
-    R->>J: Dispatch independent job
-    J->>B: TryUse(owner, buffer_id, regions) at execution time
-    alt Missing, unowned, released, release-pending or busy buffer
-        B->>B: Log ERROR with exact cause, owner and request ID
-        B-->>J: CRYPTO_ERROR_INVALID_SESSION_STATE, no active-use lease
-        J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call or retry
-    else Invalid caller-supplied region
-        B->>B: Log ERROR for invalid bounds or region parameters
-        B-->>J: CRYPTO_ERROR_INVALID_PARAMETERS, no active-use lease
-        J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call
-    else Idle owned allocation claimed atomically
-        B-->>J: Trusted object identity and capacity
-        J->>T: Query ICrypto using configuration.cryptocallsign
-        T-->>J: Scoped reference or nullptr
-        alt Lookup returns nullptr
-            J->>B: FinishUse for unused lease, finalize pending release if eligible
-            J->>J: Log ERROR for unavailable ICrypto
-            J-->>R: RPC_STATUS_INTERNAL
-        else Scoped reference acquired
-            J->>C: Decrypt(context, buffer, algorithm, keyId, initData, encryptedData)
-            C->>C: Open/check/map, enforce key policy, write plaintext
-            C->>C: Unmap and close before normal return
-            C-->>J: Invocation result, CryptoError, outputData region
-            alt Core invocation failed
-                J->>C: Release scoped reference after call returns
-                alt Backend access remains uncertain
-                    J->>B: Retain lease and any pending release
-                else Access definitively ended or was never started
-                    J->>B: FinishUse, finalize pending release if eligible
-                end
-                J->>J: Log ERROR and ignore undefined outputs
-                J-->>R: RPC_STATUS_INTERNAL, no automatic replay
-            else Invocation completed
-                J->>C: Release immediately after invocation
-                J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
-                J->>J: Validate result and successful output bounds
-                J->>B: FinishUse after definitive completion, finalize pending release if eligible
-                J-->>R: Completion with DecryptResponse
-            end
-        end
-    end
-    R-->>L: RpcResponse
-    L-->>A: Matched RpcResponse bytes through waiter or callback
-    A->>A: Check RpcStatus and CryptoError, decode region, read plaintext only on success
-```
-
-#### Sign
-
-Coverage: **AC1.8–AC1.11; AC2-Firebolt.1–AC2-Firebolt.2**.
+| Operation | App writes before the request | ICrypto call | Output returned | BUFFER_OVERFLOW possible | App reads on success |
+| --- | --- | --- | --- | --- | --- |
+| Encrypt | init_data, plaintext input_data | Encrypt(context, buffer, algorithm, keyId, initData, inputData) | encrypted_data region | Yes | Ciphertext region |
+| Decrypt | init_data, encrypted_data | Decrypt(context, buffer, algorithm, keyId, initData, encryptedData) | output_data region | Yes | Plaintext region |
+| Sign | input_data | Sign(context, buffer, algorithm, keyId, digestAlgorithm, inputData) | signature region | Yes | Signature region |
+| Verify | input_data, expected_signature | Verify(context, buffer, algorithm, keyId, digestAlgorithm, inputData, expectedSignature) | verification_status | No | verification_status only, no binary output region |
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as App-side Crypto / mapped buffer
     participant L as EyilClient
-    participant R as Gateway ROUTER
-    participant J as Private job / Crypto adapter
+    participant R as Gateway I/O owner (ROUTER)
+    participant J as Worker (private pool), Crypto adapter
     participant B as SharedBufferManager
     participant T as Thunder IShell
     participant C as Crypto plugin / ICrypto
-    A->>A: Write input_data
-    A->>A: Wrap SignRequest(buffer_id, algorithm, key_id, digest, input) in CryptoRequest and RpcRequest
+    A->>A: Write the operation's input regions (see table)
+    A->>A: Wrap Op request (buffer_id, algorithm, key_id, regions)<br/>in CryptoRequest and RpcRequest
     A->>L: Byte request API with serialized RpcRequest, service CRYPTO
     L->>R: RpcRequest over DEALER IPC
-    R->>J: Dispatch independent job
+    R->>J: Dispatch independent job (section 6.6)
     J->>B: TryUse(owner, buffer_id, regions) at execution time
-    alt Missing, unowned, released, release-pending or busy buffer
+    break Missing, unowned, released, release-pending or busy buffer
         B->>B: Log ERROR with exact cause, owner and request ID
         B-->>J: CRYPTO_ERROR_INVALID_SESSION_STATE, no active-use lease
         J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call or retry
-    else Invalid caller-supplied region
+    end
+    break Invalid caller-supplied region
         B->>B: Log ERROR for invalid bounds or region parameters
         B-->>J: CRYPTO_ERROR_INVALID_PARAMETERS, no active-use lease
         J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call
-    else Idle owned allocation claimed atomically
-        B-->>J: Trusted object identity and capacity
-        J->>T: Query ICrypto using configuration.cryptocallsign
-        T-->>J: Scoped reference or nullptr
-        alt Lookup returns nullptr
-            J->>B: FinishUse for unused lease, finalize pending release if eligible
-            J->>J: Log ERROR for unavailable ICrypto
-            J-->>R: RPC_STATUS_INTERNAL
-        else Scoped reference acquired
-            J->>C: Sign(context, buffer, algorithm, keyId, digestAlgorithm, inputData)
-            C->>C: Open/check/map, sign, select/write signature region
-            C->>C: Unmap and close before normal return
-            C-->>J: Invocation result, CryptoError, signature region
-            alt Core invocation failed
-                J->>C: Release scoped reference after call returns
-                alt Backend access remains uncertain
-                    J->>B: Retain lease and any pending release
-                else Access definitively ended or was never started
-                    J->>B: FinishUse, finalize pending release if eligible
-                end
-                J->>J: Log ERROR and ignore undefined outputs
-                J-->>R: RPC_STATUS_INTERNAL, no automatic replay
-            else Invocation completed
-                J->>C: Release immediately after invocation
-                J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
-                J->>J: Validate success region or overflow result
-                J->>B: FinishUse after definitive completion, finalize pending release if eligible
-                J-->>R: Completion with SignResponse
-            end
-        end
     end
-    R-->>L: RpcResponse
-    L-->>A: Matched RpcResponse bytes through waiter or callback
-    A->>A: Check RpcStatus and CryptoError, decode region, read signature only on success
-```
-
-#### Verify
-
-Coverage: **AC1.8–AC1.11; AC2-Firebolt.1–AC2-Firebolt.2**.
-
-```mermaid
-sequenceDiagram
-    participant A as App-side Crypto / mapped buffer
-    participant L as EyilClient
-    participant R as Gateway ROUTER
-    participant J as Private job / Crypto adapter
-    participant B as SharedBufferManager
-    participant T as Thunder IShell
-    participant C as Crypto plugin / ICrypto
-    A->>A: Write input_data and expected_signature
-    A->>A: Wrap VerifyRequest(buffer_id, algorithms, key_id, regions) in CryptoRequest and RpcRequest
-    A->>L: Byte request API with serialized RpcRequest, service CRYPTO
-    L->>R: RpcRequest over DEALER IPC
-    R->>J: Dispatch independent job
-    J->>B: TryUse(owner, buffer_id, regions) at execution time
-    alt Missing, unowned, released, release-pending or busy buffer
-        B->>B: Log ERROR with exact cause, owner and request ID
-        B-->>J: CRYPTO_ERROR_INVALID_SESSION_STATE, no active-use lease
-        J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call or retry
-    else Invalid caller-supplied region
-        B->>B: Log ERROR for invalid bounds or region parameters
-        B-->>J: CRYPTO_ERROR_INVALID_PARAMETERS, no active-use lease
-        J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call
-    else Idle owned allocation claimed atomically
-        B-->>J: Trusted object identity and capacity
-        J->>T: Query ICrypto using configuration.cryptocallsign
-        T-->>J: Scoped reference or nullptr
-        alt Lookup returns nullptr
-            J->>B: FinishUse for unused lease, finalize pending release if eligible
-            J->>J: Log ERROR for unavailable ICrypto
-            J-->>R: RPC_STATUS_INTERNAL
-        else Scoped reference acquired
-            J->>C: Verify(context, buffer, algorithms, keyId, input, signature)
-            C->>C: Open/check/map, enforce key policy, compare signature
-            C->>C: Unmap and close before normal return
-            C-->>J: Invocation result, CryptoError, verificationStatus
-            alt Core invocation failed
-                J->>C: Release scoped reference after call returns
-                alt Backend access remains uncertain
-                    J->>B: Retain lease and any pending release
-                else Access definitively ended or was never started
-                    J->>B: FinishUse, finalize pending release if eligible
-                end
-                J->>J: Log ERROR and ignore undefined outputs
-                J-->>R: RPC_STATUS_INTERNAL, no automatic replay
-            else Invocation completed
-                J->>C: Release immediately after invocation
-                J->>J: Log returned service failure if any, preserve CryptoError and defined outputs
-                J->>B: FinishUse after definitive completion, finalize pending release if eligible
-                J-->>R: Completion with VerifyResponse
-            end
-        end
+    B-->>J: Idle owned allocation claimed atomically, retained object identity and capacity
+    J->>J: Check operation-specific input limits
+    break Input exceeds the operation maximum
+        J->>B: FinishUse for the unused lease, finalize pending release if eligible
+        J->>J: Log ERROR with input length and operation limit
+        J-->>R: RPC_STATUS_OK with CRYPTO_ERROR_OVERSIZED_INPUT_DATA, no Crypto call
     end
-    R-->>L: RpcResponse
+    J->>T: Query ICrypto using configuration.cryptocallsign
+    T-->>J: Scoped reference or nullptr
+    break Lookup returns nullptr
+        J->>B: FinishUse for the unused lease, finalize pending release if eligible
+        J->>J: Log ERROR for unavailable ICrypto
+        J-->>R: RPC_STATUS_INTERNAL
+    end
+    J->>C: Op(context, buffer, ...) as listed in the table
+    C->>C: Open/check/map, enforce key policy, perform the operation
+    C->>C: Unmap and close before normal return
+    C-->>J: Invocation result, CryptoError, output region or status
+    J->>C: Release the scoped reference after the call returns
+    alt Core invocation failed, backend access uncertain
+        J->>B: Retain lease and any pending release
+        J->>J: Log ERROR and ignore undefined outputs
+        J-->>R: RPC_STATUS_INTERNAL, no automatic replay
+    else Core invocation failed, access definitively ended or never started
+        J->>B: FinishUse, finalize pending release if eligible
+        J->>J: Log ERROR and ignore undefined outputs
+        J-->>R: RPC_STATUS_INTERNAL, no automatic replay
+    else Invocation completed
+        J->>J: Preserve CryptoError, log a returned service failure
+        J->>J: Validate a successful output region,<br/>or preserve the BUFFER_OVERFLOW required region
+        J->>B: FinishUse after definitive completion, finalize pending release if eligible
+        J-->>R: Completion with the operation's response
+    end
+    R-->>L: RpcResponse, one send attempt
     L-->>A: Matched RpcResponse bytes through waiter or callback
-    A->>A: Check RpcStatus and CryptoError, decode verification_status
-    Note over A,C: Verify returns no binary output region
+    A->>A: Check RpcStatus and CryptoError, decode the output,<br/>read output regions only on success
 ```
 
 A verification result of false and a failed invocation are different outcomes.
@@ -1696,10 +1528,11 @@ dependency queue or promise that an admitted operation will succeed.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as App-side buffer helper
     participant L as EyilClient
-    participant R as Gateway ROUTER
-    participant J as Private release job
+    participant R as Gateway I/O owner (ROUTER)
+    participant J as Worker (private pool), release job
     participant B as SharedBufferManager
     participant K as Linux
     A->>A: Stop further use, unmap and close own view
@@ -1739,10 +1572,11 @@ The following flow shows release during an active operation on a live connection
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Application
-    participant R as Gateway ROUTER
-    participant W as Crypto request worker
-    participant F as Release worker
+    participant R as Gateway I/O owner (ROUTER)
+    participant W as Worker (private pool), Crypto operation
+    participant F as Worker (private pool), release job
     participant B as SharedBufferManager
     participant C as Crypto plugin / ICrypto
     participant K as Linux
@@ -1779,15 +1613,16 @@ The release-before-use case is also intentionally allowed:
 ```mermaid
 sequenceDiagram
     participant A as Application
-    participant R as Gateway ROUTER / current request
-    participant E as Encrypt worker
-    participant F as Release worker
+    participant R as Gateway I/O owner (ROUTER)
+    participant E as Worker (private pool), Encrypt
+    participant F as Worker (private pool), release job
     participant B as SharedBufferManager
     A->>R: Encrypt(B), request ID 10
-    A->>R: ReleaseSharedBuffer(B), request ID 11
     R->>E: Dispatch Encrypt, no buffer reservation before execution
+    Note over R,E: The next RPC is read only after Encrypt has started RUNNING
+    A->>R: ReleaseSharedBuffer(B), request ID 11
     R->>F: Dispatch Release
-    Note over E,F: Worker scheduling does not guarantee arrival order
+    Note over E,F: Release can overtake Encrypt only between Encrypt starting<br/>and its TryUse, for example while it decodes the request
     F->>B: RequestRelease(B), mark idle allocation releasePending
     B->>B: Claim immediate cleanup once, keep ID unavailable
     B-->>F: Release accepted
@@ -1969,6 +1804,7 @@ handler. Neither connection sends an application message in this sequence.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant A as Client A
     participant B as Client B - same process
     participant T as Gateway libzmq
@@ -2044,6 +1880,7 @@ without an RPC while A remains live.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant B as Client B
     participant T as Gateway libzmq
     participant M as Gateway monitor PAIR
@@ -2271,11 +2108,12 @@ and cleanup, independently of the new context.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant P as Peer / kernel
     participant Z as libzmq monitor producer
     participant M as Gateway PAIR monitor worker
-    participant REG as Registry / Gateway ROUTER I/O owner
-    participant J as Accepted request and initialization jobs / private pool
+    participant REG as Registry / Gateway I/O owner (ROUTER)
+    participant J as Worker (private pool), accepted and lifecycle jobs
     participant C as Crypto adapter
     participant T as Thunder IShell
     participant CP as Crypto plugin / ICrypto
@@ -2294,16 +2132,25 @@ sequenceDiagram
         J-->>REG: Jobs settled, including any uncertain buffer-access outcome
         alt Backend access is definitively over
             opt CONNECTED succeeded
-                REG->>C: Schedule one DISCONNECTED lifecycle job
+                REG->>J: Schedule one DISCONNECTED lifecycle job
+                J->>C: NotifyAppState(context, DISCONNECTED)
                 C->>T: Query ICrypto using configured callsign
                 T-->>C: Scoped reference or nullptr
-                alt Interface acquired
+                alt Lookup failed
+                    C-->>J: Lookup failure, nothing dispatched
+                    J-->>REG: Log ERROR notification failure, no background retry
+                else Core invocation failed or CryptoError returned
                     C->>CP: NotifyAppState(context, DISCONNECTED)
-                    CP-->>C: Invocation and service result
-                    C->>CP: Release reference on every completed call path
-                    C-->>REG: Notification outcome, log any failure
-                else Lookup failed
-                    C-->>REG: Log cleanup notification failure, no background retry
+                    CP-->>C: Failure result
+                    C->>CP: Release reference after the call returns
+                    C-->>J: Failure result
+                    J-->>REG: Log ERROR notification failure, no background retry
+                else Notification succeeded
+                    C->>CP: NotifyAppState(context, DISCONNECTED)
+                    CP-->>C: Success
+                    C->>CP: Release reference after the call returns
+                    C-->>J: Success
+                    J-->>REG: Notification complete
                 end
             end
             REG->>B: Mark remaining allocations releasePending, finalize through retained references
@@ -2495,12 +2342,13 @@ authentication rejects that setup as specified in section 6.5.
 
 ```mermaid
 sequenceDiagram
-    participant J as Operation or lifecycle job
+    autonumber
+    participant J as Worker (private pool), operation or lifecycle job
     participant A as Crypto adapter
     participant T as Thunder IShell
     participant C as Crypto plugin / ICrypto
     participant B as SharedBufferManager
-    participant R as ROUTER owner
+    participant R as Gateway I/O owner (ROUTER)
     J->>A: Execute with trusted connection context
     A->>T: QueryInterfaceByCallsign using configured callsign
     T-->>A: Scoped reference or nullptr
@@ -2579,10 +2427,15 @@ stateDiagram-v2
     STOPPED --> STARTING: Initialize fresh runtime
     STARTING --> RUNNING: Owners ready and ROUTER bound
     STARTING --> STOPPING: Startup failure
-    RUNNING --> DRAINING: Deinitialize closes admission
+    RUNNING --> DRAINING: Deinitialize or runtime failure closes admission
+    DRAINING --> DRAINING: Backend access or cleanup still unresolved
     DRAINING --> STOPPING: Accepted work and cleanup settled
     STOPPING --> STOPPED: All sockets closed and threads joined
     STOPPED --> STARTING: Reactivate with new generation
+    note right of DRAINING
+        A non-returning backend call keeps the runtime here.
+        No forced timeout or thread kill.
+    end note
 ```
 
 The wrapper calls the private StopAndWait() lifecycle contract before releasing
@@ -2644,10 +2497,11 @@ callback that initiated teardown.
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant T as Thunder
     participant P as EyilGateway wrapper
     participant I as Runtime / drain coordinator
-    participant R as Gateway ROUTER I/O owner
+    participant R as Gateway I/O owner (ROUTER)
     participant Z as ZAP worker
     participant M as Monitor worker
     participant W as Private request pool
@@ -2657,52 +2511,58 @@ sequenceDiagram
     T->>P: Deinitialize
     P->>P: Suppress new callbacks, retain implementation and IShell
     P->>I: StopAndWait()
-    Note over I,B: Normal path requires definitive backend completion and completed resource cleanup<br/>Unresolved access or cleanup errors keep teardown pending
-    I->>I: RUNNING to DRAINING under admission lock
+    I->>I: RUNNING to DRAINING under admission lock, mark all contexts DRAINING<br/>(no new admission, routes kept for replies)
     I->>B: Establish lifecycle finalization gates, retain pending releases and quota
-    I->>R: Close new admission, preserve receive pause and replies/control processing
+    I->>R: Close new admission, keep replies and control processing running
     I->>Z: Reject new authentication, resolve in-progress setup
-    I->>W: Drain running work and current request with its original start deadline
-    loop Until accepted work settles
-        alt Job starts before its deadline
-            W->>CP: Scoped query, operation and Release
-            CP-->>W: Definitive operation result
-            W-->>R: Original-generation completion
-            W->>B: FinishUse, record pending-release readiness without gated destruction
-            W-->>I: Settle job, lease and any already-claimed finalizer accounting
-        else Current request reaches its original worker-start deadline
-            R->>R: Atomically expire request, log worker_pool_exhausted, prepare RPC_STATUS_INTERNAL
+    par Running jobs complete
+        W->>CP: Scoped query, operation and Release
+        CP-->>W: Definitive operation result
+        W-->>R: Original-generation completion
+        W->>B: FinishUse, record pending-release readiness without gated destruction
+        W-->>I: Settle job, lease and any already-claimed finalizer accounting
+    and Current request starts or expires
+        alt Worker claims RUNNING before its original deadline
+            W-->>I: Runs and settles like any other job
+        else Original worker-start deadline expires
+            R->>R: Atomically expire, log worker_pool_exhausted, prepare RPC_STATUS_INTERNAL
             R->>I: Settle accounting after the expired handoff is reclaimed
         end
-        R->>R: Attempt reply once, release on acceptance or log and drop on failure
     end
-    I->>CP: Schedule per-context DISCONNECTED on private pool
-    Note over I,CP: Each notification acquires/releases its own ICrypto reference
+    R->>R: Attempt each reply once, release on acceptance or log and drop on failure
+    I->>CP: Schedule per-context DISCONNECTED on the private pool
+    Note over I,CP: Each notification acquires and releases its own ICrypto reference
     CP-->>I: Lifecycle jobs finish
     I->>B: Mark remaining buffers releasePending, finalize after access and notification
-    B-->>I: Physical cleanup complete, quota and retained references released once
-    I->>I: Mark all contexts CLOSING, enter STOPPING
-    I->>R: Wake owner to retire egress and close transport
-    R->>R: Disable monitor, zmq_close(ROUTER) with LINGER=0
-    Note over R,M: No per-client DISCONNECTED event is required for plugin stop
-    R-->>I: ROUTER closed on owner
-    I->>X: zmq_ctx_shutdown()
-    X-->>Z: Blocked socket operations wake with ETERM
-    X-->>M: Blocked socket operations wake with ETERM
-    I->>Z: Signal existing stop wakeup
-    I->>M: Signal existing stop wakeup
-    Z->>Z: Close REP exactly once, exit
-    M->>M: Close PAIR exactly once, exit
-    I->>I: Join ROUTER, ZAP and monitor owners
-    I->>X: zmq_ctx_term(), retry EINTR
-    X-->>I: Context and libzmq internal threads terminated
-    I->>W: Stop and join drained private pool
-    I->>I: Check saved filesystem socket identity, remove only the owned pathname
-    I->>I: Release current request, completion records, registry and endpoint ownership, publish STOPPED
-    I-->>P: StopAndWait complete
-    P->>P: Release implementation/control references, reset activation flags
-    P->>T: Unregister remaining notifications and release IShell
-    P-->>T: Deinitialize complete
+    alt Backend access unresolved or physical cleanup failed
+        B-->>I: ERROR logged, private cleanup records and quota retained
+        I->>I: Stay DRAINING, teardown is not reported complete
+        Note over I,B: Completion evidence later makes cleanup eligible (section 7.1)
+    else Cleanup complete
+        B-->>I: Quota and retained references released once
+        I->>I: Mark all contexts CLOSING, enter STOPPING
+        I->>R: Wake owner to retire egress and close transport
+        R->>R: Disable monitor, zmq_close(ROUTER) with LINGER=0
+        Note over R,M: No per-client DISCONNECTED event is required for plugin stop
+        R-->>I: ROUTER closed on owner
+        I->>X: zmq_ctx_shutdown()
+        X-->>Z: Blocked socket operations wake with ETERM
+        X-->>M: Blocked socket operations wake with ETERM
+        I->>Z: Signal existing stop wakeup
+        I->>M: Signal existing stop wakeup
+        Z->>Z: Close REP exactly once, exit
+        M->>M: Close PAIR exactly once, exit
+        I->>I: Join ROUTER, ZAP and monitor owners
+        I->>X: zmq_ctx_term(), retry EINTR
+        X-->>I: Context and libzmq internal threads terminated
+        I->>W: Stop and join drained private pool
+        I->>I: Check saved filesystem socket identity, remove only the owned pathname
+        I->>I: Release current request, completion records, registry and endpoint ownership, publish STOPPED
+        I-->>P: StopAndWait complete
+        P->>P: Release implementation/control references, reset activation flags
+        P->>T: Unregister remaining notifications and release IShell
+        P-->>T: Deinitialize complete
+    end
 ```
 
 #### ROUTER and context teardown
