@@ -128,16 +128,24 @@ extern "C"
         uint8_t **response_data, size_t *response_size);
 
     /**
-     * Starts an asynchronous serialized Google Protocol Buffers request.
+     * Sends a serialized Google Protocol Buffers request through the same
+     * transport and validation as client_send_request(). Waits for send
+     * acceptance, then returns without waiting for the response. Submission has
+     * a 15-second deadline; response waiting has no timeout.
      *
      * @param client [IN] Connected client handle.
      * @param request_data [IN] Serialized protobuf request message. Must contain
      *        exactly request_size bytes and must not be NULL when request_size is
      *        non-zero.
      * @param request_size [IN] Size in bytes of the serialized protobuf request.
-     * @param handler [IN] Response callback.
+     * @param handler [IN] Non-NULL callback receiving a validated response at
+     *        most once. Response ownership passes to the callback, which must
+     *        release it with client_free_response().
      *
-     * @return CLIENT_NOT_IMPLEMENTED until asynchronous requests are implemented.
+     * @return CLIENT_OK after libzmq accepts the message, otherwise an
+     *         appropriate ClientResult value. An error return invokes no
+     *         response callback. CLIENT_OK confirms local send acceptance;
+     *         it does not guarantee remote execution or response delivery.
      */
     EYIL_CLIENT_API ClientResult client_send_request_async(
         Client *client, const uint8_t *request_data, size_t request_size, ClientResponseHandler handler);
@@ -158,13 +166,21 @@ extern "C"
         Client *client, const char *request_data, char **response_data);
 
     /**
-     * Starts an asynchronous request using a NULL-terminated request string.
+     * Sends a NULL-terminated request string through the same transport and
+     * validation as client_send_request_string(). Waits for send acceptance,
+     * then returns without waiting for the response. Submission has a
+     * 15-second deadline; response waiting has no timeout.
      *
      * @param client [IN] Connected client handle.
      * @param request_data [IN] NULL-terminated request string.
-     * @param handler [IN] Response callback.
+     * @param handler [IN] Non-NULL callback receiving a validated response
+     *        string at most once. Response ownership passes to the callback,
+     *        which must release it with client_free_response().
      *
-     * @return CLIENT_NOT_IMPLEMENTED until asynchronous requests are implemented.
+     * @return CLIENT_OK after libzmq accepts the message, otherwise an
+     *         appropriate ClientResult value. An error return invokes no
+     *         response callback. CLIENT_OK confirms local send acceptance;
+     *         it does not guarantee remote execution or response delivery.
      */
     EYIL_CLIENT_API ClientResult client_send_request_string_async(
         Client *client, const char *request_data, ClientStringResponseHandler handler);
