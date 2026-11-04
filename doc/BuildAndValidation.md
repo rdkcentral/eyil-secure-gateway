@@ -90,6 +90,15 @@ to establish Gateway compatibility. Client/protocol-only builds can use a
 supported stock ZeroMQ 4.3+ package; those builds do not validate the Gateway
 extension. Product builds must link and load the same compatible dependency.
 
+Gateway startup must probe downstream option 10001 and pass the bounded,
+isolated IPC self-test in
+[section 6.14](EyilGateway.md#startup-capability-check-before-admission)
+before production bind/admission. Stock draft-enabled libzmq can provide monitor
+version 2 without the connection-lifetime patch. Test both rejection of an
+incompatible loaded library and the actual target rootfs under its container
+permissions/namespaces; a native development-container result is not device
+validation. The startup test supplements the full patch regression suite.
+
 With PLUGIN_EYILGATEWAY enabled, ICrypto headers are a required build input:
 configuration must report a missing SDK/API dependency instead of silently
 building an adapter without Crypto support. The platform image supplies the

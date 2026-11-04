@@ -274,8 +274,7 @@ production defaults or changes to runtime configuration. Rows marked **Agreed**
 record the existing limits; the additional byte budgets and transport/worker
 settings remain subject to product sizing under TODO(RESOURCE-LIMITS).
 The shared-memory proposal supplies the initial 32 MiB / 4 buffers / 128 MiB
-per-connection limits; these are adopted separately from the additional global
-budget. Quotas count the entire allocation, including input, output and any
+per-connection limits. Quotas count the entire allocation, including input, output and any
 alignment space. The proposal's 22 MiB allocation for a 10 MiB encrypt input
 fits the per-buffer limit; a 32 MiB allocation does not imply a 32 MiB plaintext
 limit. Crypto's output requirements and all applicable aggregate quotas still apply.
@@ -291,8 +290,14 @@ limit. Crypto's output requirements and all applicable aggregate quotas still ap
 | Private request workers | 4, configured independently of Thunder's global pool | Proposed |
 | Worker stack size | Keep the Thunder/platform default initially; measure before reducing it, including when Crypto executes in process | Proposed |
 | Shared memory per buffer/connection | 32 MiB per buffer, up to 4 buffers and 128 MiB per connection | Agreed initial limits, shared-memory proposal section 6.3 |
-| Shared memory across Gateway | 128 MiB globally, in addition to the per-connection limits | Proposed; additional platform budget |
 | Kernel socket buffers | Keep OS defaults with ZMQ_SNDBUF = -1 and ZMQ_RCVBUF = -1 | Proposed |
+
+Apply the proposal's shared-memory limits per connection. There is no additional
+Gateway-wide shared-memory cap in this design. These limits do not reserve
+backing capacity: each allocation still depends on available tmpfs space and
+system memory, and preallocation failure returns CRYPTO_ERROR_OPERATION_FAILED.
+Size the platform for its expected number of simultaneous connections; do not
+introduce an additional global buffer quota in the implementation.
 
 All applicable count and byte limits apply together. A 1,024-entry queue holding
 1 MiB requests would otherwise consume 1 GiB for payloads alone. Fast dequeueing
@@ -314,7 +319,8 @@ The proposed budgets are not a total-process RAM limit. Protobuf copies,
 bookkeeping, stacks, kernel buffers and libzmq queues add storage. In particular,
 libzmq's queues are per peer and separate from Gateway's completion handoff;
 validate sizing against simultaneous connections, peak message sizes and
-backend latency. Apply the shared-memory global quota across all connections.
+backend latency. Shared-memory accounting enforces the selected per-connection
+limits; request and response queue budgets are separate.
 
 Expose adopted values through product configuration supplied by CMake/BitBake;
 no public client API change is needed. Keep the existing error and delivery
@@ -417,6 +423,7 @@ sequenceDiagram
     T-->>P: Implementation interface
     P->>I: Acquire private lifecycle-control interface, then Configure(IShell)
     I->>I: Validate configuration, claim endpoint ownership, create fresh generation/context and stop wakeups
+    I->>I: Run bounded private-IPC libzmq self-test, fail startup on any mismatch
     I->>W: Construct/start private request pool
     I->>Z: Start REP, bind inproc ZAP endpoint
     Z-->>I: Authenticator ready or startup failure
@@ -426,6 +433,7 @@ sequenceDiagram
     R->>R: Enable Gateway monitor endpoint
     I->>M: Start PAIR collector
     M-->>I: Collector ready
+    R->>R: Create native listener with owned-path checks, set ZMQ_USE_FD
     I->>R: Bind ipc:///tmp/app-eyil-gateway.ipc
     R-->>I: Listener ready or bind failure
     alt All required runtime parts ready
@@ -449,7 +457,12 @@ notification and operation acquires its interface on demand. There is no cached
 ICrypto pointer, availability observer or startup polling. AppManager/RuntimeManager
 lookup is not called in this phase.
 
-Start the private pool, ZAP and monitor collector before binding ROUTER. Publish
+Run the isolated capability self-test in section 6.14 before creating the
+production listener. It uses its own context and minimal test authenticator,
+never Crypto, AppManager or the production registry. Then start the private
+pool, ZAP and monitor collector before binding ROUTER. Follow the selected
+[endpoint ownership and recovery rules](EyilSecureGateway.md#74-endpoint-ownership-and-server-identity)
+for native bind/listen, ZMQ_USE_FD adoption and pathname cleanup. Publish
 RUNNING only once all owners are ready; a racing handshake cannot create an
 ACTIVE context while startup admission is closed. Each activation gets fresh
 registries, counters, generation, wakeups, sockets and its own ZMQ context.
@@ -465,7 +478,8 @@ actually created/started. Failed Configure returns only after rollback completes
 
 Require exclusive ownership of the configured UDS endpoint. Never replace a
 live listener or unlink another runtime's socket. Release endpoint ownership
-after socket owners exit and context termination completes. Rebinding creates
+after socket owners exit, context termination completes and the owned pathname
+has been removed or its cleanup failure recorded under section 7.4. Rebinding creates
 a new socket inode; container mounts must expose it as specified in section 3.3.
 
 ### 6.5 ZAP, interim identity and future AppManager lookup
@@ -489,7 +503,7 @@ sequenceDiagram
     Z->>Z: Validate ZAP frames/mechanism, parse UID/GID/host PID
     Z->>A: Resolve peer identity
     alt Initial phase - no platform lookup
-        A->>A: Accept, generate unique interim appId/sessionId
+        A->>A: Generate appId eyil-interim:unique-token and separate sessionId
         A-->>Z: Peer context, all supported APIs allowed
     else Future TODO(AUTH-APPMANAGER)
         A->>AM: Formal UID lookup API - not yet integrated
@@ -544,8 +558,20 @@ retain any uncertain cleanup obligation. Do not poll/retry Crypto or admit RPCs
 against a context whose initialization failed. An in-progress CONNECTED job is
 included in plugin shutdown accounting.
 
-Interim appId/sessionId values identify this connection only. They do not
-claim an authoritative platform app identity or authorize provisioned-key use.
+Set interim appId to `eyil-interim:<unique-token>`, with an unpredictable token
+unique to the connection, and generate a separate sessionId. Keep both stable
+for that connection's notifications and operations. Reserve the `eyil-interim:`
+prefix for this provider; an authoritative provider must not issue identities
+in that namespace. Multiple connections from one process still get different
+appIds and sessionIds. The client does not supply or override either value.
+
+The marker lets Crypto distinguish an interim identity from an authoritative
+platform appId without changing ApplicationContext or the public protocol.
+It does not itself enforce key policy: Crypto's treatment of the marker,
+including any refusal of device-global keys requiring real app identity, must
+be agreed and implemented by Crypto under AUTH-APPMANAGER. Do not claim that
+adding the prefix already restricts key access or add a Gateway key-policy check.
+Interim values identify this connection only; they do not authorize provisioned-key use.
 The platform allocates application UIDs; Gateway must obtain the current
 UID-to-app/app-instance relationship through the agreed AppManager/RuntimeManager
 integration. Do not infer appId from a numeric UID or introduce an independent
@@ -1054,7 +1080,7 @@ The active-use count is initially limited to zero or one. A pending release may
 coexist with active or unresolved access. Directory references may be
 shared by the connection's allocations. Queued requests retain their context
 and buffer ID, but reserve no
-buffer use. Per-connection count/byte quotas and a global byte budget require
+buffer use. Per-connection count/byte quotas require
 atomic reservation and rollback on every failure path.
 Keep allocation count/byte charges until physical cleanup of Gateway's owned
 resources completes, including while release is pending or cleanup has failed.
@@ -1074,6 +1100,13 @@ procfs checks and can become unavailable when the peer or its main thread exits.
 See [proc_pid_root](https://man7.org/linux/man-pages/man5/proc_pid_root.5.html).
 The selected trust model requires the app to preserve that name/object binding.
 Retaining an object FD alone does not prevent replacement of its pathname.
+Keep the proposal's app-namespace backend path for this version. The discussed
+`/proc/<gateway-pid>/fd/<fd>` alternative is not selected: it would require
+different procfs/open rules and still would not prove that the correct peer
+namespace was captured initially or prevent modification/truncation. The
+existing path remains subject to the process-instance and backend-access
+validation in section 7.1; the trusted-app cooperation rule does not prove
+those properties.
 Retain the original shared-memory directory FD and generated relative filename
 for Gateway cleanup, using unlinkat() against that directory after backend
 access ends. Close the directory reference after its last allocation is cleaned
@@ -1117,9 +1150,9 @@ Required invariants:
 The initial limits are 32 MiB per allocation, four allocations and 128 MiB
 per connection, following the shared-memory proposal. Keep these values
 configurable and account for release-pending allocations until cleanup.
-Section 6.2 lists these [limits and the proposed global budget](#proposed-initial-resource-sizing);
-the additional global quota and platform memory sizing remain subject to
-TODO(RESOURCE-LIMITS).
+Section 6.2 lists these [per-connection limits](#proposed-initial-resource-sizing).
+There is no additional global shared-memory quota. Validate platform memory
+and tmpfs sizing under TODO(RESOURCE-LIMITS).
 
 #### Application cleanup after completion or error
 
@@ -1214,6 +1247,31 @@ reporting must not lose the only reference to a partially created object.
 This service allocation failure is distinct from failure to construct/send
 its response, which follows the infrastructure fallback in section 4.2.
 
+After exclusive creation, set the logical size with ftruncate(), then call
+`fallocate(fd, 0, 0, capacity)` for the complete allocation before publishing
+the buffer ID/name or handing the object to the app. Perform preallocation while
+the new object still has Gateway-only access, then apply the agreed peer
+ownership/permissions and verify the final size. ftruncate alone does not reserve
+tmpfs space; this step detects insufficient backing capacity during allocation
+instead of leaving Crypto to discover it while accessing a mapped buffer.
+See [fallocate](https://man7.org/linux/man-pages/man2/fallocate.2.html).
+
+Treat ENOSPC, ENOMEM, unsupported preallocation and other terminal fallocate
+errors as allocation failure: log ERROR with stage, errno and requested size,
+roll back the unpublished object and quota, and return RPC_STATUS_OK with
+CRYPTO_ERROR_OPERATION_FAILED and the allocation response oneof. Keep the private
+cleanup record and charges if rollback cannot finish. Never silently fall back
+to ftruncate-only allocation or publish a partly preallocated object. A
+recoverable interruption may be retried on the same unpublished object, with
+stop and connection state rechecked before publication.
+
+Preallocation does not prevent later app truncation, hole punching, mutation,
+or unrelated memory pressure. Keep the cooperation and lease rules; this is
+not a claim that all SIGBUS/OOM causes are removed. Validate tmpfs support and
+memory-cgroup charging on the product: pages allocated by Gateway need not be
+charged to the app's cgroup. EyilClient does not allocate or preallocate these
+objects.
+
 ```mermaid
 sequenceDiagram
     participant A as App-side Crypto / buffer helper
@@ -1239,8 +1297,9 @@ sequenceDiagram
         B-->>J: CRYPTO_ERROR_OPERATION_FAILED
     else Validation and quota reservation succeed
         B->>K: Retain peer shm directory FD, create exclusive object relative to it
-        B->>K: ftruncate, set approved ownership and permissions
-        alt Creation, sizing or ownership/permission setup fails
+        B->>K: ftruncate then fallocate full capacity with Gateway-only access
+        B->>K: Set approved peer ownership/permissions, verify final size
+        alt Creation, sizing, preallocation or ownership/permission setup fails
             B->>B: Log ERROR, roll back object/FD/quota before publication
             opt Physical rollback cannot finish
                 B->>B: Retain private cleanup record and unreclaimed quota
@@ -2152,13 +2211,44 @@ a reason to fall back to version-1 events. Report the runtime version for
 diagnostics, but do not use it as the capability test. Resetting the probe does
 not replace setting the original connection ID before every actual reply.
 
-This inexpensive check detects an absent/incompatible guard or monitor API; it
-does not prove all metadata and event semantics. Continue validating native
-ZAP/request properties and exact event shapes, and run the patch's behavioral
-tests against the product's installed library. Reject missing/invalid identity
-evidence without accepting an unbound connection or sending an unguarded reply.
-Validate that stock or mismatched libzmq causes activation failure before the
-production endpoint opens, without leaking partially started runtime resources.
+Option 10001 detects the downstream guard; version-2 monitoring is also present
+in stock draft-enabled libzmq and does not identify the patch. Neither the
+version number nor successful option/monitor setup proves the metadata and
+event contents. In addition to the production-socket checks above, Configure
+must complete this behavioral self-test before creating the production listener:
+
+1. Create an isolated ZMQ context and a private Gateway-owned directory with
+   mode 0700 containing a temporary IPC endpoint. One test owner runs the
+   nonblocking ROUTER, DEALERs, monitor PAIR and a minimal ZAP REP; use only dummy
+   credentials and probe bytes. The test never calls Crypto/AppManager, modifies
+   production contexts, or binds the public endpoint.
+2. Probe option 10001 and enable version-2 monitoring. Establish two connections
+   from the same process. Verify distinct nonzero transport identities, the
+   accepted FD/lifetime pair, kernel credential encoding and the ZAP metadata.
+   Exchange one probe on the first connection; require the same lifetime/FD
+   and assigned User-Id on its ROUTER routing/body frames.
+3. Try a reply guarded by the other connection's identity: the routing-frame
+   send must fail with EHOSTUNREACH and no body may be sent. Set the correct
+   guard and verify one successful probe reply. Close both peers, including the
+   second peer before it sends an application message; require the five-value
+   disconnect events to match their original accepted/ZAP lifetimes and
+   credential snapshots. Independent monitor/ZAP delivery order is permitted.
+4. Use one total 15-second monotonic self-test deadline and wake on requested
+   stop. Failure, missing metadata, wrong event shape or expiry logs one
+   actionable ERROR and fails Configure before production bind/admission.
+   Close sockets on their owner with zero linger, join any started test owner,
+   terminate the private context and remove only its owned temporary entries
+   on both success and failure. Safe rollback must finish before Configure
+   returns; the deadline does not authorize abandoning a thread.
+
+Log one successful startup summary, not each probe frame. The test must exercise
+the library actually loaded by Gateway, not an external executable that might
+resolve another libzmq. Its bounded check does not replace the patch's full
+FD/route-reuse regression or testing the product's installed binary. Continue
+validating native properties and event shapes at runtime; reject missing or
+invalid identity evidence without accepting an unbound connection or sending
+an unguarded reply. Stock or mismatched libzmq must fail activation without
+leaking partially started resources.
 
 The extension's native Linux/GCC 9 regression covers independent connections
 from one process, no-request disconnects, rejected/in-progress authentication,
@@ -2379,7 +2469,8 @@ For an idle freeze with the connection preserved, Gateway has no operation to
 complete and no response to deliver to that client. It retains the context and
 idle resource allocations while other clients continue. Retained buffers are
 expected state, not evidence that disconnect cleanup failed; apply
-per-connection and global quotas to keep that state bounded.
+the per-connection buffer quotas. Size platform memory/tmpfs for the expected
+connection count; no Gateway-wide shared-memory cap is selected.
 
 The design must still contain failures when an app freezes unexpectedly or
 violates its preparation contract:
@@ -2631,6 +2722,7 @@ sequenceDiagram
     I->>X: zmq_ctx_term(), retry EINTR
     X-->>I: Context and libzmq internal threads terminated
     I->>W: Stop and join drained private pool
+    I->>I: Check saved filesystem socket identity, remove only the owned pathname
     I->>I: Release queues, registries and endpoint ownership, publish STOPPED
     I-->>P: StopAndWait complete
     P->>P: Release implementation/control references, reset activation flags
@@ -2664,6 +2756,12 @@ linger; retry EINTR. Do not share the Gateway shutdown context with other
 Thunder plugins. Once shut down, a context cannot be restarted; reactivation
 creates a fresh one.
 [Context termination](https://libzmq.readthedocs.io/en/latest/zmq_ctx_term.html)
+
+Before releasing the endpoint lifecycle lock, finish owned-path cleanup using
+the saved filesystem entry identity and pinned parent directory as specified
+in section 7.4. With ZMQ_USE_FD the endpoint owner removes that name; it must not
+close the already-adopted listener FD again. A replaced path is left untouched
+and logged, never treated as this runtime's socket.
 
 Partial-start rollback applies the same order to only the resources that exist.
 No close/join assumes that startup reached the next stage. Successful teardown
@@ -2795,7 +2893,7 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 Gateway dispatch deadline | Expire after 10,000 ms without starting; include pool queue time; race expiry against Dispatch; exactly one result and no backend execution after expiry; do not time out running calls |
 | L1 Gateway drain | Atomic admission cutoff; queued work starts or expires under original deadline; active work finishes; callbacks and stop state require no new shutdown queue allocation |
 | L1 Gateway response capacity | Reserve at most 128 slots per connection and 1,024 globally plus configured byte allowances before execution; reject without service execution on exhaustion; no blocking/overflow queue; release each reservation once |
-| L1 resource configuration | Check initial 32 MiB per buffer, four buffers and 128 MiB per connection, including a 22 MiB allocation and per-buffer/count/aggregate rejection cases. Also exercise configured message/response/global byte budgets and arithmetic; proposed additional values remain subject to sizing. Assert the correct infrastructure/service error layer and release reservations once |
+| L1 resource configuration | Check initial 32 MiB per buffer, four buffers and 128 MiB per connection, including a 22 MiB allocation and per-buffer/count/per-connection aggregate rejection cases. Two connections can exceed 128 MiB combined when backing resources permit; no global buffer-quota rejection exists. Separately exercise configured request/response byte budgets and arithmetic. Assert the correct infrastructure/service error layer and release reservations once |
 | L1 Gateway response send | At most one logical response attempt; EAGAIN/EHOSTUNREACH/EINTR cause local error and drop; no requeue, second error response or backend replay; storage released once; multipart frames never cross responses |
 | L1 buffer concurrency | Queued jobs reserve no buffer; release winning before TryUse returns RPC_STATUS_OK with CRYPTO_ERROR_INVALID_SESSION_STATE and no Crypto call; use winning rejects a competing use through the same service error but permits release acceptance; race release with last-use completion and verify one finalization claim, no use after releasePending and no lost cleanup |
 | L1 deferred release | Release during active access returns RPC_STATUS_OK, CRYPTO_ERROR_NONE and the empty release response before that access ends; retain object, record, directory reference and quota; definitive completion triggers cleanup once; duplicate release cannot clear state or create another finalizer |
@@ -2809,6 +2907,10 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L2 disabled heartbeats | Verify IVL/TIMEOUT/TTL are 0 on DEALER and ROUTER before connect/bind and after socket recreation; confirm monitor-driven cleanup still occurs on actual socket closure |
 | L2 disconnect | Trusted FD/lifetime-to-User-Id binding; close one of multiple connections from a PID; delayed/duplicate events and FD/route reuse; disconnect before first request; no unrelated cleanup |
 | L2 guarded responses | Apply the expected transport lifetime to successful and error replies; force route reuse and verify no old response reaches a replacement connection, including before monitor cleanup catches up |
+| L2 libzmq startup self-test | Stock draft-enabled libzmq passes monitor-v2 setup but fails the option-10001 check; missing/wrong metadata or event contents fail the private IPC test before production bind. A compatible loaded library passes distinct same-PID lifetimes, a no-request disconnect and wrong-guard rejection. Expiry/stop/failure closes all private sockets/context/temp entries; no Crypto call, production session or public listener is created |
+| L1 interim identity | appId has reserved eyil-interim: prefix and a unique token; separate sessionId is stable through CONNECTED, operations and DISCONNECTED. Two connections from one PID differ; app payloads cannot replace either identity. Marker recognition alone is not proof of Crypto key-policy enforcement |
+| L1/L2 buffer preallocation | ftruncate success followed by fallocate failure returns RPC_STATUS_OK plus CRYPTO_ERROR_OPERATION_FAILED without publishing an ID. Cover ENOSPC/ENOMEM/unsupported operation and partial rollback failure; verify object/FD/quota ownership. On an isolated test tmpfs using the product configuration, exhaust capacity and verify allocation fails before Crypto accesses the buffer; record cgroup charging and remaining truncation risk |
+| L2 endpoint ownership | Keep the exact AC URI. A live listener, unknown owner, symlink, probe timeout/error or replaced inode is never unlinked. Serialize bind-before-listen with the lifecycle lock; recover only a trusted unchanged stale socket after ECONNREFUSED. Exercise ZMQ_USE_FD adoption/rollback/close without double-close, and pathname cleanup only after shutdown with the saved filesystem identity |
 | L2 buffers | Container-private mapping, cross-connection rejection, release before queued use and deferred release during active use; buffer remains accessible to the active backend until definitive completion, new uses fail, and quota becomes available only after cleanup; Crypto errors are forwarded; size/region failures and lost replies; a result after a synchronous timeout is discarded |
 | Shared-memory platform validation | Verify app permissions, directory/object reference lifetime and namespace/process reuse under the selected cooperation contract; cleanup does not reopen an exited or reused PID's path |
 | L2 app crash cleanup | Allocate buffers, then terminate the owning app without release RPCs; correlated disconnect settles accepted work, sends DISCONNECTED and reclaims all remaining objects/FDs/quotas through retained directory references; repeat with an active Crypto call, accepted pending release, lost allocation/release replies and notification failure, without early destruction or lost cleanup ownership |
@@ -2833,6 +2935,7 @@ Runtime components and their integration boundaries are organized as follows:
 ```text
 GatewayRuntime
   authentication = InterimIdentityProvider
+    // appId = eyil-interim:<unique-token>; separate per-connection sessionId.
     // TODO(AUTH-APPMANAGER): replace acceptance with the formal UID lookup.
     // TODO(API-AUTHORIZATION): populate per-connection API entitlements.
   cryptoBackend = CryptoServiceAdapter(shell, configuration.cryptocallsign)

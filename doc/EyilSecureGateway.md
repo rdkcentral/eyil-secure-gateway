@@ -350,7 +350,7 @@ a blocked in-process backend. Those limits matter while Gateway is in process.
 
 | TODO | Integration point | Selected behavior / remaining decision |
 | --- | --- | --- |
-| TODO(AUTH-APPMANAGER) | AuthenticationProvider called by ZAP; future Gateway → AppManager → RuntimeManager lookup using trusted UID | Accept valid direct UDS peers, record UID/GID/PID, create unique interim appId/sessionId per connection |
+| TODO(AUTH-APPMANAGER) | AuthenticationProvider called by ZAP; future Gateway → AppManager → RuntimeManager lookup using trusted UID | Accept valid direct UDS peers, record UID/GID/PID, create appId `eyil-interim:<unique-token>` and a separate unique sessionId per connection; the prefix marks non-authoritative identity |
 | TODO(API-AUTHORIZATION) | Admission check against entitlements cached in the connection context | Allow all structurally valid supported APIs; still enforce limits and buffer ownership |
 | ICrypto lifecycle | Scoped NotifyAppState calls through CryptoServiceAdapter | CONNECTED during authentication; DISCONNECTED after accepted work ends; Crypto owns its internal session/key behavior |
 | TODO(LIFECYCLE-EVENTS) | Lifecycle observer receiving platform events and submitting serialized context transitions | No AppManager/RuntimeManager subscriptions or inferred hibernate/idle policy |
@@ -545,7 +545,7 @@ not an empty RPC error payload:
 | --- | --- | --- |
 | Zero allocation size | CRYPTO_ERROR_INVALID_PARAMETERS | Log the invalid size; create no object |
 | Requested allocation exceeds the per-buffer maximum | CRYPTO_ERROR_OVERSIZED_INPUT_DATA | Log requested size and maximum; create no object |
-| Allocation, object creation/sizing or count/byte quota failure | CRYPTO_ERROR_OPERATION_FAILED | Log stage/errno or quota usage/limit; roll back partial allocation and retain any unresolved cleanup record |
+| Allocation, object creation/sizing/preallocation or count/byte quota failure | CRYPTO_ERROR_OPERATION_FAILED | Log stage/errno or quota usage/limit, including fallocate failure; roll back partial allocation and retain any unresolved cleanup record |
 | Missing, released or wrong-session buffer ID | CRYPTO_ERROR_INVALID_SESSION_STATE | Log failed lookup/ownership/state; do not call Crypto |
 | Invalid caller-supplied input region | CRYPTO_ERROR_INVALID_PARAMETERS | Log the failed bounds/parameter check; do not expose or access that region |
 | Input exceeds the operation's maximum | CRYPTO_ERROR_OVERSIZED_INPUT_DATA | Log input length and operation limit |
@@ -813,9 +813,9 @@ contracts.
 
 | TODO | Answer needed / integration boundary |
 | --- | --- |
-| AUTH-APPMANAGER | Formal UID lookup via AppManager/RuntimeManager, authoritative app/app-instance identity, UID reuse guarantees and lookup failure behavior; no independent static UID-to-appId map |
+| AUTH-APPMANAGER | Formal UID lookup via AppManager/RuntimeManager, authoritative app/app-instance identity, UID reuse guarantees and lookup failure behavior; no independent static UID-to-appId map. Interim appIds use reserved `eyil-interim:` prefix; agree Crypto's handling of that marker for identity-dependent key policy |
 | AUTHENTICATION-PROGRESS | Define a bound on waiting for authentication-time CONNECTED and lifecycle-worker capacity if needed. Platform startup ordering is selected; it does not bound an ICrypto call. A client timeout cannot cancel a running call, and any abandoned exchange must retain cleanup ownership for a late result |
-| ENDPOINT-OWNERSHIP | Select and validate exclusive listener ownership and client verification of the server while keeping the AC endpoint unchanged; risks and candidate mechanisms are in section 7.4 |
+| ENDPOINT-OWNERSHIP | Implement and validate the selected native listener/ZMQ_USE_FD ownership and stale-path recovery rules. Select server identity protection for the target's user namespaces: the tested overflow UID/PID-0 tuple is ambiguous. Keep the AC endpoint unchanged; section 7.4 records the evidence and remaining deployment choices |
 | API-AUTHORIZATION | Exact entitlement format and mapping from service/operation to allowed APIs; currently all supported APIs are allowed |
 | LIFECYCLE-EVENTS | Whether/how to integrate stop, destruction or platform hibernation events; application-owned freeze preparation is agreed, and transport heartbeats remain disabled independently of future observers |
 | RECONNECT-LIFECYCLE | Future platform requirements, absent from the supplied ACs, for automatic reconnect, retry, reauthentication or session restoration and any use of RESTORED/TERMINATED. The initial delivery is already defined: cleanup and explicit fresh connect, no automatic reconnect, and only later unexpected loss emits CLIENT_CONNECTION_LOST |
@@ -823,7 +823,7 @@ contracts.
 | CLIENT-MONITOR | Confirm the monitor-responsibility checklist in section 5.2 and whether PAIR plus the I/O owner satisfies the AC, or a distinct OS thread is mandatory |
 | FUTURE-TEXT-SERVICE | Successful execution of text commands needs a separately defined service route and request/response semantics. Current behavior is settled: service=0 is rejected by Gateway with UNSUPPORTED_SERVICE and exposed as status text; this future feature does not block the selected rejection path |
 | BUFFER-HELPER | Ownership of app-side shm_open/mmap helpers, output validation and release coordination |
-| RESOURCE-LIMITS | Validate and select product values from the [resource-sizing proposals in section 6.2](EyilGateway.md#proposed-initial-resource-sizing): message/response byte limits, queue byte budgets, libzmq high-water marks, worker count/stacks and the proposed global shared-buffer quota. Initial buffer limits are 32 MiB per buffer, 4 buffers and 128 MiB per connection, as specified by the shared-memory proposal; the agreed Gateway waiting limit remains 1,024/10 seconds and response slots remain 128 per connection/1,024 globally; client uses one submission slot and has no fixed pending-response count cap |
+| RESOURCE-LIMITS | Validate and select product values from the [resource-sizing proposals in section 6.2](EyilGateway.md#proposed-initial-resource-sizing): message/response byte limits, queue byte budgets, libzmq high-water marks, worker count/stacks and platform memory/tmpfs sizing. Initial buffer limits are 32 MiB per buffer, 4 buffers and 128 MiB per connection, as specified by the shared-memory proposal, with no additional global shared-memory cap; the agreed Gateway waiting limit remains 1,024/10 seconds and response slots remain 128 per connection/1,024 globally; client uses one submission slot and has no fixed pending-response count cap |
 
 ### 7.3 Integration and validation work
 
@@ -832,7 +832,7 @@ unresolved Gateway architecture gaps.
 
 | Work item | Required integration / evidence |
 | --- | --- |
-| ZMQ-PLATFORM | Integrate the included [libzmq 4.3.4 patch](zmq_connection_lifetime.patch) into the product build and Gateway consumers; enable draft APIs, check the required guard/monitor capability before binding, validate ZAP/request metadata and version-2 FD/lifetime events, and guard ROUTER sends. Test the exact rootfs binary and activation failure with an incompatible library; section 6.14 defines the contract |
+| ZMQ-PLATFORM | Integrate the included [libzmq 4.3.4 patch](zmq_connection_lifetime.patch) into the product build and Gateway consumers; enable draft APIs, probe option 10001 and run the bounded private-IPC behavioral self-test before production bind/admission, validate ZAP/request metadata and version-2 FD/lifetime events, and guard ROUTER sends. Monitor version 2 alone does not identify the patch. Test the exact rootfs binary and activation failure with an incompatible library; section 6.14 defines the contract |
 | DEPLOYMENT | Configure and verify UDS mounts across endpoint recreation, permissions, procfs/user-namespace access, private /dev/shm and blocked direct Crypto communicator access. Confirm platform ownership of leftover storage after a crash; Gateway starts fresh and does not reconstruct or blindly unlink old allocations |
 | Private Thunder pool | Validate nonblocking job handoff, ownership transfer, capacity wakeups and drain against the target Thunder API; keep application jobs off the global pool and preserve the 1,024-entry/10-second waiting contract |
 | SDK and runtime dependencies | Supply the selected topic/crypto ICrypto headers/bindings, configured Crypto callsign and matching Thunder interfaces. Platform/Thunder coordination starts Crypto before Gateway and completes Gateway drain before stopping Crypto. Validate per-call references, authentication-time CONNECTED and ordered DISCONNECTED without a Crypto health observer |
@@ -865,42 +865,103 @@ The deployment must address these risks explicitly:
 The native listener behavior is visible in
 [libzmq 4.3.4 ipc_listener.cpp](https://github.com/zeromq/libzmq/blob/v4.3.4/src/ipc_listener.cpp).
 
-**Proposed solution preserving the exact AC endpoint:** have a trusted
-platform/Gateway endpoint owner serialize activation using a root-controlled
-lock outside app-writable storage. Create an AF_UNIX listener at the existing
-`/tmp/app-eyil-gateway.ipc` path with native bind(), which must fail if the name
-is occupied; set the approved ownership/permissions before listen(). Do not
-blindly unlink an existing path. Define trusted stale-socket recovery and fail
-closed for an unknown owner or live listener. Supply the bound/listening FD to
-ROUTER through ZMQ_USE_FD, then call zmq_bind with the same AC URI. Define FD
-transfer, failure rollback and owned-path cleanup so neither libzmq nor the
-endpoint owner double-closes a descriptor or removes another listener's path.
+**Selected listener ownership, preserving the exact AC endpoint:** a trusted
+platform/Gateway endpoint owner holds a root-controlled lifecycle lock outside
+app-writable storage from before path inspection until teardown and path cleanup
+finish. Every authorized listener owner must use that lock. Pin the trusted
+parent directory and inspect its socket entry without following symlinks.
+Create an AF_UNIX listener with native bind() at the existing
+`/tmp/app-eyil-gateway.ipc` path, using restrictive creation permissions; bind
+must fail if the name is occupied. Record the filesystem entry's device, inode,
+socket type and trusted owner, and set approved access permissions before
+listen(). Supply this bound/listening FD through ZMQ_USE_FD, then call zmq_bind
+with the same AC URI. Track descriptor adoption: the endpoint owner closes
+descriptors not handed over, while libzmq closes an adopted listener, including
+during rollback. Never close an adopted numeric FD again from the endpoint
+owner. Validate the adoption/failure paths against the selected libzmq build.
 The supplied FD must already be bound and listening, as specified by
 [ZMQ_USE_FD](https://github.com/zeromq/libzmq/blob/v4.3.4/doc/zmq_setsockopt.txt#L525).
 
+Do not blindly unlink an occupied pathname. Stale-socket recovery requires all
+of the following under the lifecycle lock: the entry is a socket owned by the
+configured trusted UID, a bounded native connect probe returns ECONNREFUSED,
+and a fresh no-follow inspection still matches its recorded device/inode/type/
+owner. Only then remove that exact directory entry and retry native bind once.
+A successful connection means a live listener; a timeout, EACCES, another error,
+a symlink, an untrusted owner or changed identity means fail startup and log
+ERROR without removing the entry. If the name disappears, retry bind without
+unlinking anything; an occupied replacement must never be removed implicitly.
+ECONNREFUSED alone is insufficient: a live process can have bound its socket
+but not called listen() yet. The lifecycle lock excludes that race among
+cooperating trusted owners; this protocol does not defend against a hostile
+privileged process that ignores the lock.
+
+With ZMQ_USE_FD, libzmq closes the listener but leaves its filesystem pathname.
+After listener shutdown completes, the endpoint owner removes the name only
+if a no-follow check against the pinned parent directory still matches the
+entry it created. Use unlinkat() against that directory. ENOENT means the name
+is already absent; a mismatch or cleanup failure is logged and the foreign or
+uncertain entry is left untouched. Do not compare the pathname inode with
+fstat(listener_fd): the kernel socket descriptor and filesystem socket entry
+have different identities. Apply these rules to partial-start rollback too.
+
+The purpose is to preserve an existing live listener, avoid deleting a
+replacement endpoint during teardown, and make stale-path recovery explicit.
+It adds no new public endpoint or request protocol.
+
 This prevents replacement by the normal libzmq bind path; it does not alone
 authenticate the server or prevent an attacker from occupying an absent name.
-For peer verification, a candidate additional libzmq connector check obtains
-SO_PEERCRED on the actual connected AF_UNIX socket and rejects a peer whose
-UID differs from the configured trusted service identity before allowing
-application requests. Interpret credentials in the receiving client's user
+Any credential-based peer verification must use SO_PEERCRED from the actual
+connected AF_UNIX socket and a distinguishable configured trusted service
+identity before allowing application requests. Interpret credentials in the receiving client's user
 namespace: checking UID 0 is appropriate only when it represents host root in
 that deployment. An unmapped/overflow UID is not a unique service identity and
 must not be accepted as one. With host UID visibility, UID 0 identifies the
 trusted host service boundary, not a specific Thunder callsign. A deployment
 with incompatible user-namespace mappings needs another trusted verification
 mechanism; do not silently weaken the check.
-This client-side hook is not supplied by the current connection-lifetime patch.
 ZMQ_FD is a poll-notification descriptor and must not be used for SO_PEERCRED;
 do not use a possibly stale monitor FD for security checks either. Verify the
 actual connector and credential behavior on the target platform.
 
+**Target evidence, 2026-11-04:** the inspected Xione device runs Linux 4.9.119
+on ARMv7. Two sampled Dobby app user namespaces map app UID 0 to host UID 30003
+or 30007; host root is unmapped. An isolated kernel probe read credentials of
+two live test peers from each app's user/PID namespaces:
+
+| Test peer's host identity | UID / GID / PID returned by SO_PEERCRED in either sampled app namespace |
+| --- | --- |
+| Host UID/GID 0 | 65534 / 65534 / 0 |
+| Unrelated host UID/GID 12345 | 65534 / 65534 / 0 |
+
+Accepting overflow UID plus PID 0 would accept both. A new connector hook using
+the same syscall cannot distinguish them. This matches Linux's
+[credential translation](https://github.com/torvalds/linux/blob/v4.9/net/core/sock.c)
+and rules out that tuple as server authentication on the inspected deployment.
+The probe used private test sockets/processes; it did not run EyilClient or
+communicate with the production Gateway endpoint.
+
+Separate native libzmq 4.3.4 probes received kernel UID/GID/PID in the client's
+reply `Peer-Address`, with stock and both reviewed patched builds. This supports
+evaluating a harmless startup request/reply for products where the trusted UID
+is distinguishable; it does not solve the target namespace ambiguity. No libzmq
+was found in the inspected target host or sampled app filesystem views, so
+its deployed message-metadata behavior remains unverified. A service=0 request
+would receive UNSUPPORTED_SERVICE, not invoke an existing no-op API. Such a
+startup exchange would change the current handshake-only readiness barrier and
+is not selected here. The current patch adds no server-verification hook.
+
 A root-controlled parent directory is an alternative when deployment can
 preserve the required URI in the relevant mount namespaces. Directly changing
 the URI to a new `/run/...` path would require an AC/deployment decision; do not
-make that change implicitly. Final selection must cover app access permissions,
+make that change implicitly. Remaining deployment validation must cover app access permissions,
 endpoint squatting, namespace mounts, service identity and stop/reactivation
-together. These candidates are not claimed as implemented capabilities.
+together. Select a trusted directory/mount arrangement that excludes untrusted
+endpoint creators, a namespace mapping exposing a distinct trusted service
+identity, or another authenticated bootstrap mechanism. This requires a platform
+deployment contract, not necessarily a RuntimeManager API call. Listener
+ownership is selected above; server identity protection remains open. These
+are design requirements and evidence, not claims of implemented Gateway code.
 
 **Integration boundary:** Gateway has a required dependency on the topic/crypto
 ICrypto API and uses the deployed Crypto plugin through the CMake-configured
