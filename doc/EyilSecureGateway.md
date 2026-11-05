@@ -551,7 +551,7 @@ not an empty RPC error payload:
 | Requested allocation exceeds the per-buffer maximum | CRYPTO_ERROR_OVERSIZED_INPUT_DATA | Log requested size and maximum; create no object |
 | Allocation, object creation/sizing/preallocation or count/byte quota failure | CRYPTO_ERROR_OPERATION_FAILED | Log stage/errno or quota usage/limit, including fallocate failure; roll back partial allocation and retain any unresolved cleanup record |
 | Missing, released or wrong-session buffer ID | CRYPTO_ERROR_INVALID_SESSION_STATE | Log failed lookup/ownership/state; do not call Crypto |
-| Invalid caller-supplied input region | CRYPTO_ERROR_INVALID_PARAMETERS | Log the failed bounds/parameter check; do not expose or access that region |
+| Invalid caller-supplied input region: missing, out of bounds or overlapping another input | CRYPTO_ERROR_INVALID_PARAMETERS | Log the failed presence, bounds or overlap check; do not expose or access that region |
 | Input exceeds the operation's maximum | CRYPTO_ERROR_OVERSIZED_INPUT_DATA | Log input length and operation limit |
 | Crypto-selected output does not fit | CRYPTO_ERROR_BUFFER_OVERFLOW | Preserve the required output region when known; it is not readable output |
 | Completed generic Crypto service failure | CRYPTO_ERROR_OPERATION_FAILED | Preserve this result when returned by Crypto; retain any more specific returned CryptoError unchanged |

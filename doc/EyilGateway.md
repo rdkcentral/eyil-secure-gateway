@@ -1106,8 +1106,8 @@ Required invariants:
   its destruction waits for the active use to end. Other allocations and
   connections remain independent.
 - Check `offset <= size && length <= size - offset`; avoid unchecked
-  `offset + length` arithmetic. Enforce per-operation region presence and
-  overlap rules.
+  `offset + length` arithmetic. Enforce the region presence and overlap rules
+  below.
 - Keep the active-use lease through the ICrypto invocation. A completed
   synchronous invocation, including a defined CryptoError, ends that access
   under the Crypto contract. Every definitive lease-ending path checks for a
@@ -1125,6 +1125,50 @@ Required invariants:
   receive that timer event or prolong the client's wait; it lets the invocation
   finish and handles the result normally. An uncertain COM-RPC failure remains
   different from a completed invocation returning a defined service error.
+
+#### Region presence and overlap rules
+
+These rules implement the shared-memory proposal's non-overlapping inputs
+(section 7) and plugin-selected output placement (section 9). In-place
+processing is not supported in this version.
+
+| Operation | Required input regions | Inputs that must not overlap each other | Output region | Output must not overlap |
+| --- | --- | --- | --- | --- |
+| Encrypt | init_data, input_data | init_data and input_data | encrypted_data | init_data, input_data |
+| Decrypt | init_data, encrypted_data | init_data and encrypted_data | output_data | init_data, encrypted_data |
+| Sign | input_data | (single input) | signature | input_data |
+| Verify | input_data, expected_signature | input_data and expected_signature | none | (no output region) |
+
+1. **Presence:** every required region field must be present in the request.
+   A missing required region is CRYPTO_ERROR_INVALID_PARAMETERS.
+2. **Bounds:** every present region satisfies `offset <= size && length <=
+   size - offset`, including a region of length 0.
+3. **Zero length:** Gateway accepts a present region of length 0 and passes it
+   to Crypto. Whether the algorithm accepts it is Crypto's decision; for example
+   AES-CBC rejects empty init_data with CRYPTO_ERROR_INVALID_INIT_DATA. A region
+   of length 0 never overlaps another region.
+4. **Overlap test:** two non-empty regions `[a, a + la)` and `[b, b + lb)`
+   overlap when `a < b + lb && b < a + la`. Compute the sums in 64-bit
+   arithmetic. Adjacent regions (`a + la == b`) do not overlap.
+5. **Gateway input check:** in TryUse, after bounds and presence, reject
+   overlapping inputs with CRYPTO_ERROR_INVALID_PARAMETERS and an ERROR log
+   naming both regions. Rejection takes no active-use lease and makes no Crypto
+   call.
+6. **Gateway output check:** after a completed invocation with
+   CRYPTO_ERROR_NONE, a non-empty output region must be inside the allocation
+   and must not overlap any non-empty input region. A violation is an invalid
+   successful output region: ERROR log and RPC_STATUS_INTERNAL, with the region
+   not exposed. The lease still ends normally.
+7. **BUFFER_OVERFLOW:** the returned required region describes capacity, not
+   written data. It is exempt from the bounds and overlap checks and is
+   forwarded unchanged.
+8. **Crypto:** independently applies the same bounds and overlap rules to the
+   actual opened object, chooses an output that overlaps no input, and writes
+   only inside the output region it returns. Input regions remain unchanged.
+9. **Client:** declare every region holding data that must survive the
+   operation. Bytes outside the declared input regions may be overwritten by
+   the output. After success, read only the returned output region; the input
+   regions can be read back unchanged.
 
 The initial limits are 32 MiB per allocation, four allocations and 128 MiB
 per connection, following the shared-memory proposal. Keep these values
@@ -1360,7 +1404,8 @@ arithmetic; the app can explicitly allocate a sufficiently large new buffer,
 rewrite inputs and submit a new operation, subject to the configured limits.
 The library/Gateway does not replay automatically or resize a mapped buffer.
 
-An invalid successful output region is a Gateway processing failure: log ERROR
+An invalid successful output region, including one that overlaps an input
+region, is a Gateway processing failure: log ERROR
 and return RPC_STATUS_INTERNAL without exposing that region as usable output.
 Definitive backend return still ends the lease and can complete pending release;
 response validation or serialization must not leave completed access active.
@@ -1402,8 +1447,8 @@ sequenceDiagram
         B-->>J: CRYPTO_ERROR_INVALID_SESSION_STATE, no active-use lease
         J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call or retry
     end
-    break Invalid caller-supplied region
-        B->>B: Log ERROR for invalid bounds or region parameters
+    break Missing, out-of-bounds or overlapping input region (section 6.10)
+        B->>B: Log ERROR for the failed presence, bounds or overlap check
         B-->>J: CRYPTO_ERROR_INVALID_PARAMETERS, no active-use lease
         J-->>R: RPC_STATUS_OK with CryptoResponse error, no Crypto call
     end
@@ -2733,6 +2778,7 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 Gateway response storage | Response storage grows when allocations succeed, with no response-count/byte budget rejection. Inject actual bookkeeping/serialization allocation failure; preserve one completion/error and cleanup ownership without blocking a worker or replaying service work |
 | L1 resource configuration | Four private workers, default stack size, default HWM 1000/1000 and kernel socket buffers, MAXMSGSIZE=-1, no additional message/text/response storage cap. Check proposal limits of 32 MiB per buffer, four buffers and 128 MiB per connection, including a 22 MiB allocation. Multiple connections may exceed 128 MiB combined when backing resources permit. Preserve arithmetic, representation and service-specific validation |
 | L1 Gateway response send | At most one logical response attempt; EAGAIN/EHOSTUNREACH/EINTR cause local error and drop; no requeue, second error response or backend replay; storage released once; multipart frames never cross responses |
+| L1 region rules | Per operation: missing required region, out-of-bounds region, overlapping inputs and adjacent inputs (allowed); length-0 regions pass Gateway and reach Crypto; 64-bit overlap arithmetic near UINT32_MAX; successful output overlapping an input or outside the allocation returns RPC_STATUS_INTERNAL and ends the lease; BUFFER_OVERFLOW region is forwarded unchanged even when out of bounds |
 | L1 buffer concurrency | Admitted jobs reserve no buffer before TryUse; release winning before TryUse returns RPC_STATUS_OK with CRYPTO_ERROR_INVALID_SESSION_STATE and no Crypto call; use winning rejects a competing use through the same service error but permits release acceptance; race release with last-use completion and verify one finalization claim, no use after releasePending and no lost cleanup |
 | L1 deferred release | Release during active access returns RPC_STATUS_OK, CRYPTO_ERROR_NONE and the empty release response before that access ends; retain object, record, directory reference and quota; definitive completion triggers cleanup once; duplicate release cannot clear state or create another finalizer |
 | L1 buffer completion errors | Null lookup/pre-invocation failure, defined CryptoError and post-call validation/serialization/allocation failure end the lease exactly once when access is definitively over and trigger eligible pending cleanup; ambiguous remote failure retains access and releasePending until completion evidence arrives |
