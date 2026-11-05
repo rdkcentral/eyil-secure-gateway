@@ -88,7 +88,7 @@ method boundaries, not a requirement for a class or thread per row.
 | I/O owner | Claim the slot, serialize/send, receive/correlate, process deadlines and PAIR events | One library-owned thread; sole DEALER owner |
 | Pending map | request_id to expected response metadata and completion target | I/O owner; entry installed before first send and retired once |
 | Per-call result conditions | Wake the async caller on send outcome or sync caller on final result | Waits release the state mutex; send acceptance and response completion remain separate states in the Request |
-| Monitor collector | Decode PAIR events and drive connection-state handling | I/O owner in the proposed consolidation; dedicated-thread AC wording remains CLIENT-MONITOR |
+| Monitor collector | Decode PAIR events and drive connection-state handling | Existing I/O owner; agreed consolidation, no additional client monitor thread |
 | Response storage | Owned binary response or NUL-terminated status text | Transferred to the application and freed with client_free_response |
 
 The slot is shared only within one Client. Callers waiting for it remain on
@@ -121,7 +121,7 @@ flowchart TB
         P["Pending map by request_id<br/>Many sent requests can await responses"]
         RESULT["Request completion state<br/>Send result / synchronous response waiter"]
         CB["Async response or connection-loss handler<br/>Invoked by I/O owner without locks"]
-        MON["PAIR monitor receiver<br/>Same I/O owner performs collection duties<br/>Dedicated-thread AC confirmation remains"]
+        MON["PAIR monitor receiver<br/>Existing I/O owner polls and decodes events<br/>Agreed monitor implementation"]
         LIFE --> RT
         LIFE -- "Create empty slot, start / stop / join" --> IO
         REQ -- "F1 Retain call, validate and prepare" --> RT
@@ -158,54 +158,23 @@ of later response delivery. Connection and response callbacks share the owner
 thread and must return promptly. Notification APIs create no callback state.
 
 The PAIR monitor receiver is an internal socket plus event-decoding code.
-Enabling monitoring on DEALER makes libzmq create the other PAIR endpoint, which
-emits connection, handshake and disconnect events. The receiver connects through
-the client monitor's inproc endpoint. It carries transport events rather than
-RPC responses. See the
-[ZeroMQ monitor API](https://libzmq.readthedocs.io/en/latest/zmq_socket_monitor.html).
-In the proposed arrangement, the same client I/O loop reads DEALER and the
-PAIR receiver; the PAIR block does not itself imply a separate thread or service.
-The dedicated-monitor-thread wording remains TODO(CLIENT-MONITOR).
+Enabling monitoring on DEALER makes libzmq publish connection, handshake and
+disconnect events at the unique client monitor endpoint. The same Client I/O
+owner connects the PAIR receiver in that context, polls it alongside DEALER and
+the submission wakeup, and updates connection/request state. This is the agreed
+monitor implementation; no additional client monitor thread is required.
+[ZeroMQ monitor API](https://libzmq.readthedocs.io/en/latest/zmq_socket_monitor.html)
 
-> **Note for the PAIR and I/O-owner blocks:** together they perform the monitor
-> thread's expected event-collection and connection-state duties. The PAIR block
-> is a socket and decoder executed by the I/O owner, not another thread. A
-> separate worker is technically optional; accepting this arrangement against
-> the AC's explicit monitor-thread wording remains to be confirmed.
+#### Monitor responsibilities
 
-Monitoring is a responsibility, not necessarily a dedicated thread. The two
-proposed arrangements consume the same PAIR events:
-
-| Thread or component | Responsibility |
-| --- | --- |
-| libzmq's internal I/O threads | Transport/protocol work and production of socket-monitor events |
-| EyilClient serving/I/O owner | Own DEALER, poll replies, submissions and deadlines; in the proposed consolidated model, also poll the monitor PAIR and update connection state |
-| Optional dedicated monitor worker | Own only the monitor PAIR and post decoded events to the coordinator/I/O owner; needed only if the AC requires a distinct worker |
-
-In the consolidated model, poll the DEALER, monitor PAIR and submission wakeup
-together. Reading a monitor event must not wait for an RPC response. A dedicated
-monitor worker would separate that event-reading work, but it would not replace
-the I/O owner or its pending-request coordination. ZeroMQ's monitor API requires
-a PAIR receiver, not a particular application-thread arrangement. The remaining
-CLIENT-MONITOR question is acceptance of the AC's thread wording; both proposed
-arrangements provide the required monitoring function.
-
-Freezing the whole application stops both its serving thread and any dedicated
-monitor thread, including libzmq's own threads. Adding a separate monitor thread
-cannot make the frozen application process events. In either arrangement,
-callbacks must remain short to avoid delaying the client's processing.
-
-#### Monitor responsibilities for AC confirmation
-
-Confirm the following monitoring contract independently of whether a dedicated
-OS thread is required. The consolidated implementation assigns collection and
-handling to the existing I/O owner. A dedicated collector would own only PAIR
-and forward events to that owner; it must not also read or write DEALER or
-independently mutate the pending-request map.
+The following duties remain required under the consolidated ownership model.
+Reading monitor events must not wait for an RPC response, and callbacks run
+without internal locks. libzmq's internal transport threads produce the events;
+the Client I/O owner consumes them and owns the pending-request map.
 
 | Expected monitor responsibility | How PAIR plus the I/O owner cover it |
 | --- | --- |
-| Set up event collection before connecting | The DEALER owner enables monitoring at the unique client monitor endpoint; the collector creates/connects its PAIR receiver in the same ZMQ context |
+| Set up event collection before connecting | The DEALER owner enables monitoring at the unique client monitor endpoint; the same owner creates/connects its PAIR receiver in the same ZMQ context |
 | Receive and decode complete monitor messages | Poll PAIR alongside DEALER and the submission wakeup; validate the event frames, event value and endpoint for the configured monitor API version |
 | Establish handshake readiness | On HANDSHAKE_SUCCEEDED, publish READY and wake client_connect without an application callback; CONNECTED alone does not establish readiness |
 | Report initial connection/authentication failures | Wake the connect waiter with the exact ClientResult from section 5.5, without a callback; distinguish authentication denial from transport/protocol failure |
@@ -214,25 +183,16 @@ independently mutate the pending-request map.
 | Keep application callbacks and request retirement coordinated | Invoke connection handlers without internal locks, resolve each active API waiter once and retire affected async response records once; no synthetic async error callback |
 | Handle monitor failure and orderly stop | Treat unexpected collector failure as a runtime error; during requested shutdown, suppress intentional-close callbacks, wake the poller, stop monitoring and close PAIR on its owner without waiting indefinitely for another event |
 
-The selected monitor events and their framing come from the
-[ZeroMQ monitor API](https://libzmq.readthedocs.io/en/latest/zmq_socket_monitor.html).
-The ClientResult mapping, pending-request completion and callback rules are
-EyilClient responsibilities built on those events. The 15-second connect, sync
-request and async send-submission timers are coordinator/I/O-loop work; monitor
-events alone do not implement those deadlines. Async response waiting has no timer.
+Connect, synchronous-request and async-send deadlines are handled by the same
+owner/coordinator; monitor events alone do not implement those timers. Async
+responses have no timer. Poll and process submissions, replies and monitor events
+in finite batches so each progresses. Callbacks must return promptly because a
+blocking callback also delays monitor handling.
 
-The loop must fairly service monitor events, replies and submissions in bounded
-batches. Functional equivalence does not imply identical scheduling isolation:
-a blocking callback on the shared owner delays monitor processing too. A
-separate collector can keep reading events in that situation, but pending-map
-updates and request completions still need the owner. The proposed design
-therefore requires nonblocking I/O and short application callbacks.
-
-**Confirmation to obtain:** does the PAIR receiver plus the I/O owner, with the
-responsibilities above, satisfy AC2-Client.4, or is an additional dedicated OS thread
-itself mandatory? No heartbeat sender, idle-session watchdog or periodic PID
-responsiveness probe is part of this monitor contract. The monitor also does
-not perform Gateway-side ZAP authentication or decode service responses.
+Freezing the application stops the serving/I/O owner and libzmq's threads.
+The agreed hibernation contract requires the app to finish operations and
+callbacks first while preserving its descriptors. The monitor handles transport
+state, not app responsiveness, Gateway-side ZAP or service-payload decoding.
 
 #### Single-slot publication, claiming and completion
 
@@ -727,9 +687,8 @@ through its return value. Authentication denial occurs during that call's
 handshake and returns CLIENT_AUTH_FAILED; it does not generate TERMINATED.
 An established socket closing does not by itself identify an authentication
 failure. Automatic reconnect and in-place reauthentication are not part of
-this lifecycle. Any future use of RESTORED or TERMINATED requires an explicit
-lifecycle contract under TODO(RECONNECT-LIFECYCLE); the enum declarations alone
-do not define that behavior.
+this lifecycle. RESTORED and TERMINATED remain unused enum values; their
+presence does not introduce a reconnect or reauthentication requirement.
 
 Keep connection-callback delivery disabled while the handle is unpublished.
 Serialize successful handle publication with enabling loss-callback delivery;
@@ -780,9 +739,10 @@ recreation. These settings apply when establishing the connection. See the
 
 Freezing an application also stops its libzmq threads. Disabling transport
 heartbeats avoids disconnecting that preserved idle connection merely because
-the frozen client cannot exchange heartbeat traffic. This does not guarantee
-survival across Gateway failure, actual socket closure or checkpoint/restore
-that replaces descriptors.
+the frozen client cannot exchange heartbeat traffic. The agreed hibernation
+preserves descriptors and starts only after the app finishes its operations.
+An independent Thunder/Gateway failure uses terminal-loss cleanup; automatic
+recovery of that platform failure is outside scope.
 
 Keep the PAIR monitors and the 15-second connect, synchronous-request and
 async-send deadlines. Async responses have no timeout. There is no application
@@ -1638,7 +1598,7 @@ sequenceDiagram
     Z-->>G: Peer closure eventually becomes monitor event
     IO-->>C: Serving loop exits
     W->>C: Return mapped or already-committed results, release live-call<br/>guards
-    API->>IO: Join thread, also join separate monitor worker if used
+    API->>IO: Join the I/O owner, including its monitor processing
     API->>C: Wait for remaining live calls and claimed callbacks without<br/>holding their locks
     API->>Z: Terminate owned context after all its sockets close
     API->>C: Clear handler, verify empty slot, release records and destroy<br/>handle
@@ -1782,9 +1742,8 @@ with CLIENT_NOT_CONNECTED; they do not inherit an older operation's error.
 
 Report CLIENT_CONNECTION_LOST once for the established connection, without held
 internal locks, if its callback is claimed before explicit close shuts callback
-admission. Local close does not create a new loss event. Stop or wake any separate
-monitor collector so all sockets close
-on their owners. The old serving loop exits and the lost handle remains valid
+admission. Local close does not create a new loss event. The I/O owner closes
+both DEALER and its monitor PAIR. The old serving loop exits and the lost handle remains valid
 only for rejected requests and orderly destruction. client_disconnect joins the
 started threads and terminates the old owned ZMQ context; none of that runtime
 is reused. A callback already executing must return before destruction completes.
