@@ -227,9 +227,14 @@ metadata and checks both invocation and service results. Gateway-local buffer
 allocation/release needs no ICrypto call.
 
 Short-lived interface ownership does not remove the ICrypto dependency.
-Crypto is available before Gateway activation. Gateway sends CONNECTED during
-authentication and DISCONNECTED after accepted work ends. Crypto owns its
-internal session, key and recovery implementation.
+Crypto is available before Gateway activation. The application chooses its
+connection lifetime; retaining one connection across operations and idle periods
+for the app instance's lifetime is recommended. Gateway uses the corresponding
+connection's ApplicationContext for notifications. The current design sends
+CONNECTED during authentication. A detected disconnect immediately starts that
+connection's teardown, with DISCONNECTED after accepted work ends and before
+final resource release. No reconnect grace period or last-connection wait
+applies. Crypto owns its internal session, key and recovery implementation.
 
 ## 3. High-level architecture and platform placement
 
@@ -355,7 +360,7 @@ a blocked in-process backend. Those limits matter while Gateway is in process.
 | --- | --- | --- |
 | TODO(AUTH-APPMANAGER) | AuthenticationProvider called by ZAP; future Gateway → AppManager → RuntimeManager lookup using trusted UID | Accept valid direct UDS peers, record UID/GID/PID, create appId `eyil-interim:<unique-token>` and a separate unique sessionId per connection; the prefix marks non-authoritative identity |
 | TODO(API-AUTHORIZATION) | Admission check against entitlements cached in the connection context | Allow all structurally valid supported APIs; still enforce limits and buffer ownership |
-| ICrypto lifecycle | Scoped NotifyAppState calls through CryptoServiceAdapter | CONNECTED during authentication; DISCONNECTED after accepted work ends; Crypto owns its internal session/key behavior |
+| ICrypto lifecycle | Scoped NotifyAppState calls through CryptoServiceAdapter using the connection's ApplicationContext | CONNECTED during authentication in the current design; detected disconnect immediately starts per-connection teardown, with DISCONNECTED after safe drain as specified in section 6.14. No grace period or wait for app termination/the last connection; Crypto owns its session/key cleanup |
 
 The interface names in this table describe internal seams. They are not
 additional app-facing Thunder interfaces and do not claim that a formal
@@ -794,6 +799,7 @@ responsibilities in section 7.4 are settled and are not remaining gaps.
 | TODO | Answer needed / integration boundary |
 | --- | --- |
 | AUTH-APPMANAGER | Formal UID lookup via AppManager/RuntimeManager, authoritative app/app-instance identity, UID reuse guarantees and lookup failure behavior; no independent static UID-to-appId map. Interim appIds use reserved `eyil-interim:` prefix; agree Crypto's handling of that marker for identity-dependent key policy |
+| MULTI-CONNECTION-POLICY | Architects expect one connection per app instance; confirmation is pending on allowing additional connections with unique User-Ids or rejecting a second connection. If allowed, define the corresponding ICrypto ApplicationContext mapping so closing one connection cannot release another's active resources. Section 6.5 preserves independent interim contexts until that decision; shared host-UID quota is separate |
 | AUTHENTICATION-PROGRESS | Define a bound on waiting for authentication-time CONNECTED and lifecycle-worker capacity if needed. Platform startup ordering is selected; it does not bound an ICrypto call. A client timeout cannot cancel a running call, and any abandoned exchange must retain cleanup ownership for a late result |
 | API-AUTHORIZATION | Exact entitlement format and mapping from service/operation to allowed APIs; currently all supported APIs are allowed |
 | FUTURE-TEXT-SERVICE | Successful execution of text commands needs a separately defined service route and request/response semantics. Current behavior is settled: service=0 is rejected by Gateway with UNSUPPORTED_SERVICE and exposed as status text; this future feature does not block the selected rejection path |

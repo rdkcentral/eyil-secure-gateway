@@ -51,6 +51,13 @@ A synchronous caller waits for its response; an async caller waits only for
 libzmq send acceptance. Neither may hold a lock needed by the I/O owner or
 another caller while waiting.
 
+The application chooses when to connect and disconnect. The recommendation is
+to keep one connection for the app instance's lifetime, reusing it across
+operations and idle periods; connecting explicitly on first use is also an
+application choice. EyilClient does not connect automatically on a request or
+expire an idle connection. Closing the connection triggers Gateway/Crypto
+cleanup of its context and resources, even while the application remains alive.
+
 Each Client has one library-owned serving thread and one owned ZMQ context.
 libzmq also creates its own internal I/O threads: those do not maintain the
 library's pending map,

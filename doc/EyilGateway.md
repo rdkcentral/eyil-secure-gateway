@@ -165,7 +165,7 @@ pauses only further request reception; responses and control handling continue.
 | ALLOCATE_SHARED_BUFFER / RELEASE_SHARED_BUFFER | Worker calls SharedBufferManager locally. Allocation returns buffer_id, name and size; release acceptance blocks new use and defers physical cleanup while access remains active or unresolved | Sections 6.10–6.11 and 6.13 |
 | ENCRYPT / DECRYPT / SIGN / VERIFY | Worker-side adapter acquires an execution-time buffer lease, calls ICrypto using trusted context/object metadata, and ends the lease when backend access is definitively complete | Section 6.12 |
 | Other Crypto operations | Adapter queries the configured callsign through IShell, invokes the mapped ICrypto method and releases the reference immediately after that call | Sections 6.7–6.9 |
-| Peer closure after client_disconnect or unexpected transport loss | PAIR event identifies the original connection; close admission, drain accepted work, notify DISCONNECTED through the private pool and finalize releasable resources | Section 6.14 |
+| Peer closure after client_disconnect or unexpected transport loss | PAIR event identifies the original connection; immediately close its admission, drain accepted work, notify DISCONNECTED with its ApplicationContext through the private pool and finalize releasable resources; no grace period or wait for another connection to close | Section 6.14 |
 
 Only the ROUTER owner sends RPC replies. Workers publish completions carrying
 the original connection generation; backend notifications publish internal
@@ -554,11 +554,31 @@ sequenceDiagram
     end
 ```
 
-A User-Id can encode `appId#sessionId#connectionToken`, or be an opaque random
-token resolved through the registry. The important property is uniqueness per
-accepted connection and an unambiguous lookup; any delimiter-based encoding
-needs escaping/validation. Reconnection creates a new generation. Two sockets
-from the same UID/GID/PID do not share a context.
+The ZAP worker assigns one unique User-Id per accepted connection; every request
+resolves its context through that authenticated metadata. With authoritative
+platform identities, the architect suggests `<app_id>#<app_instance_id>` for
+one connection and a unique suffix such as
+`<app_id>#<app_instance_id>#<connection_count>` if multiple connections are
+allowed. Escape/validate delimiter-based fields and avoid collisions with any
+retained connection generation. The string alone does not replace the trusted
+transport-lifetime binding.
+
+**Multiple connections — architect decision pending:** typically one app
+instance is expected to keep one connection. Allowing additional connections
+with distinct User-Ids or rejecting a second connection remains under architect
+review. Until that decision and authoritative identity integration, retain the
+current independent interim contexts; do not reject another connection merely
+because UID or PID matches. If multiple connections are allowed, their backend
+ApplicationContext mapping must preserve independent teardown: a unique ZAP
+User-Id alone does not isolate two connections passed to Crypto with an identical
+ApplicationContext. Track this under MULTI-CONNECTION-POLICY in section 7.2.
+
+For the interim provider, User-Id can encode `appId#sessionId#connectionToken`,
+or be an opaque token resolved through the registry. Generated sessionId is not
+an authoritative app-instance ID. Each accepted connection gets its own context;
+reconnection creates a new generation. The shared host-UID buffer quota in
+section 6.10 does not merge these contexts or defer teardown until the last
+connection closes.
 
 CONNECTED is sent during authentication for every accepted connection,
 including one that never sends an RPC. Crypto is already available. The private
@@ -920,10 +940,15 @@ ApplicationContext and key ID. Crypto must preserve that session's state across
 these independent interface references. Releasing an interface must not invoke
 NotifyAppState(DISCONNECTED) or discard the app's keys.
 
-NotifyAppState(CONNECTED) completes during authentication before ZAP success
-and RPC admission. After accepted work finishes, send DISCONNECTED once before
-final connection-resource release. This also covers authenticated connections
-that never send a request.
+In the current design, NotifyAppState(CONNECTED) completes during authentication
+before ZAP success and RPC admission. Keep that connection's ApplicationContext
+stable across CONNECTED, operations and DISCONNECTED. Each detected disconnect
+starts teardown of its corresponding context, even if the app remains alive or
+has another connection. After accepted work finishes, send DISCONNECTED once
+before final connection-resource release, without a grace timer or last-client
+condition. This also covers authenticated connections that never send a request.
+Section 6.14 distinguishes this execution ordering from the architect's
+clarification of the disconnect trigger.
 
 Crypto owns session creation, key lifetime, authorization, internal concurrency
 and backend recovery. Gateway forwards ApplicationContext and arguments, checks
@@ -2205,6 +2230,21 @@ worker deadline or expires; handed-off records retain ownership until reclaimed,
 and running operations finish before destructive connection cleanup.
 There is no reconnect grace period or idle/process-responsiveness timeout.
 
+The architect's clarification ties DISCONNECTED to detection of each client's
+disconnection and its corresponding ApplicationContext. Do not wait for app
+termination, the last connection from that app instance, or a reconnect window.
+The application decides when to close; keeping one connection across operations
+and idle periods for its lifetime is recommended.
+
+The current implementation design starts teardown immediately and drains
+accepted work before invoking DISCONNECTED, because that notification may
+release Crypto resources still used by a call. Schedule it as soon as that
+drain permits. This is the existing active-work safety ordering; the architect's
+quoted clarification establishes the trigger and absence of a grace period
+but does not explicitly specify ordering against in-flight Crypto calls.
+Section 7.1 retains the abnormal-completion boundary. An idle connection has
+no accepted work to drain and its notification is immediately eligible.
+
 At that cutoff, establish SharedBufferManager's lifecycle finalization gate as
 specified in section 6.13. It covers still-unclaimed pending releases and all
 remaining connection allocations; it does not invalidate unreleased buffers
@@ -2251,13 +2291,14 @@ sequenceDiagram
         REG->>REG: Ignore duplicate/stale event without touching a reused FD
     else Original context found
         REG->>REG: Mark CLOSING, remove admission and route visibility
+        Note over REG,J: Per-connection teardown starts now, no grace timer or last-connection wait
         REG->>B: Establish lifecycle finalization gate, retain pending releases and quota
         REG->>REG: Drop completed undeliverable responses and release their capacity
         REG->>J: Drain accepted jobs, active uses, claimed finalizers and CONNECTED
         J-->>REG: Jobs settled, including any uncertain buffer-access outcome
         alt Backend access is definitively over
             opt CONNECTED succeeded
-                REG->>J: Schedule one DISCONNECTED lifecycle job
+                REG->>J: Schedule one DISCONNECTED job for this connection's ApplicationContext
                 J->>C: NotifyAppState(context, DISCONNECTED)
                 C->>T: Query ICrypto using configured callsign
                 T-->>C: Scoped reference or nullptr
@@ -2869,7 +2910,7 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L2 explicit reconnect | Verify RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0; after loss and Gateway return, no automatic handshake or old queued send occurs; explicit close/new connect creates an empty client runtime and new Gateway session, rejects old buffer IDs and never delivers old replies to new requests |
 | L2 client disconnect barrier | Disconnect with pending calls and an active short callback; wake callers before waiting, join socket owners without lock deadlocks, discard transport queues, preserve app-owned responses and verify zero callbacks after return |
 | L2 disabled heartbeats | Verify IVL/TIMEOUT/TTL are 0 on DEALER and ROUTER before connect/bind and after socket recreation; confirm monitor-driven cleanup still occurs on actual socket closure |
-| L2 disconnect | Trusted FD/lifetime-to-User-Id binding; close one of multiple connections from a PID; delayed/duplicate events and FD/route reuse; disconnect before first request; no unrelated cleanup |
+| L2 disconnect | Trusted FD/lifetime-to-User-Id binding; close one of multiple supported interim connections from a PID while the app and other connection remain alive; notify the closed connection's ApplicationContext once after safe drain, with no grace/last-connection wait and no unrelated cleanup. Cover delayed/duplicate events, FD/route reuse and disconnect before the first request |
 | L2 guarded responses | Apply the expected transport lifetime to successful and error replies; force route reuse and verify no old response reaches a replacement connection, including before monitor cleanup catches up |
 | L2 libzmq startup self-test | Stock draft-enabled libzmq passes monitor-v2 setup but fails the option-10001 check; missing/wrong metadata or event contents fail the private IPC test before production bind. A compatible loaded library passes distinct same-PID lifetimes, a no-request disconnect and wrong-guard rejection. Expiry/stop/failure closes all private sockets/context/temp entries; no Crypto call, production session or public listener is created |
 | L1 interim identity | appId has reserved eyil-interim: prefix and a unique token; separate sessionId is stable through CONNECTED, operations and DISCONNECTED. Two connections from one PID differ; app payloads cannot replace either identity. Marker recognition alone is not proof of Crypto key-policy enforcement |
