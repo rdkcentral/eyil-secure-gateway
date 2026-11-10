@@ -344,6 +344,12 @@ access permissions, including exposure of the current socket after endpoint
 recreation. These are selected deployment assumptions, described in section
 7.4; endpoint ownership and server identity are not open Gateway design topics.
 
+The AppManagers Legacy and RALF generators add the socket bind mount only when
+the source exists and is a Unix socket. Otherwise the container starts without
+Gateway access. If Gateway becomes available later, recreate the container with
+a newly generated configuration to add the mount. See
+[container mount setup](DevelopmentClient.md#container-mount).
+
 Monitor and ZAP `inproc://` endpoints are local to a ZMQ context; they need no
 filesystem socket or container mount.
 

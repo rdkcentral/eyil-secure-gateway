@@ -66,17 +66,3 @@ endif()
 if(BUILD_TESTING)
     add_subdirectory(Tests)
 endif()
-
-install(FILES LICENSE NOTICE
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/eyil-secure-gateway
-)
-
-install(FILES
-    doc/EyilSecureGateway.md
-    doc/EyilClient.md
-    doc/EyilGateway.md
-    doc/BuildAndValidation.md
-    doc/DevelopmentClient.md
-    doc/zmq_connection_lifetime.patch
-    DESTINATION ${CMAKE_INSTALL_DOCDIR}
-)

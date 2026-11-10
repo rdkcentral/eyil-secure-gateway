@@ -26,8 +26,8 @@ stage_dir=$(realpath -m "${2:-$repo_dir/rootfs/all}")
 DESTDIR="$stage_dir" cmake --install "$build_dir"
 export LD_LIBRARY_PATH="$stage_dir/usr/lib:$LD_LIBRARY_PATH"
 cmake -S "$repo_dir/scripts/consumer" -B "$build_dir/consumer" -G Ninja \
-    -UEyilClient_DIR -UEyilProtocol_DIR \
-    -DCMAKE_PREFIX_PATH="$stage_dir/usr"
+    -UEyilClient_DIR -UEYIL_PROTOCOL_LIBRARY -DCMAKE_PREFIX_PATH="$stage_dir/usr" \
+    -DEYIL_INSTALL_ROOT="$stage_dir" -DEYIL_BUILD_DIR="$build_dir"
 cmake --build "$build_dir/consumer" --parallel "${BUILD_JOBS:-4}"
 "$build_dir/consumer/eyil-c-consumer"
 "$build_dir/consumer/eyil-protocol-consumer"
@@ -47,6 +47,22 @@ from pathlib import Path
 
 build = Path(sys.argv[1])
 stage = Path(sys.argv[2])
+for entry in (build / "install_manifest.txt").read_text().splitlines():
+    path = Path(entry)
+    allowed = (
+        ".so" in path.name
+        or str(path).endswith("/include/eyilclient/EyilClient.h")
+        or str(path).endswith("/bin/eyil-client")
+        or str(path).endswith("/WPEFramework/plugins/EyilGateway.json")
+        or (
+            path.parent.name == "EyilClient"
+            and path.parent.parent.name == "cmake"
+            and path.suffix == ".cmake"
+        )
+        or str(path).endswith("/pkgconfig/eyilclient.pc")
+    )
+    assert allowed, f"Unexpected install artifact: {entry}"
+print("Install manifest contains runtime artifacts and the client SDK, without documentation.")
 if "PLUGIN_EYILGATEWAY:BOOL=ON" in (build / "CMakeCache.txt").read_text():
     config_path = stage / "etc/WPEFramework/plugins/EyilGateway.json"
     config = json.loads(config_path.read_text())

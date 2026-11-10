@@ -72,7 +72,6 @@ def main():
         (loader, destination / "lib" / loader.name),
     ]
     copied = set()
-    manifest = []
     while pending:
         source, target = pending.pop()
         if target.name in copied:
@@ -82,7 +81,6 @@ def main():
             raise RuntimeError(f"Wrong dependency architecture: {source}")
         shutil.copy2(source.resolve(), target)
         copied.add(target.name)
-        manifest.append(f"{target.relative_to(destination)} <- {source.resolve()}")
         for name in needed:
             found = preferred.get(name)
             if found is None:
@@ -103,11 +101,6 @@ def main():
         f'exec "$bundle_dir/lib/{loader.name}" --library-path "$bundle_dir/lib" "$bundle_dir/eyil-client" "$@"\n'
     )
     script.chmod(0o755)
-    (destination / "manifest.txt").write_text(
-        "Development diagnostic bundle; redistribution follows the original package licenses.\n"
-        + "\n".join(sorted(manifest))
-        + "\n"
-    )
     print(
         f"Staged development client and {len(copied) - 1} runtime objects: {destination}"
     )

@@ -48,9 +48,8 @@ src/
                               configuration and CMakeLists.txt
 cmake/
   EyilProtocol.cmake          Protocol generation, library and install rules
-  EyilClientConfig.cmake.in   Installed client package template
-  EyilProtocolConfig.cmake.in Installed protocol package template
-  eyilclient.pc.in            pkg-config template
+  EyilClientConfig.cmake.in   Installed client CMake package template
+  eyilclient.pc.in            Installed client pkg-config template
   Coverage.cmake             Coverage configuration
   FindZeroMQ.cmake            ZeroMQ discovery
 CMakeLists.txt                Top-level build
@@ -59,12 +58,12 @@ scripts/                     Build and validation utilities
 doc/                         Architecture and supporting material
 ```
 
-The interface tree contains only public headers and schemas. Build rules and
-package templates stay outside it; generated Protobuf sources/headers and
-configured package files are written to the build directory. The client keeps
-the public include path `eyilclient/EyilClient.h`. Library names, CMake targets
-`EyilClient::EyilClient` and `EyilProtocol::EyilProtocol`, and installed interface
-locations are independent of the source layout.
+The interface tree contains only public headers and schemas. Build rules stay
+outside it; generated Protobuf sources/headers are written to the build directory.
+The client keeps the public include path `eyilclient/EyilClient.h`. The build
+targets `EyilClient::EyilClient` and `EyilProtocol::EyilProtocol` are available
+inside this build. The installed client also exports `EyilClient::EyilClient`
+through `find_package(EyilClient CONFIG REQUIRED)` and provides `eyilclient.pc`.
 
 <details>
 <summary>Build, installation, coverage and GitHub workflow details</summary>
@@ -158,11 +157,29 @@ Use a CMake toolchain file and target dependency prefixes when cross compiling.
 Protobuf_PROTOC_EXECUTABLE must identify a host-runnable protoc. Cross-platform
 rootfs validation is still pending.
 
-Installed CMake consumers use EyilClient::EyilClient and
-EyilProtocol::EyilProtocol. The C header is eyilclient/EyilClient.h; the client also
-provides eyilclient.pc. Both plugin libraries install to the Thunder plugin
-directory. The generated configuration uses org.rdk.EyilGateway, with autostart
-false by default. No test executables are installed.
+Installation contains the shared libraries, `eyilclient/EyilClient.h`, client
+CMake/pkg-config metadata, enabled development executables and the generated
+Thunder plugin configuration. Both
+plugin libraries install to the Thunder plugin directory. The configuration
+uses org.rdk.EyilGateway, with autostart false by default. Consumers include the
+client header and link the imported `EyilClient::EyilClient` target, or use
+`pkg-config --cflags --libs eyilclient`. Protobuf schemas remain in
+`apis/proto` for service consumers to generate their own bindings. Documentation,
+patches, raw/generated protocol headers and test
+executables are not installed. License collection for images belongs to the
+packaging system.
+
+An application with the installation prefix in its CMake search path needs only:
+
+```cmake
+find_package(EyilClient CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE EyilClient::EyilClient)
+```
+
+The imported target supplies the client include directory and library location.
+Yocto places the header and CMake/pkg-config files in `eyil-secure-gateway-dev`;
+they are available to consumer builds through the recipe sysroot/SDK and are not
+required in the runtime image.
 
 L1 scenarios are registered individually in CTest. The suites cover:
 
