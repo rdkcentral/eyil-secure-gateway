@@ -12,6 +12,7 @@
  */
 
 #include "CryptoServiceAdapter.h"
+#include <com/com.h>
 #include <climits>
 #include <optional>
 
@@ -297,8 +298,11 @@ namespace Eyil
         }
         catch (...)
         {
+            // Local stack unwinding ends the synchronous call. A proxy exception
+            // can interrupt response handling without proving remote completion.
+            const bool remote = dynamic_cast<WPEFramework::ProxyStub::UnknownProxyType<Crypto> *>(api) != nullptr;
             api->Release();
-            if (lease)
+            if (lease && remote)
                 lease->Uncertain();
             log.Error(Reason::BackendCall, "ICrypto invocation raised an exception");
             return false;
@@ -307,7 +311,9 @@ namespace Eyil
         // Mapping, serialization and egress run after releasing the interface.
         if (result != WPEFramework::Core::ERROR_NONE)
         {
-            if (lease)
+            // R4 proxies mark transport failures with COM_ERROR. An ordinary
+            // method HRESULT is a completed invocation, including error returns.
+            if (lease && (result & COM_ERROR))
                 lease->Uncertain();
             log.Error(Reason::BackendCall, "ICrypto invocation failed code=%u", result);
             return false;
@@ -350,6 +356,10 @@ namespace Eyil
 
     ServiceResult CryptoServiceAdapter::Execute(const std::shared_ptr<Connection> &owner, const std::string &payload)
     {
+        LogScope scope;
+        scope.Context().connection = owner->peer.lifetime;
+        scope.Context().uid = owner->peer.uid;
+        scope.Context().service = RPC_SERVICE_CRYPTO;
         const auto invalid = [&](const char *reason)
         {
             log.Error(Reason::Protocol, "Crypto request rejected: %s", reason);
@@ -362,6 +372,7 @@ namespace Eyil
             if (!(payload.size() <= INT_MAX
                     && request.ParseFromArray(payload.data(), static_cast<int>(payload.size()))))
                 return invalid("invalid Crypto payload");
+            scope.Context().operation = request.operation();
             if (!(request.operation() > CRYPTO_OPERATION_UNSPECIFIED
                     && request.operation() <= CRYPTO_OPERATION_RELEASE_SHARED_BUFFER))
                 return invalid("invalid Crypto payload");

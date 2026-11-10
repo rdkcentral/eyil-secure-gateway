@@ -698,7 +698,7 @@ no new metrics service, app API or mandatory request-tracing system is required.
 | Severity | Events and required context |
 | --- | --- |
 | ERROR | worker_pool_exhausted after the ten-second worker-start wait, with total/running/reserved counts and request identity; Gateway faults and buffer/service failures from section 4.2; startup/configuration or required-libzmq-capability failure; ICrypto lookup/invocation failure; response allocation/send failure; shared-memory creation or deferred-cleanup failure. Record the failing stage and result/errno when available. |
-| WARNING | Client deadline expiry, unexpected connection loss, an accepted async record retired without a deliverable response, and unresolved backend-access/cleanup obligations. Include the reason and number of affected records; normal idle connections and prepared process freeze are not warnings. |
+| WARNING | First transition of a request into waiting for worker capacity; client deadline expiry, unexpected connection loss, an accepted async record retired without a deliverable response, and unresolved backend-access/cleanup obligations. Include the reason and number of affected records; normal idle connections and prepared process freeze are not warnings. |
 | INFO | One activation/readiness summary with relevant configured limits and libzmq version/capability-check outcome; one orderly stop/drain summary. Routine successful requests, buffer operations and explicit client disconnects need no per-operation INFO log. |
 | DEBUG / TRACE | Optional, disabled-by-default investigation of sequencing or individual successful operations. Never enable full request-flow tracing by default to compensate for missing error context. |
 
@@ -709,9 +709,15 @@ material, authentication tokens or shared-memory contents. Logging a rejection
 does not imply its error response was delivered; log a failed delivery as a
 separate outcome under the same correlation identifiers.
 
-Keep the ERROR classification required by section 4.2. Rate-limit repeated
-identical diagnostics and report suppressed-event counts at that same severity;
-retain the reason and affected-connection context. Small counters may summarize
+Keep the ERROR classification required by section 4.2. Rate-limit diagnostics
+within each fixed category and severity to one emitted event per five-second
+window, reporting suppressed-event counts at that same severity. WARNING must
+not suppress ERROR. Stop-time summaries retain the last suppressed connection
+and request identifiers; aggregate counts can cover multiple requests.
+Synchronous adapter calls inherit a bounded thread-local correlation scope;
+deferred buffer cleanup retains its own context, including the explicit release
+request when one exists. Buffer IDs are truncated to 64 characters and sanitized;
+payloads and credentials are never included. Small counters may summarize
 rejections, timeouts, dropped replies, outstanding async records and deferred
 cleanup at shutdown or on a diagnostic request. Do not add periodic polling,
 per-request INFO traces or a new externally exposed metrics contract.

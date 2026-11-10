@@ -42,7 +42,7 @@ if(TARGET EyilGatewayRuntime)
     add_executable(eyil-buffer-l1 SharedBufferTests.cpp)
     target_link_libraries(eyil-buffer-l1 PRIVATE EyilGatewayRuntime)
     eyil_test_faults(eyil-buffer-l1)
-    eyil_test_cases(eyil-buffer-l1 L1 sizes range-arithmetic uid-isolation
+    eyil_test_cases(eyil-buffer-l1 L1 log-correlation sizes range-arithmetic uid-isolation
         allocation-memory release-failure lease-lifetime release-race open-denied
         exclusive-create-failed truncate-failed allocate-enospc chown-failed
         chmod-failed stat-failed allocate-eintr)
@@ -52,7 +52,8 @@ if(TARGET EyilGatewayRuntime)
     eyil_test_cases(eyil-adapter-l1 L1 arguments enum-mappings optional-presence
         invalid-enums oneof-parsing missing-parameters service-errors invocation-errors
         bad-backend-outputs output-regions uncertain-access local-without-backend
-        lookup-all-operations invocation-all-operations exception-all-operations buffer-rejections)
+        lookup-all-operations invocation-all-operations exception-all-operations buffer-rejections
+        completed-error-release completed-exception-release)
 endif()
 
 if(TARGET EyilGatewayRuntime AND TARGET eyilclient)
@@ -61,7 +62,8 @@ if(TARGET EyilGatewayRuntime AND TARGET eyilclient)
         EyilGatewayRuntime EyilClient::EyilClient)
     set(lifecycle_cases invalid-config partial-startup destructor-idle
         destructor-inflight missing-backend default-backends empty-backends empty-callsign
-        omitted-callsign backend-list wrapper-failed-config wrapper-missing-implementation volatile-directory)
+        omitted-callsign backend-list wrapper-failed-config wrapper-missing-implementation volatile-directory
+        runtime-deactivation)
     eyil_test_cases(eyil-lifecycle-l1 L1 ${lifecycle_cases})
     foreach(scenario IN LISTS lifecycle_cases)
         # Root() loads Thunder Plugins and its indirect SDK dependencies.
@@ -76,7 +78,7 @@ if(TARGET EyilGatewayRuntime)
     eyil_test_faults(eyil-common-l1)
     target_link_options(eyil-common-l1 PRIVATE "-Wl,--wrap=zmq_msg_gets")
     eyil_enable_coverage(eyil-common-l1)
-    eyil_test_cases(eyil-common-l1 L1 descriptors wakeup sockets tokens log-suppression
+    eyil_test_cases(eyil-common-l1 L1 descriptors wakeup sockets tokens log-suppression poll-deadlines log-context
         identity-decimal credentials monitor-framing)
 endif()
 
@@ -98,5 +100,5 @@ if(TARGET eyilclient)
         input-memory explicit-close transport-loss callback-rules callback-quiescence
         sync-timeout-late-reply auth-denied auth-temporary auth-internal socket-memory socket-error
         monitor-memory monitor-error connect-memory connect-error
-        owner-memory close-before-send async-no-deadline connect-allocation monitor-auth-300)
+        owner-memory close-before-send idle-poll async-no-deadline connect-allocation monitor-auth-300)
 endif()

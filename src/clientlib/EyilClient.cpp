@@ -249,6 +249,8 @@ struct Client
     {
         std::lock_guard<std::mutex> lock(mutex);
         const auto now = Eyil::Clock::now();
+        if (startupPending && now >= startupDeadline)
+            Startup(CLIENT_TIMEOUT);
         for (auto it = pending.begin(); it != pending.end();)
         {
             auto &r = *it->second;
@@ -513,17 +515,26 @@ struct Client
             }
             for (;;)
             {
+                Expire();
                 bool sending;
+                auto deadline = Eyil::Clock::time_point::max();
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (stop || (!startupPending && !ready))
                         break;
                     sending = ready && static_cast<bool>(slot);
+                    if (startupPending)
+                        deadline = startupDeadline;
+                    if (slot)
+                        deadline = std::min(deadline, slot->deadline);
+                    for (const auto &entry : pending)
+                        if (!entry.second->asynchronous || !entry.second->accepted)
+                            deadline = std::min(deadline, entry.second->deadline);
                 }
                 zmq_pollitem_t items[]
                     = { { dealer.Get(), 0, static_cast<short>(ZMQ_POLLIN | (sending ? ZMQ_POLLOUT : 0)), 0 },
                           { monitor.Get(), 0, ZMQ_POLLIN, 0 }, { nullptr, wake.Get(), ZMQ_POLLIN, 0 } };
-                const int rc = zmq_poll(items, 3, 50);
+                const int rc = zmq_poll(items, 3, Eyil::PollTimeout(deadline));
                 if (rc < 0 && errno != EINTR)
                 {
                     Fail(SystemResult(errno));

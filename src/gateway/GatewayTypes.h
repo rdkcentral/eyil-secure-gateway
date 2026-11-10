@@ -39,6 +39,7 @@ namespace Eyil
         std::atomic<bool> closing { false };
 
         // Remaining fields are serialized by the Gateway registry mutex.
+        bool disconnected = false;
         bool authenticated = false;
         bool initialized = false;
         bool authFinished = false;

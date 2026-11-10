@@ -46,7 +46,7 @@ directory containing `interfaces/ICrypto.h` and matching `IConfiguration.h`,
 
 For a development image, set `BUILD_EYIL_DEV_TOOLS=ON`. Production defaults to
 OFF. The install target installs `/usr/bin/eyil-client` and a self-contained
-runtime bundle in `/usr/libexec/eyil-dev`. The bundle includes a launcher,
+runtime bundle in `/usr/lib/eyil`. The bundle includes a launcher,
 the client executable, its ELF interpreter and required libraries.
 `scripts/stage-dev-client.py` uses readelf and never executes target
 binaries. Cross installs need `CMAKE_SYSROOT` or `EYIL_DEV_SYSROOT` containing
@@ -95,7 +95,7 @@ The existence check runs during configuration generation; removal between that
 check and Dobby's bind mount can still fail container startup.
 
 For development AppManagers builds (`RDK_APPMANAGERS_DEBUG`), both generation
-paths additionally bind `/usr/libexec/eyil-dev` read-only when that directory
+paths additionally bind `/usr/lib/eyil` read-only when that directory
 exists. It is executable, unlike the socket mount. This is why a host-rootfs
 binary is actually reachable inside the app container. Enable development tools
 only in development images and create the container after the bundle is installed.
@@ -106,7 +106,7 @@ After the new image boots and an application container is running:
 
 ```sh
 DobbyTool list
-DobbyTool exec <container-id> '/usr/libexec/eyil-dev/run --expect-no-crypto'
+DobbyTool exec <container-id> '/usr/lib/eyil/run --expect-no-crypto'
 ```
 
 The command syntax follows [Dobby's command documentation](https://github.com/rdkcentral/Dobby/blob/e534e3d461251c9f7cadcd6184cdf5b95c431061/Troubleshooting.md).
@@ -134,7 +134,7 @@ quota error. No connection callback is emitted for a backend lookup failure.
 ## Run with a backend
 
 ```sh
-DobbyTool exec <container-id> '/usr/libexec/eyil-dev/run --exercise'
+DobbyTool exec <container-id> '/usr/lib/eyil/run --exercise'
 ```
 
 This exercises two connections, 16 binary async sends from application threads,

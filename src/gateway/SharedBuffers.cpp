@@ -20,13 +20,14 @@ namespace Eyil
     SharedBuffers::Lease::~Lease()
     {
         if (record)
-            manager->Finish(record, uncertain);
+            manager->Finish(record, uncertain, context);
     }
 
     SharedBuffers::Lease::Lease(Lease &&other) noexcept
         : manager(other.manager)
         , record(std::move(other.record))
         , uncertain(other.uncertain)
+        , context(other.context)
     {
     }
 
@@ -35,10 +36,11 @@ namespace Eyil
         if (this != &other)
         {
             if (record)
-                manager->Finish(record, uncertain);
+                manager->Finish(record, uncertain, context);
             manager = other.manager;
             record = std::move(other.record);
             uncertain = other.uncertain;
+            context = other.context;
         }
         return *this;
     }
@@ -64,6 +66,11 @@ namespace Eyil
 
     SharedBuffers::Allocation SharedBuffers::Allocate(const std::shared_ptr<Connection> &owner, uint32_t size)
     {
+        LogScope scope;
+        scope.Context().connection = owner->peer.lifetime;
+        scope.Context().uid = owner->peer.uid;
+        scope.Context().service = RPC_SERVICE_CRYPTO;
+        scope.Context().operation = CRYPTO_OPERATION_ALLOCATE_SHARED_BUFFER;
         try
         {
             return AllocateImpl(owner, size);
@@ -89,6 +96,9 @@ namespace Eyil
         record->uid = owner->peer.uid;
         record->size = size;
         record->id = Token();
+        LogScope scope;
+        scope.Context().Buffer(record->id);
+        record->cleanupContext = scope.Context();
         const auto nameToken = Token();
         if (record->id.empty() || nameToken.empty())
         {
@@ -206,12 +216,21 @@ namespace Eyil
     CryptoError SharedBuffers::TryUse(const std::shared_ptr<Connection> &owner, const std::string &id,
         const Region *regions, size_t count, Lease &lease)
     {
+        LogScope scope;
+        scope.Context().connection = owner->peer.lifetime;
+        scope.Context().uid = owner->peer.uid;
+        scope.Context().Buffer(id);
         std::lock_guard<std::mutex> lock(mutex);
         const auto it = records.find(id);
         if (it == records.end() || it->second->owner != owner->userId || !it->second->published || it->second->active
             || it->second->pending)
         {
-            log.Error(Reason::Buffer, "buffer_unavailable uid=%u", owner->peer.uid);
+            const char *reason = it == records.end() ? "unknown"
+                : it->second->owner != owner->userId ? "owner"
+                : !it->second->published             ? "unpublished"
+                : it->second->pending                ? "release_pending"
+                                                     : "busy";
+            log.Error(Reason::Buffer, "buffer_unavailable cause=%s", reason);
             return CRYPTO_ERROR_INVALID_SESSION_STATE;
         }
         auto &record = it->second;
@@ -219,24 +238,32 @@ namespace Eyil
         {
             if (!Inside(regions[i], record->size))
             {
-                log.Error(Reason::Buffer, "region_out_of_bounds uid=%u", owner->peer.uid);
+                log.Error(Reason::Buffer, "region_out_of_bounds region=%zu offset=%u length=%u capacity=%u", i,
+                    regions[i].offset, regions[i].length, record->size);
                 return CRYPTO_ERROR_INVALID_PARAMETERS;
             }
             for (size_t j = 0; j < i; ++j)
                 if (Overlap(regions[i], regions[j]))
                 {
-                    log.Error(Reason::Buffer, "region_overlap uid=%u", owner->peer.uid);
+                    log.Error(Reason::Buffer, "region_overlap first=%zu second=%zu", j, i);
                     return CRYPTO_ERROR_INVALID_PARAMETERS;
                 }
         }
         lease.manager = this;
         lease.record = record;
+        lease.context = scope.Context();
         record->active = true;
         return CRYPTO_ERROR_NONE;
     }
 
     CryptoError SharedBuffers::Release(const std::shared_ptr<Connection> &owner, const std::string &id)
     {
+        LogScope scope;
+        scope.Context().connection = owner->peer.lifetime;
+        scope.Context().uid = owner->peer.uid;
+        scope.Context().service = RPC_SERVICE_CRYPTO;
+        scope.Context().operation = CRYPTO_OPERATION_RELEASE_SHARED_BUFFER;
+        scope.Context().Buffer(id);
         std::shared_ptr<Record> record;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -249,6 +276,7 @@ namespace Eyil
             }
             record = it->second;
             record->pending = true;
+            record->cleanupContext = scope.Context();
         }
         Finalize(record);
         return CRYPTO_ERROR_NONE;
@@ -256,6 +284,7 @@ namespace Eyil
 
     bool SharedBuffers::Finalize(const std::shared_ptr<Record> &record)
     {
+        LogContext context;
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (!record->pending || record->active || record->gate || record->finalizing)
@@ -263,7 +292,9 @@ namespace Eyil
             if (!records.count(record->id))
                 return true;
             record->finalizing = true;
+            context = record->cleanupContext;
         }
+        LogScope scope(context);
         const bool removed
             = !record->exists || unlinkat(record->directory.Get(), record->name.c_str(), 0) == 0 || errno == ENOENT;
         const int error = errno;
@@ -288,15 +319,17 @@ namespace Eyil
         return true;
     }
 
-    void SharedBuffers::Finish(const std::shared_ptr<Record> &record, bool uncertain) noexcept
+    void SharedBuffers::Finish(
+        const std::shared_ptr<Record> &record, bool uncertain, const LogContext &context) noexcept
     {
+        LogScope scope(context);
         try
         {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (uncertain)
                 {
-                    log.Error(Reason::Buffer, "backend_access_uncertain uid=%u cleanup_deferred=1", record->uid);
+                    log.Warning(Reason::Buffer, "backend_access_uncertain uid=%u cleanup_deferred=1", record->uid);
                     return;
                 }
                 record->active = false;
@@ -343,6 +376,12 @@ namespace Eyil
                     }
                 if (!record)
                     return true;
+                if (!record->pending)
+                {
+                    // Internal cleanup has no app release request to correlate.
+                    record->cleanupContext.request = 0;
+                    record->cleanupContext.operation = CRYPTO_OPERATION_RELEASE_SHARED_BUFFER;
+                }
                 record->pending = true;
                 record->gate = false;
             }

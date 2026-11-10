@@ -66,10 +66,10 @@ def main():
     if inspect(loader)[0] != machine:
         raise RuntimeError("Loader architecture does not match the client")
     destination = args.destination
-    (destination / "lib").mkdir(parents=True, exist_ok=True)
+    destination.mkdir(parents=True, exist_ok=True)
     pending = [
         (args.executable, destination / "eyil-client"),
-        (loader, destination / "lib" / loader.name),
+        (loader, destination / loader.name),
     ]
     copied = set()
     while pending:
@@ -93,12 +93,12 @@ def main():
                 raise RuntimeError(
                     f"Cannot resolve {name} required by {source}; supply target --sysroot/--search"
                 )
-            pending.append((found, destination / "lib" / name))
+            pending.append((found, destination / name))
     script = destination / "run"
     script.write_text(
         "#!/bin/sh\n# Copyright 2026 RDK Management\n# SPDX-License-Identifier: Apache-2.0\n"
         'bundle_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
-        f'exec "$bundle_dir/lib/{loader.name}" --library-path "$bundle_dir/lib" "$bundle_dir/eyil-client" "$@"\n'
+        f'exec "$bundle_dir/{loader.name}" --library-path "$bundle_dir" "$bundle_dir/eyil-client" "$@"\n'
     )
     script.chmod(0o755)
     print(

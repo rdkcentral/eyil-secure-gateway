@@ -21,9 +21,10 @@ namespace Eyil
     namespace Core = WPEFramework::Core;
 
     GatewayRuntime::GatewayRuntime(CryptoServiceAdapter::Resolver resolver, unsigned count, std::string address,
-        Diagnostics::Sink sink, std::string temporaryPath)
+        Diagnostics::Sink sink, std::string temporaryPath, FailureHandler failureCallback)
         : log("EyilGateway", sink)
         , adapter(std::move(resolver), buffers, log)
+        , failureHandler(std::move(failureCallback))
         , workers(count)
         , endpoint(std::move(address))
         , temporaryDirectory(std::move(temporaryPath))
@@ -35,10 +36,10 @@ namespace Eyil
     bool GatewayRuntime::Start()
     {
         std::lock_guard<std::mutex> serial(stopMutex);
-        if (started || !workers || workers > UINT8_MAX || wake.Error())
+        if (started || !workers || workers > UINT8_MAX || wake.Error() || zapWake.Error() || monitorWake.Error())
         {
             log.Error(Reason::Setup, "invalid runtime startup started=%u workers=%u wake_errno=%d", started, workers,
-                wake.Error());
+                wake.Error() ? wake.Error() : (zapWake.Error() ? zapWake.Error() : monitorWake.Error()));
             return false;
         }
         const auto probe = VerifyTransportPatch(temporaryDirectory);
@@ -67,7 +68,10 @@ namespace Eyil
             std::unique_lock<std::mutex> lock(mutex);
             changed.wait(lock, [&] { return listenerReady || failed; });
             if (!failed)
+            {
+                notifyFailures = true;
                 return true;
+            }
         }
         catch (const std::exception &error)
         {
@@ -81,7 +85,9 @@ namespace Eyil
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
             auxiliaryStop = true;
-            changed.notify_all();
+            zapWake.Signal();
+            monitorWake.Signal();
+            StateChanged();
         }
         wake.Signal();
         if (io.joinable())
@@ -106,7 +112,10 @@ namespace Eyil
         {
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
-            changed.notify_all();
+            notifyFailures = false;
+            for (const auto &entry : connections)
+                Close(entry.second, false);
+            StateChanged();
         }
         wake.Signal();
         if (io.joinable())
@@ -114,7 +123,9 @@ namespace Eyil
         {
             std::lock_guard<std::mutex> lock(mutex);
             auxiliaryStop = true;
-            changed.notify_all();
+            zapWake.Signal();
+            monitorWake.Signal();
+            StateChanged();
         }
         if (zap.joinable())
             zap.join();
@@ -130,26 +141,69 @@ namespace Eyil
     void GatewayRuntime::Fatal(const char *reason) noexcept
     {
         log.Error(Reason::Transport, "runtime_failure reason=%s", reason);
+        bool notify;
         {
             std::lock_guard<std::mutex> lock(mutex);
+            notify = notifyFailures && !failed && !stopping;
+            notifyFailures = false;
             failed = true;
             stopping = true;
-            changed.notify_all();
+            for (const auto &entry : connections)
+                Close(entry.second, false);
+            StateChanged();
         }
         wake.Signal();
+        if (notify && failureHandler)
+        {
+            // The callback only schedules framework work. It must not destroy
+            // the runtime on a socket thread that its destructor has to join.
+            try
+            {
+                failureHandler();
+            }
+            catch (...)
+            {
+                log.Error(Reason::Callback, "runtime deactivation scheduling failed");
+            }
+        }
     }
 
-    void GatewayRuntime::Close(const std::shared_ptr<Connection> &connection)
+    void GatewayRuntime::Close(const std::shared_ptr<Connection> &connection, bool disconnected)
     {
-        if (!connection->closing.exchange(true))
+        const bool routeLost = disconnected && !connection->disconnected;
+        connection->disconnected = connection->disconnected || disconnected;
+        const bool closing = !connection->closing.exchange(true);
+        if (closing)
             buffers.Gate(connection->userId);
+        if (closing || routeLost)
+            StateChanged();
+    }
+
+    void GatewayRuntime::StateChanged()
+    {
+        ++stateRevision;
         changed.notify_all();
         wake.Signal();
     }
 
+    void GatewayRuntime::LogWorkerWait(const Work &work, bool expired)
+    {
+        LogScope scope({ work.connection->peer.lifetime, work.request.request_id(), work.connection->peer.uid,
+            work.request.service() });
+        const auto elapsed
+            = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - work.admitted).count();
+        const char *format = "reason=%s workers=%u running=%u reserved=%u lifecycle_running=%u wait_ms=%lld";
+        if (expired)
+            log.Error(Reason::WorkerExhausted, format, "worker_pool_exhausted", workers, running, reserved,
+                lifecycleRunning, static_cast<long long>(elapsed));
+        else
+            log.Warning(Reason::WorkerWaiting, format, "worker_pool_wait", workers, running, reserved, lifecycleRunning,
+                static_cast<long long>(elapsed));
+    }
+
     bool GatewayRuntime::Schedule(const std::shared_ptr<Work> &work)
     {
-        if (reserved >= workers)
+        if (reserved + running >= workers)
             return false;
         // Every Submit has a reserved worker. At most workers jobs can be held by
         // Thunder, whose internal queue has workers entries; Insert(0) cannot fill.
@@ -210,7 +264,20 @@ namespace Eyil
     void GatewayRuntime::Execute(const std::shared_ptr<Work> &work) noexcept
     {
         auto &connection = *work->connection;
-        bool initialized = false, cleaned = false;
+        LogScope scope(
+            { connection.peer.lifetime, work->request.request_id(), connection.peer.uid, work->request.service() });
+        bool initialized = false, cleaned = false, expired = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            expired = work->kind == Kind::Request && Clock::now() >= work->deadline;
+            if (expired)
+                LogWorkerWait(*work, true);
+            --reserved;
+            ++running;
+            if (work->kind != Kind::Request)
+                ++lifecycleRunning;
+            StateChanged();
+        }
         try
         {
             if (work->kind == Kind::Authenticate)
@@ -227,11 +294,8 @@ namespace Eyil
             else
             {
                 // Start/expiry is decided once by Dispatch, before entering any backend.
-                if (Clock::now() >= work->deadline)
+                if (expired)
                 {
-                    log.Error(Reason::WorkerExhausted,
-                        "reason=worker_pool_exhausted workers=%u request_id=%llu wait_ms=10000", workers,
-                        static_cast<unsigned long long>(work->request.request_id()));
                     Respond(*work, RPC_STATUS_INTERNAL);
                 }
                 else
@@ -249,7 +313,9 @@ namespace Eyil
         }
         {
             std::lock_guard<std::mutex> lock(mutex);
-            --reserved;
+            --running;
+            if (work->kind != Kind::Request)
+                --lifecycleRunning;
             if (work->kind == Kind::Authenticate)
             {
                 connection.initialized = initialized;
@@ -271,7 +337,7 @@ namespace Eyil
                     completedHead = work;
                 completedTail = work;
             }
-            changed.notify_all();
+            StateChanged();
         }
         wake.Signal();
     }
@@ -283,15 +349,16 @@ namespace Eyil
         {
             auto connection = it->second;
             if (stopping)
-                Close(connection);
+                Close(connection, false);
             if (connection->closing && !connection->active && connection->authFinished)
             {
                 if (connection->cleanupFinished)
                 {
                     it = connections.erase(it);
+                    StateChanged();
                     continue;
                 }
-                if (!connection->cleanupScheduled && buffers.Idle(connection->userId) && reserved < workers)
+                if (!connection->cleanupScheduled && buffers.Idle(connection->userId) && reserved + running < workers)
                 {
                     auto work = std::make_shared<Work>(Kind::Cleanup, connection);
                     if (Schedule(work))
@@ -338,7 +405,7 @@ namespace Eyil
             {
                 std::unique_lock<std::mutex> lock(mutex);
                 monitorEnabled = true;
-                changed.notify_all();
+                StateChanged();
                 changed.wait(lock, [&] { return (monitorReady && zapReady) || stopping; });
                 if (stopping)
                     return;
@@ -356,32 +423,22 @@ namespace Eyil
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 listenerReady = true;
-                changed.notify_all();
+                StateChanged();
             }
-            bool unbound = false;
             for (;;)
             {
                 bool receive;
+                long timeout;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     receive = !stopping && !current;
+                    timeout = completedHead ? 0 : (current ? PollTimeout(current->deadline) : -1);
                 }
-                if (!receive && !unbound)
-                {
-                    bool stopNow;
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        stopNow = stopping;
-                    }
-                    if (stopNow)
-                    {
-                        zmq_unbind(router.Get(), endpoint.c_str());
-                        unbound = true;
-                    }
-                }
+                // Keep the listener and existing routes until accepted work and
+                // its completions drain. ZAP rejects new admission while stopping.
                 zmq_pollitem_t items[] = { { router.Get(), 0, static_cast<short>(receive ? ZMQ_POLLIN : 0), 0 },
                     { nullptr, wake.Get(), ZMQ_POLLIN, 0 } };
-                if (zmq_poll(items, 2, 20) < 0 && errno != EINTR)
+                if (zmq_poll(items, 2, timeout) < 0 && errno != EINTR)
                 {
                     Fatal("ROUTER poll failed");
                     return;
@@ -402,12 +459,7 @@ namespace Eyil
                         {
                             expired = std::move(current);
                             --expired->connection->active;
-                            log.Error(Reason::WorkerExhausted,
-                                "reason=worker_pool_exhausted workers=%u running_reserved=%u wait_ms=10000 "
-                                "request_id=%llu "
-                                "uid=%u",
-                                workers, reserved, static_cast<unsigned long long>(expired->request.request_id()),
-                                expired->connection->peer.uid);
+                            LogWorkerWait(*expired, true);
                         }
                         else
                         {
@@ -415,6 +467,11 @@ namespace Eyil
                             {
                                 if (Schedule(current))
                                     current.reset();
+                                else if (!current->waitingLogged)
+                                {
+                                    current->waitingLogged = true;
+                                    LogWorkerWait(*current, false);
+                                }
                             }
                             catch (const std::bad_alloc &)
                             {
@@ -459,7 +516,7 @@ namespace Eyil
                 Lifecycle();
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    if (stopping && !current && !reserved && !completedHead && connections.empty())
+                    if (stopping && !current && !reserved && !running && !completedHead && connections.empty())
                         break;
                 }
             }
@@ -480,6 +537,11 @@ namespace Eyil
         // still has to finish. Do not unload workers or destroy leased allocations.
         for (;;)
         {
+            uint64_t observed;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                observed = stateRevision;
+            }
             try
             {
                 {
@@ -497,7 +559,7 @@ namespace Eyil
                         completedHead = std::move(retired->next);
                     }
                     completedTail.reset();
-                    if (!reserved && connections.empty())
+                    if (!reserved && !running && connections.empty())
                         break;
                 }
                 Lifecycle();
@@ -507,12 +569,15 @@ namespace Eyil
                 log.Error(Reason::Allocation, "shutdown cleanup deferred");
             }
             std::unique_lock<std::mutex> lock(mutex);
-            changed.wait_for(lock, std::chrono::milliseconds(50));
+            changed.wait(
+                lock, [&] { return stateRevision != observed || (!reserved && !running && connections.empty()); });
         }
         {
             std::lock_guard<std::mutex> lock(mutex);
             auxiliaryStop = true;
-            changed.notify_all();
+            zapWake.Signal();
+            monitorWake.Signal();
+            StateChanged();
         }
     }
 
@@ -574,12 +639,25 @@ namespace Eyil
             }
             work = std::make_shared<Work>(Kind::Request, connection);
             work->route = route.String();
-            work->deadline = Clock::now() + WorkerTimeout;
+            work->admitted = Clock::now();
+            work->deadline = work->admitted + WorkerTimeout;
             if (body.Size() > INT_MAX || !work->request.ParseFromArray(body.Data(), static_cast<int>(body.Size()))
                 || !work->request.request_id())
             {
                 log.Error(Reason::Protocol, "uncorrelatable request");
                 return true;
+            }
+            // Check ownership before schema/service rejection as well: any reply
+            // with an occupied ID could consume the original client's waiter.
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (connection->requests.count(work->request.request_id()))
+                {
+                    log.Error(Reason::Protocol, "duplicate_request_id request_id=%llu connection=%llu",
+                        static_cast<unsigned long long>(work->request.request_id()),
+                        static_cast<unsigned long long>(connection->peer.lifetime));
+                    return true;
+                }
             }
             correlated = true;
             status = RPC_STATUS_OK;
@@ -592,10 +670,10 @@ namespace Eyil
                 std::lock_guard<std::mutex> lock(mutex);
                 if (stopping || connection->closing)
                     status = RPC_STATUS_INVALID_CONNECTION;
-                else if (!connection->requests.insert(work->request.request_id()).second)
-                    status = RPC_STATUS_INTERNAL;
                 else
                 {
+                    // Only the ROUTER owner inserts/retires request IDs.
+                    connection->requests.insert(work->request.request_id());
                     work->tracked = true;
                     ++connection->active;
                     current = work;
@@ -632,7 +710,7 @@ namespace Eyil
             std::lock_guard<std::mutex> lock(mutex);
             if (work.tracked)
                 connection->requests.erase(work.request.request_id());
-            if (connection->closing || work.response.empty())
+            if (connection->disconnected || work.response.empty())
                 return true;
         }
         const auto lifetime = connection->peer.lifetime;
@@ -674,7 +752,7 @@ namespace Eyil
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 monitorReady = true;
-                changed.notify_all();
+                StateChanged();
             }
             for (;;)
             {
@@ -683,13 +761,21 @@ namespace Eyil
                     if (auxiliaryStop)
                         break;
                 }
-                zmq_pollitem_t item { pair.Get(), 0, ZMQ_POLLIN, 0 };
-                if (zmq_poll(&item, 1, 50) < 0 && errno != EINTR)
+                zmq_pollitem_t items[]
+                    = { { pair.Get(), 0, ZMQ_POLLIN, 0 }, { nullptr, monitorWake.Get(), ZMQ_POLLIN, 0 } };
+                if (zmq_poll(items, 2, -1) < 0 && errno != EINTR)
                 {
                     Fatal("monitor poll failed");
                     return;
                 }
-                if (!(item.revents & ZMQ_POLLIN))
+                if (items[1].revents & ZMQ_POLLIN)
+                    monitorWake.Drain();
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (auxiliaryStop)
+                        break;
+                }
+                if (!(items[0].revents & ZMQ_POLLIN))
                     continue;
                 MonitorEvent event;
                 const auto read = ReadMonitor(pair.Get(), event);
@@ -737,7 +823,7 @@ namespace Eyil
                         Close(it->second);
                     }
                 }
-                changed.notify_all();
+                StateChanged();
                 wake.Signal();
             }
         }
@@ -764,7 +850,7 @@ namespace Eyil
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 zapReady = true;
-                changed.notify_all();
+                StateChanged();
             }
             for (;;)
             {
@@ -773,13 +859,20 @@ namespace Eyil
                     if (auxiliaryStop)
                         break;
                 }
-                zmq_pollitem_t item { rep.Get(), 0, ZMQ_POLLIN, 0 };
-                if (zmq_poll(&item, 1, 50) < 0 && errno != EINTR)
+                zmq_pollitem_t items[] = { { rep.Get(), 0, ZMQ_POLLIN, 0 }, { nullptr, zapWake.Get(), ZMQ_POLLIN, 0 } };
+                if (zmq_poll(items, 2, -1) < 0 && errno != EINTR)
                 {
                     Fatal("ZAP poll/send failed");
                     return;
                 }
-                if (!(item.revents & ZMQ_POLLIN))
+                if (items[1].revents & ZMQ_POLLIN)
+                    zapWake.Drain();
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (auxiliaryStop)
+                        break;
+                }
+                if (!(items[0].revents & ZMQ_POLLIN))
                     continue;
                 std::vector<std::string> frames;
                 Peer peer;
@@ -835,8 +928,8 @@ namespace Eyil
                             {
                                 connection->authFinished = false;
                                 auto work = std::make_shared<Work>(Kind::Authenticate, connection);
-                                changed.wait(
-                                    lock, [&] { return stopping || connection->closing || reserved < workers; });
+                                changed.wait(lock,
+                                    [&] { return stopping || connection->closing || reserved + running < workers; });
                                 if (!stopping && !connection->closing && Schedule(work))
                                 {
                                     changed.wait(lock,

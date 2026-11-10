@@ -265,6 +265,21 @@ For example, `reason=worker_pool_exhausted workers=4 running=4 reserved=0
 wait_ms=10000`, followed by request ID, service and connection generation,
 identifies a request that could not start while all four workers were occupied.
 
+Emit `worker_pool_wait` at WARNING once when a request first cannot obtain
+capacity. Both diagnostics distinguish running jobs from reserved handoffs that
+have not started; running lifecycle jobs are included and also reported
+separately. Compute `wait_ms` from the monotonic admission timestamp, rather than
+printing the configured timeout as the observed duration.
+
+Transport owners have no periodic idle-poll interval. ROUTER polls its socket
+and eventfd indefinitely without a current deadline, or until the current
+request's absolute worker-start deadline. Pending completions continue draining
+without a blocking poll. Worker start/completion and registry changes signal the
+owner. ZAP and monitor each poll their socket and a separate stop eventfd, so
+shutdown wakes both even with no traffic. After transport failure, cleanup waits
+for a state-revision change under the registry mutex to avoid missed wakeups;
+unresolved cleanup does not introduce a retry timer.
+
 The timer starts when Gateway admits this current request, **not** when the
 client submits it or when libzmq first buffers it. Unread messages can remain
 in libzmq/kernel buffers while reception is paused. They have no Gateway job or
@@ -1532,6 +1547,15 @@ definitive path, including null lookup and failure before calling Crypto, a
 returned service error and later response-processing failure. It does not wait
 for reply delivery. Section 6.13 defines the finalization and error contract.
 
+For Thunder R4, an ordinary failed Core::hresult is a completed method return:
+report RPC_STATUS_INTERNAL and end the lease. COM-RPC transport failures carry
+the COM_ERROR flag and conservatively retain the access obligation. A C++
+exception unwinding a direct in-process call also ends its synchronous access;
+an exception from a Thunder proxy does not establish remote completion. Identify
+the proxy locally without another interface lookup or backend call. These
+distinctions preserve the backend contract above and the unresolved remote
+completion boundary in section 7.1.
+
 The topic/crypto ICrypto contract selects output locations in Crypto. Gateway
 forwards the returned region only after validating the invocation and service
 result. On success, output must be inside the allocation. A BUFFER_OVERFLOW
@@ -2659,6 +2683,10 @@ library lifetime before remote Terminate can be used.
 Runtime failures request framework deactivation through the wrapper. Suppress
 new lifecycle callbacks and quiesce registered ones without self-joining the
 callback that initiated teardown.
+The runtime reports its first running-state failure through an internal C++
+callback. The implementation queues an IShell::Job(DEACTIVATED, FAILURE) on the
+framework pool, which invokes wrapper teardown on a framework thread. Startup
+rollback and an already requested stop do not schedule another deactivation.
 
 #### Admission and drain contract
 

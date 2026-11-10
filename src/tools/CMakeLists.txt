@@ -17,7 +17,7 @@ endif()
 install(CODE "
     execute_process(COMMAND \"${Python3_EXECUTABLE}\" \"${PROJECT_SOURCE_DIR}/scripts/stage-dev-client.py\"
         --executable \"$<TARGET_FILE:eyil-client>\"
-        --destination \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBEXECDIR}/eyil-dev\"
+        --destination \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/eyil\"
         --sysroot \"${EYIL_DEV_SYSROOT}\" --readelf \"${CMAKE_READELF}\"
         --library \"$<TARGET_FILE:eyilclient>\" --library \"$<TARGET_FILE:eyilprotocol>\"
         --library \"$<TARGET_FILE:protobuf::libprotobuf>\" --library \"$<TARGET_FILE:ZeroMQ::ZeroMQ>\"

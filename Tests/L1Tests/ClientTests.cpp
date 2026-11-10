@@ -23,6 +23,17 @@ using namespace EyilTest;
 
 namespace Injection
 {
+    std::atomic<unsigned> pollCalls { 0 };
+    std::atomic<long> pollTimeout { 0 };
+    std::atomic<int> wakeFd { -1 };
+
+    void Advance(long long milliseconds)
+    {
+        clockAdvanceMs = milliseconds;
+        const uint64_t one = 1;
+        CHECK(write(wakeFd.load(), &one, sizeof(one)) == sizeof(one));
+    }
+
     std::atomic<int> sendError { 0 }, sendFailures { 0 }, setupError { 0 }, setupPoint { 0 };
     std::atomic<unsigned> attempts { 0 };
     std::atomic<int> ownerAllocation { -1 }, monitorStatus { 0 };
@@ -112,6 +123,12 @@ extern "C"
 
     int __wrap_zmq_poll(zmq_pollitem_t *items, int count, long timeout)
     {
+        if (count == 3 && Injection::Type(items[0].socket) == ZMQ_DEALER)
+        {
+            Injection::wakeFd = items[2].fd;
+            Injection::pollTimeout = timeout;
+            ++Injection::pollCalls;
+        }
         int result = __real_zmq_poll(items, count, timeout);
         if (count == 3 && Injection::Type(items[0].socket) == ZMQ_DEALER)
         {
@@ -752,7 +769,7 @@ namespace
         f.server.hold = true;
         auto sync = std::async(std::launch::async, [&] { return f.Call(); });
         Eventually([&] { return f.server.requests == 1; });
-        clockAdvanceMs = 16000;
+        Injection::Advance(16000);
         auto result = sync.get();
         clockAdvanceMs = 0;
         CHECK(result == CLIENT_TIMEOUT);
@@ -806,6 +823,22 @@ namespace
         Injection::sendFailures = 0;
         CHECK(a == CLIENT_NOT_CONNECTED && b == CLIENT_NOT_CONNECTED);
         CHECK(f.server.requests == 0 && callbacks == 0 && lost == 0);
+    }
+
+    void IdlePoll()
+    {
+        Fixture f;
+        CHECK(f.Call() == CLIENT_OK);
+        Eventually(
+            []
+            {
+                if (Injection::pollTimeout != -1)
+                    return false;
+                const auto before = Injection::pollCalls.load();
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                return Injection::pollCalls == before;
+            });
+        CHECK(f.Call() == CLIENT_OK); // A new API submission wakes an indefinite poll.
     }
 
     void AsyncNoDeadline()
@@ -910,7 +943,7 @@ int main(int argc, char **argv)
             { "socket-memory", [] { SetupFailure(1, ENOMEM); } }, { "socket-error", [] { SetupFailure(1, EMFILE); } },
             { "monitor-memory", [] { SetupFailure(2, ENOMEM); } }, { "monitor-error", [] { SetupFailure(2, EINVAL); } },
             { "connect-memory", [] { SetupFailure(3, ENOMEM); } }, { "connect-error", [] { SetupFailure(3, EINVAL); } },
-            { "owner-memory", OwnerMemory }, { "close-before-send", CloseBeforeSend },
+            { "owner-memory", OwnerMemory }, { "close-before-send", CloseBeforeSend }, { "idle-poll", IdlePoll },
             { "async-no-deadline", AsyncNoDeadline }, { "connect-allocation", ConnectMemory },
             { "monitor-auth-300", []
                 {

@@ -192,8 +192,10 @@ namespace Eyil
         while (Clock::now() < deadline && !(received && disconnected && replied))
         {
             zmq_pollitem_t items[] = { { zap.Get(), 0, ZMQ_POLLIN, 0 }, { router.Get(), 0, ZMQ_POLLIN, 0 },
-                { monitor.Get(), 0, ZMQ_POLLIN, 0 }, { first->Get(), 0, ZMQ_POLLIN, 0 } };
-            if (zmq_poll(items, 4, 20) < 0 && errno != EINTR)
+                { monitor.Get(), 0, ZMQ_POLLIN, 0 },
+                { first->Get(), 0,
+                    static_cast<short>(ZMQ_POLLIN | (identities.size() == 2 && !requestSent ? ZMQ_POLLOUT : 0)), 0 } };
+            if (zmq_poll(items, 4, PollTimeout(deadline)) < 0 && errno != EINTR)
                 return { EPROTO, "probe poll failed" };
             if (items[0].revents & ZMQ_POLLIN)
             {

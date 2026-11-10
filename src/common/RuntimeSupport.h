@@ -13,12 +13,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -33,6 +35,66 @@ namespace Eyil
     constexpr auto CallTimeout = std::chrono::milliseconds(15000);
     constexpr auto WorkerTimeout = std::chrono::milliseconds(10000);
     constexpr const char *Endpoint = "ipc:///tmp/app-eyil-gateway.ipc";
+
+    inline long PollTimeout(Clock::time_point deadline, Clock::time_point now = Clock::now()) noexcept
+    {
+        if (deadline == Clock::time_point::max())
+            return -1;
+        if (deadline <= now)
+            return 0;
+        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+        return static_cast<long>(std::min<int64_t>(remaining, std::numeric_limits<long>::max()));
+    }
+
+    // Copied with retained work; no payload, app identity string or heap allocation.
+    struct LogContext
+    {
+        uint64_t connection = 0;
+        uint64_t request = 0;
+        uint32_t uid = 0;
+        int service = 0;
+        int operation = 0;
+        std::array<char, 65> buffer {};
+
+        void Buffer(const std::string &id) noexcept
+        {
+            buffer.fill(0);
+            for (size_t i = 0; i < id.size() && i + 1 < buffer.size(); ++i)
+            {
+                const char c = id[i];
+                buffer[i] = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-'
+                                || c == '_' || c == '.')
+                    ? c
+                    : '?';
+            }
+        }
+    };
+
+    // Nested synchronous calls inherit correlation; another worker has its own scope.
+    class LogScope
+    {
+    public:
+        explicit LogScope(LogContext value = Current()) noexcept
+            : context(value)
+            , previous(active)
+        {
+            active = &context;
+        }
+
+        ~LogScope() { active = previous; }
+
+        LogScope(const LogScope &) = delete;
+        LogScope &operator=(const LogScope &) = delete;
+
+        LogContext &Context() noexcept { return context; }
+
+        static LogContext Current() noexcept { return active ? *active : LogContext {}; }
+
+    private:
+        LogContext context;
+        const LogContext *previous;
+        inline static thread_local const LogContext *active = nullptr;
+    };
 
     class Fd
     {
@@ -296,6 +358,7 @@ namespace Eyil
         Authentication,
         Buffer,
         WorkerExhausted,
+        WorkerWaiting,
         DroppedReply,
         Callback,
         Setup,
@@ -315,41 +378,24 @@ namespace Eyil
 
         void Error(Reason reason, const char *format, ...) noexcept
         {
-            try
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                auto &bucket = buckets[static_cast<size_t>(reason)];
-                ++bucket.total;
-                const auto now = Clock::now();
-                if (bucket.total != 1 && now - bucket.last < std::chrono::seconds(5))
-                {
-                    ++bucket.suppressed;
-                    return;
-                }
-                char detail[512];
-                va_list args;
-                va_start(args, format);
-                vsnprintf(detail, sizeof(detail), format, args);
-                va_end(args);
-                char output[768];
-                snprintf(output, sizeof(output), "%s ERROR category=%u %s suppressed=%llu\n", component,
-                    static_cast<unsigned>(reason), detail, static_cast<unsigned long long>(bucket.suppressed));
-                bucket.suppressed = 0;
-                bucket.last = now;
-                if (sink)
-                    sink(output);
-                else
-                    fputs(output, stderr);
-            }
-            catch (...)
-            {
-            }
+            va_list args;
+            va_start(args, format);
+            Write(0, reason, format, args);
+            va_end(args);
+        }
+
+        void Warning(Reason reason, const char *format, ...) noexcept
+        {
+            va_list args;
+            va_start(args, format);
+            Write(1, reason, format, args);
+            va_end(args);
         }
 
         uint64_t Total(Reason reason) const
         {
             std::lock_guard<std::mutex> lock(mutex);
-            return buckets[static_cast<size_t>(reason)].total;
+            return buckets[0][static_cast<size_t>(reason)].total + buckets[1][static_cast<size_t>(reason)].total;
         }
 
         void Summary() noexcept
@@ -357,20 +403,22 @@ namespace Eyil
             try
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                for (size_t i = 0; i < buckets.size(); ++i)
-                {
-                    auto &b = buckets[i];
-                    if (!b.suppressed)
-                        continue;
-                    char text[192];
-                    snprintf(text, sizeof(text), "%s WARNING category=%zu suppressed=%llu total=%llu\n", component, i,
-                        static_cast<unsigned long long>(b.suppressed), static_cast<unsigned long long>(b.total));
-                    if (sink)
-                        sink(text);
-                    else
-                        fputs(text, stderr);
-                    b.suppressed = 0;
-                }
+                for (unsigned level = 0; level < buckets.size(); ++level)
+                    for (size_t i = 0; i < buckets[level].size(); ++i)
+                    {
+                        auto &b = buckets[level][i];
+                        if (!b.suppressed)
+                            continue;
+                        char text[512];
+                        snprintf(text, sizeof(text),
+                            "%s %s category=%zu suppressed=%llu total=%llu last_connection=%llu last_request_id=%llu\n",
+                            component, Level(level), i, static_cast<unsigned long long>(b.suppressed),
+                            static_cast<unsigned long long>(b.total),
+                            static_cast<unsigned long long>(b.context.connection),
+                            static_cast<unsigned long long>(b.context.request));
+                        Emit(text);
+                        b.suppressed = 0;
+                    }
             }
             catch (...)
             {
@@ -378,16 +426,74 @@ namespace Eyil
         }
 
     private:
+        static const char *Level(unsigned level) { return level ? "WARNING" : "ERROR"; }
+
+        void Emit(const char *text)
+        {
+            if (sink)
+                sink(text);
+            else
+                fputs(text, stderr);
+        }
+
+        void Write(unsigned level, Reason reason, const char *format, va_list args) noexcept
+        {
+            try
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto &bucket = buckets[level][static_cast<size_t>(reason)];
+                ++bucket.total;
+                bucket.context = LogScope::Current();
+                const auto now = Clock::now();
+                if (bucket.total != 1 && now - bucket.last < std::chrono::seconds(5))
+                {
+                    ++bucket.suppressed;
+                    return;
+                }
+                char detail[512];
+                vsnprintf(detail, sizeof(detail), format, args);
+                char fields[320] {};
+                size_t used = 0;
+                const auto append = [&](const char *key, unsigned long long value)
+                { used += snprintf(fields + used, sizeof(fields) - used, " %s=%llu", key, value); };
+                const auto &context = bucket.context;
+                if (context.connection)
+                {
+                    append("connection", context.connection);
+                    append("uid", context.uid);
+                }
+                if (context.request)
+                {
+                    append("request_id", context.request);
+                    append("service", context.service);
+                }
+                if (context.operation)
+                    append("operation", context.operation);
+                if (context.buffer[0])
+                    snprintf(fields + used, sizeof(fields) - used, " buffer_id=%s", context.buffer.data());
+                char output[1024];
+                snprintf(output, sizeof(output), "%s %s category=%u %s%s suppressed=%llu\n", component, Level(level),
+                    static_cast<unsigned>(reason), detail, fields, static_cast<unsigned long long>(bucket.suppressed));
+                bucket.suppressed = 0;
+                bucket.last = now;
+                Emit(output);
+            }
+            catch (...)
+            {
+            }
+        }
+
         struct Bucket
         {
             Clock::time_point last {};
             uint64_t total = 0;
             uint64_t suppressed = 0;
+            LogContext context;
         };
 
         const char *component;
         Sink sink;
         mutable std::mutex mutex;
-        std::array<Bucket, static_cast<size_t>(Reason::Count)> buckets {};
+        std::array<std::array<Bucket, static_cast<size_t>(Reason::Count)>, 2> buckets {};
     };
 }

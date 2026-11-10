@@ -42,6 +42,7 @@ python3 - "$build_dir" "$stage_dir" <<'PY'
 import ctypes
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -63,6 +64,14 @@ for entry in (build / "install_manifest.txt").read_text().splitlines():
     )
     assert allowed, f"Unexpected install artifact: {entry}"
 print("Install manifest contains runtime artifacts and the client SDK, without documentation.")
+if "BUILD_EYIL_DEV_TOOLS:BOOL=ON" in (build / "CMakeCache.txt").read_text():
+    bundle = stage / "usr/lib/eyil"
+    assert (stage / "usr/bin/eyil-client").is_file()
+    assert (bundle / "eyil-client").is_file()
+    assert (bundle / "run").is_file()
+    assert all(path.name in {"eyil-client", "run"} or ".so" in path.name for path in bundle.iterdir())
+    subprocess.run([str(bundle / "run"), "--help"], check=True)
+    print("Installed container client starts from /usr/lib/eyil with its private libraries.")
 if "PLUGIN_EYILGATEWAY:BOOL=ON" in (build / "CMakeCache.txt").read_text():
     config_path = stage / "etc/WPEFramework/plugins/EyilGateway.json"
     config = json.loads(config_path.read_text())

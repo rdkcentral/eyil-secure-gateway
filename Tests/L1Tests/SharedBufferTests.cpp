@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <future>
 #include <set>
+#include <vector>
 #include <sys/stat.h>
 using namespace EyilTest;
 
@@ -25,7 +26,12 @@ namespace
 {
     struct Fixture
     {
-        Eyil::Diagnostics log { "buffer-unit", IgnoreLog };
+        explicit Fixture(Eyil::Diagnostics::Sink sink = IgnoreLog)
+            : log("buffer-unit", sink)
+        {
+        }
+
+        Eyil::Diagnostics log;
         Eyil::SharedBuffers buffers { log };
         std::shared_ptr<Eyil::Connection> a = Owner("a"), b = Owner("b");
 
@@ -225,14 +231,54 @@ namespace
             CHECK(f.buffers.Charged(getuid()) == 0);
         }
     }
+
+    std::vector<std::string> bufferLogs;
+
+    void CaptureBufferLog(const char *text) { bufferLogs.emplace_back(text); }
+
+    void LogCorrelation()
+    {
+        bufferLogs.clear();
+        Fixture f(CaptureBufferLog);
+        f.a->peer.lifetime = 567;
+        Eyil::SharedBuffers::Allocation allocation;
+        {
+            Eyil::LogScope scope({ 567, 123, getuid(), RPC_SERVICE_CRYPTO });
+            allocation = f.buffers.Allocate(f.a, 4096);
+        }
+        CHECK(allocation.error == CRYPTO_ERROR_NONE);
+        Eyil::SharedBuffers::Lease lease;
+        const Eyil::SharedBuffers::Region region { 0, 16 };
+        {
+            Eyil::LogScope scope({ 567, 124, getuid(), RPC_SERVICE_CRYPTO, CRYPTO_OPERATION_ENCRYPT });
+            CHECK(f.buffers.TryUse(f.a, allocation.id, &region, 1, lease) == CRYPTO_ERROR_NONE);
+        }
+        {
+            Eyil::LogScope scope({ 567, 125, getuid(), RPC_SERVICE_CRYPTO });
+            CHECK(f.buffers.Release(f.a, allocation.id) == CRYPTO_ERROR_NONE);
+        }
+        {
+            FailSystemCall failure(Syscall::Unlink, EACCES);
+            lease = {}; // Deferred cleanup retains the release request's context.
+        }
+        CHECK(bufferLogs.size() == 1);
+        const auto &line = bufferLogs.front();
+        CHECK(line.find("buffer_cleanup_failed") != std::string::npos);
+        CHECK(line.find("connection=567") != std::string::npos);
+        CHECK(line.find("request_id=125 service=1") != std::string::npos);
+        CHECK(line.find("buffer_id=" + allocation.id) != std::string::npos);
+        CHECK(line.find("errno=13") != std::string::npos);
+        CHECK(f.buffers.Cleanup(f.a->userId));
+    }
+
 }
 
 int main(int argc, char **argv)
 {
     return RunCases(argc, argv,
-        { { "sizes", BoundarySizes }, { "range-arithmetic", RangeArithmetic }, { "uid-isolation", UidIsolation },
-            { "allocation-memory", AllocationMemory }, { "release-failure", ReleaseFailures },
-            { "lease-lifetime", Leases }, { "release-race", ReleaseRace },
+        { { "log-correlation", LogCorrelation }, { "sizes", BoundarySizes }, { "range-arithmetic", RangeArithmetic },
+            { "uid-isolation", UidIsolation }, { "allocation-memory", AllocationMemory },
+            { "release-failure", ReleaseFailures }, { "lease-lifetime", Leases }, { "release-race", ReleaseRace },
             { "open-denied", [] { AllocationFailure(Syscall::Open, EACCES); } },
             { "exclusive-create-failed", [] { AllocationFailure(Syscall::OpenAt, EEXIST); } },
             { "truncate-failed", [] { AllocationFailure(Syscall::Truncate, EIO); } },

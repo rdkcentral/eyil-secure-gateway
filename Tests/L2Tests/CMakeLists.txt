@@ -81,12 +81,13 @@ if(TARGET EyilGatewayRuntime)
     add_executable(eyil-gateway-edge-l2 GatewayEdgeTests.cpp)
     target_link_libraries(eyil-gateway-edge-l2 PRIVATE EyilGatewayRuntime)
     eyil_test_faults(eyil-gateway-edge-l2)
-    target_link_options(eyil-gateway-edge-l2 PRIVATE "-Wl,--wrap=zmq_send"
+    target_link_options(eyil-gateway-edge-l2 PRIVATE "-Wl,--wrap=zmq_send" "-Wl,--wrap=zmq_poll"
         "-Wl,--wrap=_ZN6google8protobuf11MessageLite14ParseFromArrayEPKvi"
         "-Wl,--wrap=_ZNK6google8protobuf11MessageLite17SerializeToStringEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE")
-    eyil_test_cases(eyil-gateway-edge-l2 L2 envelopes framing-drain duplicate-id
+    eyil_test_cases(eyil-gateway-edge-l2 L2 idle-poll worker-logs envelopes framing-drain duplicate-id
         disconnect-before-request route-reuse reply-eagain reply-unreachable reply-body-failure
         admission-body-failure response-admission-fallback response-admission-drop response-catch-drop
         response-worker-fallback response-worker-drop response-timeout-drop
-        response-serialization-fallback response-serialization-drop)
+        response-serialization-fallback response-serialization-drop
+        drain-replies drain-waiting drain-waiting-timeout)
 endif()

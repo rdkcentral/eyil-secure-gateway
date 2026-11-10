@@ -144,7 +144,14 @@ namespace WPEFramework
                         return callsign.empty() ? nullptr
                                                 : _service->QueryInterfaceByCallsign<Exchange::ICrypto>(callsign);
                     },
-                    settings.workers, Eyil::Endpoint, RuntimeLog, service->VolatilePath());
+                    settings.workers, Eyil::Endpoint, RuntimeLog, service->VolatilePath(),
+                    [this]
+                    {
+                        // Thunder invokes the wrapper's Deinitialize on its own
+                        // worker; never release the implementation on an I/O owner.
+                        Core::IWorkerPool::Instance().Submit(PluginHost::IShell::Job::Create(
+                            _service, PluginHost::IShell::DEACTIVATED, PluginHost::IShell::FAILURE));
+                    });
                 started = _runtime->Start();
             }
             catch (const std::exception &e)

@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <set>
+#include <thread>
 using namespace EyilTest;
 
 namespace Metadata
@@ -175,6 +176,50 @@ namespace
         CHECK(broken.Total(Eyil::Reason::Buffer) == 2);
     }
 
+    void Deadlines()
+    {
+        const auto now = Eyil::Clock::now();
+        CHECK(Eyil::PollTimeout(Eyil::Clock::time_point::max(), now) == -1);
+        CHECK(Eyil::PollTimeout(now, now) == 0);
+        CHECK(Eyil::PollTimeout(now - std::chrono::seconds(1), now) == 0);
+        CHECK(Eyil::PollTimeout(now + std::chrono::nanoseconds(1), now) == 1);
+        CHECK(Eyil::PollTimeout(now + std::chrono::milliseconds(10000), now) == 10000);
+    }
+
+    void ContextLogs()
+    {
+        lines.clear();
+        Eyil::Diagnostics log("test", Log);
+        {
+            Eyil::LogScope outer({ 12, 34, 56, 1, 4 });
+            outer.Context().Buffer("opaque\n\r=" + std::string(100, 'x'));
+            log.Warning(Eyil::Reason::Buffer, "waiting");
+            log.Warning(Eyil::Reason::Buffer, "waiting again");
+            log.Error(Eyil::Reason::Buffer, "failure"); // WARNING must not suppress ERROR.
+            CHECK(lines.size() == 2);
+            CHECK(lines[0].find(" WARNING ") != std::string::npos);
+            CHECK(lines[1].find(" ERROR ") != std::string::npos);
+            CHECK(lines[1].find("connection=12 uid=56 request_id=34 service=1 operation=4") != std::string::npos);
+            CHECK(lines[1].find("buffer_id=opaque???") != std::string::npos);
+            CHECK(std::count(lines[1].begin(), lines[1].end(), '\n') == 1);
+            CHECK(Eyil::LogScope::Current().buffer.back() == 0);
+            {
+                Eyil::LogScope nested;
+                nested.Context().request = 99;
+                CHECK(Eyil::LogScope::Current().request == 99);
+            }
+            CHECK(Eyil::LogScope::Current().request == 34);
+            uint64_t otherThread = 99;
+            std::thread worker([&] { otherThread = Eyil::LogScope::Current().request; });
+            worker.join();
+            CHECK(otherThread == 0);
+        }
+        CHECK(Eyil::LogScope::Current().request == 0);
+        log.Summary();
+        CHECK(lines.back().find(" WARNING ") != std::string::npos);
+        CHECK(lines.back().find("last_request_id=34") != std::string::npos);
+    }
+
     void Decimals()
     {
         uint64_t value = 0;
@@ -270,6 +315,6 @@ int main(int argc, char **argv)
 {
     return RunCases(argc, argv,
         { { "descriptors", Descriptors }, { "wakeup", Wakeups }, { "sockets", Sockets }, { "tokens", Tokens },
-            { "log-suppression", Logs }, { "identity-decimal", Decimals }, { "credentials", Credentials },
-            { "monitor-framing", MonitorFrames } });
+            { "poll-deadlines", Deadlines }, { "log-context", ContextLogs }, { "log-suppression", Logs },
+            { "identity-decimal", Decimals }, { "credentials", Credentials }, { "monitor-framing", MonitorFrames } });
 }

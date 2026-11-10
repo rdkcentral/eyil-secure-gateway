@@ -37,8 +37,50 @@ namespace ResponseFault
     std::atomic<bool> returnFalse { false };
 }
 
+namespace PollObservation
+{
+    std::atomic<unsigned> paused { 0 };
+    std::array<std::atomic<unsigned>, 3> calls {};
+    std::array<std::atomic<long>, 3> timeouts {};
+    std::atomic<int> routerWake { -1 };
+
+    void Advance(long long milliseconds)
+    {
+        clockAdvanceMs = milliseconds;
+        const uint64_t one = 1;
+        CHECK(write(routerWake.load(), &one, sizeof(one)) == sizeof(one));
+    }
+}
+
 extern "C"
 {
+    int __real_zmq_poll(zmq_pollitem_t *, int, long);
+
+    int __wrap_zmq_poll(zmq_pollitem_t *items, int count, long timeout)
+    {
+        if (count == 2 && items[0].socket)
+        {
+            int type = -1;
+            size_t size = sizeof(type);
+            if (!zmq_getsockopt(items[0].socket, ZMQ_TYPE, &type, &size))
+            {
+                const int index = type == ZMQ_ROUTER ? 0 : type == ZMQ_REP ? 1 : type == ZMQ_PAIR ? 2 : -1;
+                if (index >= 0)
+                {
+                    PollObservation::timeouts[index] = timeout;
+                    ++PollObservation::calls[index];
+                }
+                if (type == ZMQ_ROUTER)
+                {
+                    PollObservation::routerWake = items[1].fd;
+                    if (!(items[0].events & ZMQ_POLLIN))
+                        ++PollObservation::paused;
+                }
+            }
+        }
+        return __real_zmq_poll(items, count, timeout);
+    }
+
     int __real_zmq_send(void *, const void *, size_t, int);
 
     int __wrap_zmq_send(void *socket, const void *data, size_t size, int flags)
@@ -107,16 +149,43 @@ extern "C"
 
 namespace
 {
-    void Ignore(const char *) { }
+    std::mutex logMutex;
+    std::vector<std::string> logs;
+
+    void Capture(const char *text)
+    {
+        std::lock_guard<std::mutex> lock(logMutex);
+        logs.emplace_back(text);
+    }
+
+    std::string FindLog(const std::string &text)
+    {
+        std::lock_guard<std::mutex> lock(logMutex);
+        for (const auto &line : logs)
+            if (line.find(text) != std::string::npos)
+                return line;
+        return {};
+    }
 
     struct Fixture
     {
         MockCrypto crypto;
-        Eyil::GatewayRuntime gateway { [this] { return crypto.Acquire(); }, 4, Eyil::Endpoint, Ignore };
+        Eyil::GatewayRuntime gateway;
         Eyil::Context context;
 
-        Fixture()
+        explicit Fixture(unsigned workers = 4)
+            : gateway([this] { return crypto.Acquire(); }, workers, Eyil::Endpoint, Capture)
         {
+            {
+                std::lock_guard<std::mutex> lock(logMutex);
+                logs.clear();
+            }
+            PollObservation::paused = 0;
+            for (size_t i = 0; i < 3; ++i)
+            {
+                PollObservation::calls[i] = 0;
+                PollObservation::timeouts[i] = 0;
+            }
             ReplyFault::error = 0;
             ReplyFault::countSends = false;
             ResponseFault::request = 0;
@@ -250,12 +319,34 @@ namespace
         const auto wire = Request(77).SerializeAsString();
         p.Send(wire);
         Eventually([&] { return f.crypto.entered == 1; });
-        p.Send(wire);
-        auto duplicate = p.Read();
-        CHECK(duplicate.request_id() == 77 && duplicate.status() == RPC_STATUS_INTERNAL && f.crypto.entered == 1);
+        for (unsigned variant = 0; variant < 3; ++variant)
+        {
+            auto duplicate = Request(77);
+            if (variant == 1)
+                duplicate.set_schema_version(99);
+            if (variant == 2)
+                duplicate.set_service(RPC_SERVICE_UNSPECIFIED);
+            const auto rejected = f.gateway.Log().Total(Eyil::Reason::Protocol);
+            p.Send(duplicate.SerializeAsString());
+            Eventually([&] { return f.gateway.Log().Total(Eyil::Reason::Protocol) > rejected; });
+            zmq_pollitem_t item { p.socket.Get(), 0, ZMQ_POLLIN, 0 };
+            CHECK(zmq_poll(&item, 1, 0) == 0);
+            CHECK(f.crypto.entered == 1);
+        }
+
+        // The same ID on another authenticated connection remains independent.
+        Peer other(f);
+        other.Send(wire);
+        Eventually([&] { return f.crypto.entered == 2; });
         f.crypto.Unblock();
         auto original = p.Read();
-        CHECK(original.request_id() == 77 && original.status() == RPC_STATUS_OK && f.crypto.entered == 1);
+        CHECK(original.request_id() == 77 && original.status() == RPC_STATUS_OK);
+        auto independent = other.Read();
+        CHECK(independent.request_id() == 77 && independent.status() == RPC_STATUS_OK && f.crypto.entered == 2);
+        p.Send(Request(78).SerializeAsString());
+        CHECK(p.Read().request_id() == 78);
+        zmq_pollitem_t item { p.socket.Get(), 0, ZMQ_POLLIN, 0 };
+        CHECK(zmq_poll(&item, 1, 50) == 0);
     }
 
     void DisconnectBeforeRequest()
@@ -270,6 +361,122 @@ namespace
         b.reset();
         Eventually([&] { return f.crypto.SessionCount() == 0; });
         CHECK(f.crypto.references == 1);
+    }
+
+    void DrainReplies(bool waiting, bool expire)
+    {
+        Fixture f(waiting ? 1 : 4);
+        Peer p(f);
+        f.crypto.block = true;
+        const unsigned running = waiting ? 1 : 4;
+        for (unsigned id = 1; id <= running; ++id)
+            p.Send(Request(id).SerializeAsString());
+        Eventually([&] { return f.crypto.entered == running; });
+        if (waiting)
+        {
+            const auto paused = PollObservation::paused.load();
+            p.Send(Request(2).SerializeAsString());
+            Eventually([&] { return ResponseFault::parsed == 2 && PollObservation::paused > paused; });
+        }
+
+        auto stopped = std::async(std::launch::async, [&] { f.gateway.StopAndWait(); });
+
+        struct Finish
+        {
+            Fixture &fixture;
+            std::future<void> &stopped;
+
+            ~Finish()
+            {
+                fixture.crypto.Unblock();
+                if (stopped.valid())
+                    stopped.wait();
+            }
+        } finish { f, stopped };
+
+        CHECK(stopped.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
+        if (expire)
+        {
+            PollObservation::Advance(10001);
+            const auto response = p.Read();
+            CHECK(response.request_id() == 2 && response.status() == RPC_STATUS_INTERNAL);
+            CHECK(f.crypto.entered == 1);
+        }
+        f.crypto.Unblock();
+        std::set<uint64_t> replies;
+        const unsigned expected = running + (waiting && !expire ? 1 : 0);
+        for (unsigned n = 0; n < expected; ++n)
+        {
+            const auto response = p.Read();
+            CHECK(response.status() == RPC_STATUS_OK && replies.insert(response.request_id()).second);
+        }
+        CHECK(replies.count(1) && (!waiting || expire || replies.count(2)));
+        CHECK(stopped.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+        stopped.get();
+        CHECK(f.crypto.SessionCount() == 0 && f.crypto.references == 1 && f.crypto.entered == expected);
+    }
+
+    void IdlePoll()
+    {
+        Fixture f;
+        Peer p(f);
+        p.Send(Request(1).SerializeAsString());
+        CHECK(p.Read().status() == RPC_STATUS_OK);
+        Eventually(
+            []
+            {
+                std::array<unsigned, 3> before;
+                for (size_t i = 0; i < 3; ++i)
+                {
+                    if (PollObservation::timeouts[i] != -1 || PollObservation::calls[i] == 0)
+                        return false;
+                    before[i] = PollObservation::calls[i];
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                for (size_t i = 0; i < 3; ++i)
+                    if (PollObservation::calls[i] != before[i])
+                        return false;
+                return true;
+            });
+        p.Send(Request(2).SerializeAsString());
+        CHECK(p.Read().status() == RPC_STATUS_OK);
+        // The fixture stops while all three owners may be in indefinite poll.
+    }
+
+    void WorkerLogs()
+    {
+        Fixture f(1);
+        Peer p(f);
+        f.crypto.block = true;
+
+        struct Unblock
+        {
+            MockCrypto &crypto;
+
+            ~Unblock() { crypto.Unblock(); }
+        } unblock { f.crypto };
+
+        p.Send(Request(41).SerializeAsString());
+        Eventually([&] { return f.crypto.entered == 1; });
+        p.Send(Request(42).SerializeAsString());
+        Eventually([&] { return f.gateway.Log().Total(Eyil::Reason::WorkerWaiting) == 1; });
+        const auto warning = FindLog("reason=worker_pool_wait");
+        CHECK(warning.find(" WARNING ") != std::string::npos);
+        CHECK(warning.find("workers=1 running=1 reserved=0 lifecycle_running=0") != std::string::npos);
+        CHECK(warning.find("request_id=42 service=1") != std::string::npos);
+        CHECK(warning.find("connection=") != std::string::npos);
+        PollObservation::Advance(25000);
+        const auto response = p.Read();
+        CHECK(response.request_id() == 42 && response.status() == RPC_STATUS_INTERNAL);
+        const auto error = FindLog("reason=worker_pool_exhausted");
+        CHECK(error.find(" ERROR ") != std::string::npos);
+        CHECK(error.find("running=1 reserved=0") != std::string::npos);
+        CHECK(error.find("request_id=42 service=1") != std::string::npos);
+        const auto wait = error.find("wait_ms=");
+        CHECK(wait != std::string::npos && std::stoll(error.substr(wait + 8)) >= 25000);
+        CHECK(f.gateway.Log().Total(Eyil::Reason::WorkerWaiting) == 1);
+        f.crypto.Unblock();
+        CHECK(p.Read().request_id() == 41);
     }
 
     void DropReply(int error, bool body, bool admission = false)
@@ -346,7 +553,7 @@ namespace
         if (path == ResponsePath::WorkerTimeout)
         {
             Eventually([&] { return ResponseFault::parsed == target; });
-            clockAdvanceMs = 10001;
+            PollObservation::Advance(10001);
         }
 
         const bool alreadyInternal = path == ResponsePath::AdmissionFailure || path == ResponsePath::WorkerTimeout;
@@ -429,8 +636,12 @@ namespace
 int main(int argc, char **argv)
 {
     return RunCases(argc, argv,
-        { { "envelopes", Envelopes }, { "framing-drain", Framing }, { "duplicate-id", DuplicateInFlight },
+        { { "idle-poll", IdlePoll }, { "worker-logs", WorkerLogs }, { "envelopes", Envelopes },
+            { "framing-drain", Framing }, { "duplicate-id", DuplicateInFlight },
             { "disconnect-before-request", DisconnectBeforeRequest }, { "route-reuse", RouteReuse },
+            { "drain-replies", [] { DrainReplies(false, false); } },
+            { "drain-waiting", [] { DrainReplies(true, false); } },
+            { "drain-waiting-timeout", [] { DrainReplies(true, true); } },
             { "reply-eagain", [] { DropReply(EAGAIN, false); } },
             { "reply-unreachable", [] { DropReply(EHOSTUNREACH, false); } },
             { "reply-body-failure", [] { DropReply(EPIPE, true); } },

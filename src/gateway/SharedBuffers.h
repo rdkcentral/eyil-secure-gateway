@@ -64,6 +64,7 @@ namespace Eyil
             SharedBuffers *manager = nullptr;
             std::shared_ptr<Record> record;
             bool uncertain = false;
+            LogContext context;
         };
 
         explicit SharedBuffers(Diagnostics &diagnostics)
@@ -93,6 +94,7 @@ namespace Eyil
             std::string path;
             uint32_t uid = 0;
             uint32_t size = 0;
+            LogContext cleanupContext;
             Fd directory;
             Fd fd;
 
@@ -111,7 +113,7 @@ namespace Eyil
         };
 
         Allocation AllocateImpl(const std::shared_ptr<Connection> &owner, uint32_t size);
-        void Finish(const std::shared_ptr<Record> &record, bool uncertain) noexcept;
+        void Finish(const std::shared_ptr<Record> &record, bool uncertain, const LogContext &context) noexcept;
         bool Finalize(const std::shared_ptr<Record> &record);
 
         Diagnostics &log;

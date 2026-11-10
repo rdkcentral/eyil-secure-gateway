@@ -25,8 +25,11 @@ namespace Eyil
     class GatewayRuntime
     {
     public:
+        using FailureHandler = std::function<void()>;
+
         explicit GatewayRuntime(CryptoServiceAdapter::Resolver resolver, unsigned workers = 4,
-            std::string endpoint = Endpoint, Diagnostics::Sink sink = nullptr, std::string temporaryDirectory = {});
+            std::string endpoint = Endpoint, Diagnostics::Sink sink = nullptr, std::string temporaryDirectory = {},
+            FailureHandler failureHandler = {});
         ~GatewayRuntime();
 
         bool Start();
@@ -54,11 +57,13 @@ namespace Eyil
 
             Kind kind;
             bool tracked = false;
+            bool waitingLogged = false;
             std::shared_ptr<Connection> connection;
             RpcRequest request;
             std::string route;
             std::string response;
             Clock::time_point deadline;
+            Clock::time_point admitted;
             std::shared_ptr<Work> next;
         };
 
@@ -98,19 +103,24 @@ namespace Eyil
         bool Send(void *router, const Work &work);
         void Respond(Work &work, RpcStatus status, const std::string &payload = {}) noexcept;
 
-        void Close(const std::shared_ptr<Connection> &connection); // registry mutex held
+        void Close(const std::shared_ptr<Connection> &connection, bool disconnected = true); // registry mutex held
         void Fatal(const char *reason) noexcept;
         void Lifecycle();
+        void StateChanged(); // registry mutex held
+        void LogWorkerWait(const Work &work, bool expired); // registry mutex held
 
         Diagnostics log;
         SharedBuffers buffers { log };
         CryptoServiceAdapter adapter;
+        FailureHandler failureHandler;
 
         unsigned workers;
         std::string endpoint;
         std::string temporaryDirectory;
 
         Wakeup wake;
+        Wakeup zapWake;
+        Wakeup monitorWake;
         std::unique_ptr<Context> context;
         Dispatcher dispatcher;
         std::unique_ptr<WPEFramework::Core::ThreadPool> pool;
@@ -126,6 +136,7 @@ namespace Eyil
         bool stopping = false;
         bool auxiliaryStop = false;
         bool failed = false;
+        bool notifyFailures = false;
 
         bool zapReady = false;
         bool monitorReady = false;
@@ -133,6 +144,9 @@ namespace Eyil
         bool listenerReady = false;
 
         unsigned reserved = 0;
+        unsigned running = 0;
+        unsigned lifecycleRunning = 0;
+        uint64_t stateRevision = 0;
         std::unordered_map<uint64_t, std::shared_ptr<Connection>> connections;
         std::shared_ptr<Work> current;
         std::shared_ptr<Work> completedHead;

@@ -18,10 +18,83 @@
 #include <eyilclient/EyilClient.h>
 #include <future>
 #include <filesystem>
+#include <dlfcn.h>
 using namespace EyilTest;
+
+namespace RuntimeFault
+{
+    std::atomic<bool> poll { false };
+    std::atomic<int> wakeFd { -1 };
+}
+
+// Interpose at the shared-library boundary too: Configure owns a runtime inside
+// the implementation DSO, so GNU ld --wrap on the test executable is insufficient.
+extern "C" int zmq_poll(zmq_pollitem_t *items, int count, long timeout)
+{
+    using Poll = int (*)(zmq_pollitem_t *, int, long);
+    static const auto original = reinterpret_cast<Poll>(dlsym(RTLD_NEXT, "zmq_poll"));
+    bool router = false;
+    if (count == 2 && items[0].socket)
+    {
+        int type = -1;
+        size_t size = sizeof(type);
+        router = !zmq_getsockopt(items[0].socket, ZMQ_TYPE, &type, &size) && type == ZMQ_ROUTER;
+        if (router)
+            RuntimeFault::wakeFd = items[1].fd;
+    }
+    const auto result = original(items, count, timeout);
+    if (router && RuntimeFault::poll.exchange(false))
+    {
+        errno = EIO;
+        return -1;
+    }
+    return result;
+}
 
 namespace
 {
+    class FrameworkPool : public Core::IWorkerPool
+    {
+    public:
+        FrameworkPool() { Assign(this); }
+
+        ~FrameworkPool() override { Assign(nullptr); }
+
+        void Submit(const Core::ProxyType<Core::IDispatch> &job) override
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            pending = job;
+            ++submissions;
+        }
+
+        Core::ProxyType<Core::IDispatch> Take()
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto job = pending;
+            pending.Release();
+            return job;
+        }
+
+        ::ThreadId Id(uint8_t) const override { return {}; }
+
+        void Schedule(const Core::Time &, const Core::ProxyType<Core::IDispatch> &) override { CHECK(false); }
+
+        bool Reschedule(const Core::Time &, const Core::ProxyType<Core::IDispatch> &) override { return false; }
+
+        uint32_t Revoke(const Core::ProxyType<Core::IDispatch> &, uint32_t) override { return Core::ERROR_NONE; }
+
+        void Join() override { }
+
+        const Metadata &Snapshot() const override { return metadata; }
+
+        std::atomic<unsigned> submissions { 0 };
+
+    private:
+        std::mutex mutex;
+        Core::ProxyType<Core::IDispatch> pending;
+        Metadata metadata {};
+    };
+
     struct Implementation
     {
         WPEFramework::Exchange::IConfiguration *value = Core::Service<
@@ -291,6 +364,53 @@ namespace
         CHECK(i.Destroy() == Core::ERROR_DESTRUCTION_SUCCEEDED);
         CHECK(shell.lookups == 2 && shell.crypto.SessionCount() == 0);
     }
+
+    void RuntimeDeactivation()
+    {
+        RequireUnusedEndpoint();
+        FrameworkPool pool;
+        MockShell shell;
+        auto *plugin = Core::Service<WPEFramework::Plugin::EyilGateway>::Create<WPEFramework::PluginHost::IPlugin>();
+        CHECK(plugin);
+
+        struct Cleanup
+        {
+            WPEFramework::PluginHost::IPlugin *plugin;
+            MockShell &shell;
+
+            ~Cleanup()
+            {
+                RuntimeFault::poll = false;
+                shell.onDeactivate = {};
+                plugin->Deinitialize(&shell);
+                plugin->Release();
+            }
+        } cleanup { plugin, shell };
+
+        CHECK(plugin->Initialize(&shell).empty() && pool.submissions == 0);
+        ClientHandle client;
+        CHECK(client_connect(&client.value, nullptr) == CLIENT_OK);
+        const auto name = Allocate(client.value);
+        shell.onDeactivate = [&](WPEFramework::PluginHost::IShell::reason why)
+        {
+            CHECK(why == WPEFramework::PluginHost::IShell::FAILURE);
+            plugin->Deinitialize(&shell);
+        };
+
+        RuntimeFault::poll = true;
+        const uint64_t one = 1;
+        CHECK(write(RuntimeFault::wakeFd.load(), &one, sizeof(one)) == sizeof(one));
+        Eventually([&] { return pool.submissions == 1; });
+        CHECK(shell.deactivations == 0); // Never deactivate inline on the failing owner.
+        auto job = pool.Take();
+        CHECK(job.IsValid());
+        job->Dispatch(); // Framework thread calls the wrapper, whose destructor joins I/O.
+        job.Release();
+        CHECK(shell.deactivations == 1 && shell.State() == WPEFramework::PluginHost::IShell::DEACTIVATED);
+        CHECK(pool.submissions == 1 && shell.references == 1 && shell.crypto.references == 1);
+        CHECK(shell.crypto.SessionCount() == 0 && access(name.c_str(), F_OK) != 0);
+        CHECK(!shell.prematureRelease);
+    }
 }
 
 int main(int argc, char **argv)
@@ -309,6 +429,7 @@ int main(int argc, char **argv)
             { "empty-callsign", [] { MissingBackend(R"({"backends":[{"service":"crypto","callsign":""}]})"); } },
             { "omitted-callsign", [] { MissingBackend(R"({"backends":[{"service":"crypto"}]})"); } },
             { "backend-list", BackendList }, { "wrapper-failed-config", [] { WrapperFailure(false); } },
+            { "runtime-deactivation", RuntimeDeactivation },
             { "wrapper-missing-implementation", [] { WrapperFailure(true); } },
             { "volatile-directory", VolatileDirectory } });
 }

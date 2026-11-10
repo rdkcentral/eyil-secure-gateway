@@ -116,12 +116,23 @@ def run(args, with_crypto):
             raise RuntimeError(f"Gateway lifecycle failure: {contents}")
         if not with_crypto:
             error_lines = [
-                line for line in contents.splitlines() if "EyilGateway ERROR" in line
+                line
+                for line in contents.splitlines()
+                if "EyilGateway ERROR" in line and "last_connection=" not in line
+            ]
+            # Suppression summaries preserve ERROR severity. They are aggregate
+            # counters, not another log for each failed backend invocation.
+            summaries = [
+                line
+                for line in contents.splitlines()
+                if "EyilGateway ERROR" in line and "last_connection=" in line
             ]
             if (
                 len(error_lines) > 4
-                or "WARNING category=" not in contents
-                or "suppressed=" not in contents
+                or not summaries
+                or not any(
+                    "suppressed=" in line and "total=" in line for line in summaries
+                )
             ):
                 raise RuntimeError(
                     f"Repeated missing-Crypto failures flooded logs: {contents}"

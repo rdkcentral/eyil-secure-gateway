@@ -484,8 +484,38 @@ namespace
             CHECK(result.status == RPC_STATUS_INTERNAL && result.payload.empty());
             CHECK(f.crypto.references == 1);
             CHECK(f.crypto.releases == released + (failure == 0 ? 0 : 1));
-            const bool bulk = operation == 4 || operation == 5 || operation == 14 || operation == 15;
-            CHECK(f.buffers.Idle(f.owner->userId) == (!bulk || failure == 0));
+            CHECK(f.buffers.Idle(f.owner->userId));
+            CHECK(f.buffers.Cleanup(f.owner->userId));
+            CHECK(f.buffers.Charged(getuid()) == 0);
+        }
+    }
+
+    void CompletedFailureRelease(bool exception)
+    {
+        for (int operation : { 4, 5, 14, 15 })
+        {
+            Fixture f;
+            for (unsigned n = 1; n < Eyil::SharedBuffers::MaximumCount; ++n)
+                CHECK(f.buffers.Allocate(f.owner, 4096).error == CRYPTO_ERROR_NONE);
+            CHECK(f.buffers.Charged(getuid()) == Eyil::SharedBuffers::MaximumCount);
+            CHECK(f.buffers.Allocate(f.owner, 4096).error == CRYPTO_ERROR_OPERATION_FAILED);
+
+            bool pending = false;
+            f.crypto.onRelease = [&]
+            {
+                pending = f.buffers.Release(f.owner, f.allocation.id) == CRYPTO_ERROR_NONE
+                    && access(("/dev/shm" + f.allocation.name).c_str(), F_OK) == 0
+                    && f.buffers.Charged(getuid()) == Eyil::SharedBuffers::MaximumCount;
+            };
+            f.crypto.throwCall = exception;
+            f.crypto.invocation = exception ? WPEFramework::Core::ERROR_NONE : WPEFramework::Core::ERROR_GENERAL;
+            auto result = f.Execute(Request(operation, f.allocation.id));
+            f.crypto.onRelease = {};
+            CHECK(result.status == RPC_STATUS_INTERNAL && result.payload.empty());
+            CHECK(pending && f.crypto.references == 1 && f.buffers.Idle(f.owner->userId));
+            CHECK(access(("/dev/shm" + f.allocation.name).c_str(), F_OK) != 0);
+            CHECK(f.buffers.Charged(getuid()) == Eyil::SharedBuffers::MaximumCount - 1);
+            CHECK(f.buffers.Allocate(f.owner, 4096).error == CRYPTO_ERROR_NONE);
         }
     }
 
@@ -557,7 +587,7 @@ namespace
     void Quarantine()
     {
         Fixture f;
-        f.crypto.invocation = WPEFramework::Core::ERROR_GENERAL;
+        f.crypto.invocation = COM_ERROR | WPEFramework::Core::ERROR_TIMEDOUT;
         CHECK(f.Execute(Request(4, f.allocation.id)).status == RPC_STATUS_INTERNAL);
         CHECK(f.crypto.references == 1 && !f.buffers.Idle(f.owner->userId));
         CHECK(f.buffers.Release(f.owner, f.allocation.id) == CRYPTO_ERROR_NONE);
@@ -593,6 +623,8 @@ int main(int argc, char **argv)
             { "lookup-all-operations", [] { BackendFailures(0); } },
             { "invocation-all-operations", [] { BackendFailures(1); } },
             { "exception-all-operations", [] { BackendFailures(2); } }, { "buffer-rejections", BufferRejections },
+            { "completed-error-release", [] { CompletedFailureRelease(false); } },
+            { "completed-exception-release", [] { CompletedFailureRelease(true); } },
             { "output-regions", OutputRegions }, { "uncertain-access", Quarantine },
             { "local-without-backend", LocalWithoutBackend } });
 }

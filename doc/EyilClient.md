@@ -216,6 +216,14 @@ is admitted, before input preparation and slot waiting; no stage restarts it.
 After publication, unlock and signal the existing pollable wakeup. A condition
 variable alone cannot wake the I/O owner's socket poll.
 
+The owner has no fixed idle-poll interval. Poll DEALER, monitor PAIR and the
+existing eventfd indefinitely when no deadline applies, otherwise use the time
+remaining until the earliest connect, synchronous-request or unaccepted-send
+deadline. Accepted asynchronous response records do not contribute a deadline.
+Publication, cancellation and stop signal eventfd; replies and writable
+readiness wake the socket poll directly. Retire expired records before computing
+the next wait, so an already expired deadline cannot cause a busy loop.
+
 On that wakeup, ClaimSubmission locks state, reads the published Request,
 retains it, marks the slot CLAIMED and unlocks. Reading the slot does not clear
 it. The owner prepares serialization and the pending-map entry outside the

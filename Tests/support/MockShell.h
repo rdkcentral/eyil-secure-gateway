@@ -15,6 +15,7 @@
 
 #include "MockCrypto.h"
 #include <plugins/plugins.h>
+#include <functional>
 
 namespace EyilTest
 {
@@ -25,6 +26,8 @@ namespace EyilTest
         mutable std::atomic<unsigned> references { 1 };
         mutable std::atomic<bool> prematureRelease { false };
         std::atomic<unsigned> lookups { 0 };
+        std::atomic<unsigned> deactivations { 0 };
+        std::function<void(reason)> onDeactivate;
         std::string volatilePath;
         std::string config = R"({"workers":2,"backends":[{"service":"crypto","callsign":"test.crypto"}]})";
 
@@ -123,11 +126,17 @@ namespace EyilTest
 
         void Unregister(WPEFramework::PluginHost::IPlugin::INotification *) override { }
 
-        state State() const override { return ACTIVATED; }
+        state State() const override { return deactivations ? DEACTIVATED : ACTIVATED; }
 
         Core::hresult Activate(reason) override { return Core::ERROR_NONE; }
 
-        Core::hresult Deactivate(reason) override { return Core::ERROR_NONE; }
+        Core::hresult Deactivate(reason why) override
+        {
+            if (onDeactivate)
+                onDeactivate(why);
+            ++deactivations;
+            return Core::ERROR_NONE;
+        }
 
         Core::hresult Unavailable(reason) override { return Core::ERROR_NONE; }
 
