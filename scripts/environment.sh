@@ -25,3 +25,9 @@ eyil_thunder_prefix=${EYIL_THUNDER_PREFIX:-"$eyil_deps_dir/thunder/install/usr"}
 export CMAKE_PREFIX_PATH="$eyil_thunder_prefix${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 export LD_LIBRARY_PATH="$eyil_thunder_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="$eyil_deps_dir/python${PYTHONPATH:+:$PYTHONPATH}"
+
+# The Gateway must run against the patched library, not the host's stock libzmq.
+if [[ -d "$eyil_deps_dir/zmq/install" ]]; then
+    export CMAKE_PREFIX_PATH="$eyil_deps_dir/zmq/install:$eyil_deps_dir/crypto:$CMAKE_PREFIX_PATH"
+    export LD_LIBRARY_PATH="$eyil_deps_dir/zmq/install/lib:$LD_LIBRARY_PATH"
+fi

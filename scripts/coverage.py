@@ -93,7 +93,7 @@ def main():
             "--root",
             str(root),
             "--filter",
-            re.escape(str(root)) + r"/src/(gateway|clientlib)/",
+            re.escape(str(root)) + r"/src/(gateway|clientlib|common)/",
             "--xml-pretty",
             "--xml",
             str(report_dir / "coverage.xml"),

@@ -24,6 +24,8 @@ namespace WPEFramework
 {
     namespace
     {
+        constexpr uint32_t ImplementationTimeoutMs = 5000;
+
         static Plugin::Metadata<Plugin::EyilGateway> metadata(
             // Version (Major, Minor, Patch)
             API_VERSION_NUMBER_MAJOR, API_VERSION_NUMBER_MINOR, API_VERSION_NUMBER_PATCH,
@@ -37,8 +39,6 @@ namespace WPEFramework
 
     namespace Plugin
     {
-        SERVICE_REGISTRATION(EyilGateway, API_VERSION_NUMBER_MAJOR, API_VERSION_NUMBER_MINOR, API_VERSION_NUMBER_PATCH);
-
         EyilGateway::EyilGateway()
             : _notification(this)
         {
@@ -55,19 +55,22 @@ namespace WPEFramework
             _service->AddRef();
             _service->Register(&_notification);
 
-            _implementation
-                = _service->Root<Exchange::IConfiguration>(_connectionId, 5000, _T("EyilGatewayImplementation"));
+            _implementation = _service->Root<Exchange::IConfiguration>(
+                _connectionId, ImplementationTimeoutMs, _T("EyilGatewayImplementation"));
             if (_implementation == nullptr)
             {
-                Deinitialize(service);
                 return "EyilGateway implementation could not be created";
             }
 
+            // The initial deployment uses synchronous destruction in this process.
+            if (_connectionId != 0)
+            {
+                return "EyilGateway requires in-process mode";
+            }
             const Core::hresult result = _implementation->Configure(_service);
             if (result != Core::ERROR_NONE)
             {
                 SYSLOG(Logging::Error, (_T("EyilGateway implementation configuration failed: %u"), result));
-                Deinitialize(service);
                 return "EyilGateway implementation could not be configured";
             }
 
@@ -88,7 +91,11 @@ namespace WPEFramework
 
             if (_implementation != nullptr)
             {
-                _implementation->Release();
+                // The wrapper owns the implementation's sole interface reference.
+                // Its destructor drains the runtime before this final Release returns.
+                const uint32_t released = _implementation->Release();
+                ASSERT(released == Core::ERROR_DESTRUCTION_SUCCEEDED);
+                (void)released;
                 _implementation = nullptr;
             }
 
@@ -106,7 +113,7 @@ namespace WPEFramework
 
         string EyilGateway::Information() const
         {
-            return "EyilGateway skeleton; request processing is not implemented";
+            return "EyilGateway: authenticated IPC routing and connection-owned shared memory";
         }
 
         void EyilGateway::Deactivated(RPC::IRemoteConnection *connection)

@@ -25,8 +25,7 @@
 
 int main()
 {
-    Client *client = nullptr;
-    if (client_connect(&client, nullptr) != CLIENT_NOT_IMPLEMENTED || client != nullptr)
+    if (client_connect(nullptr, nullptr) != CLIENT_INVALID_ARGUMENT)
     {
         return 1;
     }

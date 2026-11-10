@@ -38,6 +38,7 @@ target_link_libraries(eyilclient
     PRIVATE
         EyilProtocol::EyilProtocol
         ZeroMQ::ZeroMQ
+        Threads::Threads
 )
 
 target_compile_options(eyilclient PRIVATE -Wall -Wextra -Wpedantic)

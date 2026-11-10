@@ -66,9 +66,9 @@ extern "C"
 
     typedef enum
     {
-        CLIENT_CONNECTION_LOST, /* Connection to the server was lost, may get restored */
-        CLIENT_CONNECTION_RESTORED, /* Connection to the server was restored */
-        CLIENT_CONNECTION_TERMINATED /* Connection to the server was terminated due to auth failures */
+        CLIENT_CONNECTION_LOST, /* Terminal loss; disconnect this handle before connecting anew. */
+        CLIENT_CONNECTION_RESTORED, /* Reserved; no automatic reconnect in this version. */
+        CLIENT_CONNECTION_TERMINATED /* Reserved; initial authentication errors are returned by connect. */
     } ClientConnectionEvent;
 
     /*
@@ -94,8 +94,12 @@ extern "C"
      * Connects a client. Authentication uses the process credentials supplied by
      * the transport; callers do not provide ZAP credentials.
      *
-     * @param client [OUT] Receives the allocated client handle on CLIENT_OK.
-     *        The handle is not returned when the function fails.
+     * Waits up to 15 seconds for handshake readiness. Initial success/failure
+     * has no connection callback. Later unexpected loss emits LOST once;
+     * explicit disconnect has no connection callback.
+     * @param client [IN/OUT] NULL-initialized handle slot. An occupied live slot
+     *        returns CLIENT_ALREADY_CONNECTED without modifying its handle.
+     *        A new handle is published only on CLIENT_OK.
      * @param handler [IN] Connection event callback. It runs on an internal
      *        thread and must not call other client APIs. It is automatically
      *        unregistered by client_disconnect().
@@ -108,7 +112,10 @@ extern "C"
      * Sends a serialized Google Protocol Buffers request and returns the
      * serialized response buffer for the caller. The request and response use
      * the protobuf wire format and must be interpreted using the agreed message
-     * schema; this API does not perform protobuf serialization or deserialization.
+     * schema. The caller supplies RpcRequest(service, opaque payload); the
+     * library replaces request_id/schema_version and validates RpcResponse.
+     * One 15-second budget includes submission and response delivery. A timeout
+     * does not cancel backend work. Gateway error responses still return CLIENT_OK.
      *
      * @param client [IN] Connected client handle.
      * @param request_data [IN] Serialized protobuf request message. Must contain
@@ -120,7 +127,8 @@ extern "C"
      *        The caller must release a successful response with
      *        client_free_response().
      * @param response_size [OUT] Receives the size in bytes of the serialized
-     *        protobuf response. Successful calls always return a non-zero size.
+     *        protobuf response. Successful calls always return a non-zero size;
+     *        every local error sets this output to zero.
      *
      * @return CLIENT_OK on success, otherwise an appropriate ClientResult value.
      */
@@ -140,7 +148,12 @@ extern "C"
      * @param request_size [IN] Size in bytes of the serialized protobuf request.
      * @param handler [IN] Non-NULL callback receiving a validated response at
      *        most once. Response ownership passes to the callback, which must
-     *        release it with client_free_response().
+     *        release it with client_free_response(). Callbacks run on this
+     *        Client's I/O thread without internal locks, possibly before the
+     *        submitting thread resumes. Request APIs return CLIENT_INVALID_ARGUMENT
+     *        on that thread; schedule further requests/disconnect on an app thread.
+     *        A post-send local failure or disconnect retires the request without
+     *        a callback. No NULL/synthetic error response is generated.
      *
      * @return CLIENT_OK after libzmq accepts the message, otherwise an
      *         appropriate ClientResult value. An error return invokes no
@@ -152,7 +165,10 @@ extern "C"
 
     /**
      * Sends a NULL-terminated request string and returns a NULL-terminated
-     * response string.
+     * response string. Copies bytes up to the first NUL; no Base64/ProtoJSON.
+     * The current Gateway rejects service=0 with RPC_STATUS_UNSUPPORTED_SERVICE;
+     * successful transport returns CLIENT_OK and that exact status name as text.
+     * This does not select a Crypto operation. The synchronous budget is 15 seconds.
      *
      * @param client [IN] Connected client handle.
      * @param request_data [IN] NULL-terminated request string.
@@ -194,15 +210,13 @@ extern "C"
     EYIL_CLIENT_API void client_free_response(void *response_data);
 
     /**
-     * Registers a local notification callback. The callback is called from an
-     * internal thread, must not call other client APIs, and receives notification
-     * data owned by the callback. The callback must free it when it is no longer
-     * needed.
+     * Reserved for future notifications. Always returns CLIENT_NOT_IMPLEMENTED;
+     * no handler is stored or invoked and no subscription is created.
      *
      * @param client [IN] Connected client handle.
-     * @param handler [IN] Notification callback.
+     * @param handler [IN] Ignored reserved callback.
      *
-     * @return CLIENT_OK on success, otherwise an appropriate ClientResult value.
+     * @return CLIENT_NOT_IMPLEMENTED.
      */
     EYIL_CLIENT_API ClientResult client_register_notifications(Client *client, ClientNotificationHandler handler);
 
@@ -211,17 +225,17 @@ extern "C"
      *
      * @param client [IN] Client whose notifications are registered.
      *
-     * This function unregisters the local callback for notifications and must be
-     * called before client_disconnect().
+     * No effect in this version; no allocation or callback state is retained.
      */
     EYIL_CLIENT_API void client_unregister_notifications(Client *client);
 
     /**
-     * Releases the connection and client handle.
-     *
-     * @param client [IN] Client handle to release. Notification handlers must be
-     *        unregistered first. The connection event handler is unregistered
-     *        automatically during disconnect.
+     * Stops admission, wakes pending sync/send waiters with CLIENT_NOT_CONNECTED,
+     * retires async response records, joins I/O and quiesces callbacks/callers.
+     * Does not emit a connection callback or cancel remote execution.
+     * Call on an application thread, never from a callback. The caller must
+     * prevent new calls and clear its own handle slot after this function returns.
+     * @param client [IN] Client handle to release, or NULL.
      */
     EYIL_CLIENT_API void client_disconnect(Client *client);
 

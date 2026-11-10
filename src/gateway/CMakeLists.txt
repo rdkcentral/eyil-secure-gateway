@@ -33,6 +33,27 @@ if(NOT EYIL_CONFIGURATION_INCLUDE_DIR)
     )
 endif()
 
+find_path(EYIL_CRYPTO_INCLUDE_DIR NAMES interfaces/ICrypto.h
+    HINTS "$ENV{EYIL_DEPS_DIR}/crypto/include" "${PROJECT_SOURCE_DIR}/_deps/crypto/include"
+    PATH_SUFFIXES include/${NAMESPACE})
+if(NOT EYIL_CRYPTO_INCLUDE_DIR)
+    message(FATAL_ERROR "ICrypto from entservices-apis topic/crypto is required; set EYIL_CRYPTO_INCLUDE_DIR")
+endif()
+# IConfiguration and ICrypto must use the same entservices-apis Ids.h.
+set(EYIL_CONFIGURATION_INCLUDE_DIR "${EYIL_CRYPTO_INCLUDE_DIR}")
+if(NOT PLUGIN_EYILGATEWAY_MODE STREQUAL "Off")
+    message(FATAL_ERROR "The initial implementation supports only in-process mode Off")
+endif()
+add_library(EyilGatewayRuntime STATIC
+    GatewayRuntime.cpp CryptoServiceAdapter.cpp SharedBuffers.cpp TransportIdentity.cpp)
+target_include_directories(EyilGatewayRuntime PUBLIC ${EYIL_CRYPTO_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(EyilGatewayRuntime PUBLIC
+    ${NAMESPACE}Core::${NAMESPACE}Core ${NAMESPACE}COM::${NAMESPACE}COM
+    ${NAMESPACE}Plugins::${NAMESPACE}Plugins EyilProtocol::EyilProtocol
+    ZeroMQ::ZeroMQ Threads::Threads ${CMAKE_DL_LIBS})
+target_compile_options(EyilGatewayRuntime PRIVATE -Wall -Wextra)
+eyil_enable_coverage(EyilGatewayRuntime)
+
 mark_as_advanced(EYIL_CONFIGURATION_INCLUDE_DIR)
 
 add_library(${MODULE_NAME} SHARED
@@ -61,6 +82,7 @@ add_library(${PLUGIN_IMPLEMENTATION} SHARED
 
 target_link_libraries(${PLUGIN_IMPLEMENTATION}
     PRIVATE
+        EyilGatewayRuntime
         ${NAMESPACE}Core::${NAMESPACE}Core
         ${NAMESPACE}COM::${NAMESPACE}COM
         ${NAMESPACE}Plugins::${NAMESPACE}Plugins

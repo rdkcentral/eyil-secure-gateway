@@ -22,6 +22,7 @@
 #include "Module.h"
 
 #include <interfaces/IConfiguration.h>
+#include "GatewayRuntime.h"
 
 namespace WPEFramework
 {
@@ -34,6 +35,8 @@ namespace WPEFramework
             ~EyilGatewayImplementation() override;
             EyilGatewayImplementation(const EyilGatewayImplementation &) = delete;
             EyilGatewayImplementation &operator=(const EyilGatewayImplementation &) = delete;
+            EyilGatewayImplementation(EyilGatewayImplementation &&) = delete;
+            EyilGatewayImplementation &operator=(EyilGatewayImplementation &&) = delete;
 
             BEGIN_INTERFACE_MAP(EyilGatewayImplementation)
             INTERFACE_ENTRY(Exchange::IConfiguration)
@@ -42,7 +45,8 @@ namespace WPEFramework
             Core::hresult Configure(PluginHost::IShell *service) override;
 
         private:
-            bool _configured = false;
+            PluginHost::IShell *_service = nullptr;
+            std::unique_ptr<Eyil::GatewayRuntime> _runtime;
         };
     }
 }

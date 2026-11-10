@@ -667,9 +667,10 @@ clear the caller's variable.
 **Agreed readiness contract:** return CLIENT_OK and publish a valid Client
 handle only after local startup has succeeded and the client monitor receives
 `ZMQ_EVENT_HANDSHAKE_SUCCEEDED` for the pending connection attempt. The
-application can then immediately submit RPC requests. Gateway completes
-NotifyAppState(CONNECTED) during authentication before returning ZAP success.
-Crypto is available before Gateway activation; RPCs carry operation results.
+application can then immediately submit RPC requests. Gateway attempts
+NotifyAppState(CONNECTED) during authentication, but a missing backend or failed
+notification does not reject an otherwise valid transport. Backend RPCs report
+lookup/invocation/service errors; local buffer RPCs remain available without Crypto.
 
 The startup coordinator waits for handshake success or a terminal failure
 within a **15-second connect deadline**. Deadline expiry returns CLIENT_TIMEOUT;
@@ -811,7 +812,7 @@ sequenceDiagram
                 opt Gateway reachable and handshake progresses
                     Z->>GW: UDS connection and PLAIN handshake
                     GW->>G: ZAP request with kernel-derived peer credentials
-                    G->>G: Bind connection and complete scoped ICrypto CONNECTED<br/>notification
+                    G->>G: Bind connection, attempt scoped ICrypto CONNECTED<br/>Backend failure is logged, transport may still succeed
                     G-->>GW: Status 200 and User-Id after setup, or failure status
                     GW-->>Z: Handshake result
                 end
@@ -881,6 +882,13 @@ connect call on those explicit failures, preserving CLIENT_AUTH_FAILED for a
 denial. Event and status definitions:
 [ZeroMQ monitor API](https://libzmq.readthedocs.io/en/latest/zmq_socket_monitor.html),
 [ZAP specification](https://rfc.zeromq.org/spec/27/).
+
+ZAP status is first observed on the server. In particular, status 300 can close
+or stall the handshake without exposing `HANDSHAKE_FAILED_AUTH(300)` on the
+client monitor. Map the event actually received: a disconnect or terminal
+failure returns CLIENT_COMMUNICATION_ERROR; expiry with no terminal event
+returns CLIENT_TIMEOUT. Never infer CLIENT_AUTH_FAILED from either condition.
+The table's status-300 mapping applies only if that event reaches the client.
 
 `zmq_connect()` returning zero and receiving ZMQ_EVENT_CONNECTED are both
 insufficient for CLIENT_OK. Successful handshake detection is the agreed

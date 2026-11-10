@@ -34,6 +34,8 @@ namespace WPEFramework
             ~EyilGateway() override = default;
             EyilGateway(const EyilGateway &) = delete;
             EyilGateway &operator=(const EyilGateway &) = delete;
+            EyilGateway(EyilGateway &&) = delete;
+            EyilGateway &operator=(EyilGateway &&) = delete;
 
             BEGIN_INTERFACE_MAP(EyilGateway)
             INTERFACE_ENTRY(PluginHost::IPlugin)

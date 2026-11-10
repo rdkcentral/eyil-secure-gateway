@@ -47,15 +47,10 @@ static void on_string_response(Client *client, char *data)
 int main(void)
 {
     Client *client = NULL;
-    if (client_connect(&client, on_connection_event) != CLIENT_NOT_IMPLEMENTED || client != NULL)
-    {
-        return 1;
-    }
-
     uint8_t request[] = { 0x08, 0x01 };
     uint8_t *response = request;
     size_t response_size = sizeof(request);
-    if (client_send_request(client, request, sizeof(request), &response, &response_size) != CLIENT_NOT_IMPLEMENTED
+    if (client_send_request(client, request, sizeof(request), &response, &response_size) != CLIENT_INVALID_ARGUMENT
         || response != NULL || response_size != 0)
     {
         return 1;
@@ -63,14 +58,14 @@ int main(void)
 
     char string_request[] = "{}";
     char *string_response = string_request;
-    if (client_send_request_string(client, string_request, &string_response) != CLIENT_NOT_IMPLEMENTED
+    if (client_send_request_string(client, string_request, &string_response) != CLIENT_INVALID_ARGUMENT
         || string_response != NULL)
     {
         return 1;
     }
 
-    if (client_send_request_async(client, request, sizeof(request), on_response) != CLIENT_NOT_IMPLEMENTED
-        || client_send_request_string_async(client, string_request, on_string_response) != CLIENT_NOT_IMPLEMENTED
+    if (client_send_request_async(client, request, sizeof(request), on_response) != CLIENT_INVALID_ARGUMENT
+        || client_send_request_string_async(client, string_request, on_string_response) != CLIENT_INVALID_ARGUMENT
         || client_register_notifications(client, on_response) != CLIENT_NOT_IMPLEMENTED)
     {
         return 1;
@@ -101,6 +96,6 @@ int main(void)
     {
         return 1;
     }
-    puts("Client API placeholders verified.");
+    puts("Installed C API validation and ownership contract verified.");
     return 0;
 }

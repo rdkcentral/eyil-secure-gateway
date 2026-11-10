@@ -55,17 +55,17 @@ The default `configuration.root.mode` is `Off`. A future `Local` mode can use
 the same split with matching framework proxy/stubs.
 
 **There is no app-facing Gateway COM-RPC or JSON-RPC API.** IConfiguration is
-the internal Thunder bootstrap contract. The wrapper also acquires a private
-lifecycle-control interface with StopAndWait(), which is not a method on
-IConfiguration and is not exposed to apps. A future remote implementation needs
-matching proxy/stubs for that interface. ICrypto calls form a separate
+the internal Thunder bootstrap contract. The wrapper owns the sole implementation
+interface reference. Its final Release invokes the implementation destructor,
+which drains and destroys the runtime before releasing its retained IShell.
+No additional lifecycle interface is introduced. ICrypto calls form a separate
 trusted backend boundary. "No public Gateway COM-RPC API" does not mean there
 are no framework/backend interfaces internally.
 
 | Component | Responsibility | Separation rule |
 | --- | --- | --- |
-| EyilGateway wrapper | Register notifications, acquire/configure implementation, await StopAndWait before release | Keep transport and service logic out of IPlugin |
-| EyilGatewayImplementation | Own configuration/runtime and idempotent StopAndWait | IConfiguration starts the runtime; private lifecycle control drains and stops it |
+| EyilGateway wrapper | Register notifications, acquire/configure implementation, final Release waits for destruction | Keep transport and service logic out of IPlugin |
+| EyilGatewayImplementation | Own configuration/runtime and destructor-driven shutdown | IConfiguration starts the runtime; destruction drains and stops it before releasing IShell |
 | GatewayServer / IoLoop | Own ROUTER, receive messages, route completions | No blocking backend work; no worker uses ROUTER |
 | ZapAuthenticator | Own REP, parse credentials, answer ZAP | No application-supplied identity is trusted |
 | AuthenticationProvider | Interim acceptance; future authoritative lookup | TODO(AUTH-APPMANAGER), separate from transport |
@@ -112,13 +112,13 @@ flowchart TB
             OUT["CompletionHandoff<br/>RpcResponse + original generation<br/>No response count/byte cap"]
         end
     end
-    CRYPTO["Crypto plugin / ICrypto<br/>Configured cryptocallsign"]
+    CRYPTO["Crypto plugin / ICrypto<br/>Configured Crypto backend callsign"]
     PLATFORM["AppManager / RuntimeManager<br/>Future identity and authorization lookup"]
 
     APP -- "Calls client_* functions" --> CLIENT
     CLIENT <-->|"RpcRequest / RpcResponse over UDS<br/>ipc:///tmp/app-eyil-gateway.ipc"| IO
     TH -- "Initialize / Deinitialize" --> WR
-    WR -- "Acquire, Configure, StopAndWait, release" --> RT
+    WR -- "Acquire, Configure, final Release / destructor" --> RT
 
     IO -. "libzmq internal ZAP exchange" .-> ZAP
     IO -. "libzmq transport events" .-> MON
@@ -158,8 +158,8 @@ pauses only further request reception; responses and control handling continue.
 
 | Call or event entering Gateway | Internal path and result | Detailed flow |
 | --- | --- | --- |
-| Thunder Initialize / Deinitialize | Wrapper acquires/configures the implementation; deactivation awaits StopAndWait before releasing it | Sections 6.4 and 6.16 |
-| client_connect | DEALER handshake reaches ZAP; bind a unique User-Id to the transport/context and complete the worker-side NotifyAppState(CONNECTED) before ZAP success | Section 6.5 |
+| Thunder Initialize / Deinitialize | Wrapper acquires/configures the implementation; deactivation releases its sole interface reference and awaits destructor completion | Sections 6.4 and 6.16 |
+| client_connect | DEALER handshake reaches ZAP; bind a unique User-Id to the transport/context and settle the worker-side NotifyAppState(CONNECTED) attempt before ZAP success. Backend failure is logged separately and does not reject the transport | Section 6.5 |
 | client_send_request / client_send_request_async carrying a Crypto RpcRequest | ROUTER owner validates/adopts the current request, pauses further receives while waiting up to 10 seconds for a worker, then dispatches or returns INTERNAL; completions use the same owner | Sections 6.6–6.9 |
 | client_send_request_string / client_send_request_string_async | ROUTER rejects the unrouted service=0 envelope with RPC_STATUS_UNSUPPORTED_SERVICE before worker admission; client exposes the received status as text | Sections 5.8–5.9 and 6.6 |
 | ALLOCATE_SHARED_BUFFER / RELEASE_SHARED_BUFFER | Worker calls SharedBufferManager locally. Allocation returns buffer_id, name and size; release acceptance blocks new use and defers physical cleanup while access remains active or unresolved | Sections 6.10–6.11 and 6.13 |
@@ -431,7 +431,7 @@ sequenceDiagram
     P->>T: AddRef shell, Register notification
     P->>T: Root(IConfiguration, EyilGatewayImplementation)
     T-->>P: Implementation interface
-    P->>I: Acquire private lifecycle-control interface, then Configure(IShell)
+    P->>I: Configure(IShell) through IConfiguration
     I->>I: Validate configuration, create fresh generation/context and stop wakeups
     I->>I: Run bounded private-IPC libzmq self-test, fail startup on any mismatch
     I->>W: Construct/start private request pool
@@ -450,25 +450,27 @@ sequenceDiagram
         I-->>P: Configure succeeds
         P-->>T: Initialization succeeds
     else Any startup step fails
-        I->>I: StopAndWait, close/join only resources that started
+        I->>I: Destroy partial runtime, close/join only resources that started
         I-->>P: Configure fails
-        P->>P: Deinitialize and release framework references
         P-->>T: Initialization error
+        T->>P: Deinitialize after failed Initialize
+        P->>P: Release implementation and framework references
     end
 ```
 
-Platform/Thunder lifecycle coordination makes Crypto available before Gateway
-activation and keeps it available until Gateway StopAndWait/Deinitialize has
-finished, including final DISCONNECTED calls. The same ordering applies to
-controlled plugin deactivation; it is a platform integration requirement, not
-a Gateway health-monitoring feature. Configure validates/stores its callsign; each
-notification and operation acquires its interface on demand. There is no cached
+When Crypto is included, platform/Thunder lifecycle coordination should make it
+available before client use and retain it through Gateway's final DISCONNECTED
+calls. Gateway startup and transport admission also work without Crypto; the
+platform's preferred ordering is not a Configure precondition. Configure stores
+the backend list; each notification and operation acquires its configured
+interface on demand. There is no cached
 ICrypto pointer, availability observer or startup polling. AppManager/RuntimeManager
 lookup is not called in this phase.
 
 Run the isolated capability self-test in section 6.14 before creating the
 production listener. It uses its own context and minimal test authenticator,
-never Crypto, AppManager or the production registry. Then start the private
+never Crypto, AppManager or the production registry. Its private directory is
+created under IShell::VolatilePath(). Then start the private
 pool, ZAP and monitor collector before binding ROUTER. Use standard zmq_bind
 at the unchanged AC endpoint under the trusted
 [deployment assumptions](EyilSecureGateway.md#74-settled-deployment-and-scope-assumptions).
@@ -483,7 +485,7 @@ and ZMQ_HEARTBEAT_TTL to 0, matching client setup in section 5.5. Use the PAIR
 monitor for transport events and event-driven cleanup. There is no application
 heartbeat worker or inactivity watchdog.
 
-Partial rollback uses the same StopAndWait discipline as section 6.16. Create
+Partial rollback uses the same runtime-destruction discipline as section 6.16. Create
 stop state and wakeups before starting threads; close/join only resources
 actually created/started. Failed Configure returns only after rollback completes.
 
@@ -539,11 +541,11 @@ sequenceDiagram
             W->>CP: Release reference on every completed call path
             W-->>Z: Retained initialization result
         end
-        alt Success, same transport live and admission still open
+        alt Notification attempt settled, same transport live and admission open
             Z->>REG: Publish ACTIVE context
             Z-->>L: ZAP success with unique User-Id
             L-->>C: Authenticated transport
-        else Failure, disconnect or deactivation wins
+        else Disconnect, deactivation or local setup failure wins
             Z->>REG: Close admission, retain required cleanup state
             Z-->>L: ZAP service error if exchange still open
             Note over REG,W: If CONNECTED succeeded, perform DISCONNECTED after work ends
@@ -580,17 +582,23 @@ reconnection creates a new generation. The shared host-UID buffer quota in
 section 6.10 does not merge these contexts or defer teardown until the last
 connection closes.
 
-CONNECTED is sent during authentication for every accepted connection,
-including one that never sends an RPC. Crypto is already available. The private
-lifecycle job completes before ZAP success; no first-request initialization is
-needed. ZAP waits without registry locks and must wake on stop/transport closure.
-A late CONNECTED result cannot revive a closed context.
+Gateway attempts CONNECTED during authentication for every accepted connection,
+including one that never sends an RPC. The private lifecycle job settles before
+ZAP success; its failure is logged but does not reject an otherwise valid peer.
+An unconfigured callsign performs no Thunder lookup. A configured but absent
+interface produces the same unavailable-backend result. ZAP waits without
+registry locks and wakes on stop/transport closure. A late CONNECTED result
+cannot revive a closed context.
 
-A null ICrypto lookup or failed CONNECTED invocation fails setup. Return ZAP
-300/500 when possible, mapped to CLIENT_COMMUNICATION_ERROR by the client, and
-retain any uncertain cleanup obligation. Do not poll/retry Crypto or admit RPCs
-against a context whose initialization failed. An in-progress CONNECTED job is
-included in plugin shutdown accounting.
+Keep transport authentication separate from backend-session initialization.
+Missing Crypto does not prevent a usable Client handle or local buffer RPCs;
+backend calls use their normal per-call lookup and error mapping. If Crypto
+appears later, Gateway does not silently repeat CONNECTED or replay operations:
+Crypto validates ApplicationContext and can return its invalid-session error.
+A fresh explicit connection performs a new CONNECTED attempt. Successful
+initialization is recorded only for matching DISCONNECTED cleanup, not as a
+cached health flag. Retain any uncertain notification cleanup obligation; an
+in-progress CONNECTED job remains included in plugin shutdown accounting.
 
 Set interim appId to `eyil-interim:<unique-token>`, with an unpredictable token
 unique to the connection, and generate a separate sessionId. Keep both stable
@@ -832,8 +840,9 @@ specifically [apis/Crypto/ICrypto.h](https://github.com/rdkcentral/entservices-a
 The reviewed branch revision is 6926f6a72fbfff18b691d09b3b7376fbd541b9d3.
 The platform build supplies compatible headers and any required COM-RPC
 proxy/stubs from that branch; pin a compatible revision in the dependency
-recipe for reproducible builds. The architecture assumes Crypto is deployed
-and queries it through Thunder using the configured callsign.
+recipe for reproducible builds. Crypto operations use the deployed backend
+through its configured callsign. Gateway startup and transport admission also
+work when no backend is configured or installed.
 
 The interface supplies ApplicationContext { appId, sessionId } and
 SharedBuffer { name }. Construct these from trusted internal records. A raw
@@ -841,47 +850,71 @@ FD integer is not an interprocess shared-memory identity.
 
 #### Callsign configuration: BitBake to CMake to runtime
 
-Define a CMake cache string, using org.rdk.Crypto as the default configuration
-value. Products override it to match their installed Crypto plugin:
+The default callsign is empty: an image can run Gateway without a Crypto backend.
+Products select the installed plugin explicitly through CMake/BitBake:
 
 ```cmake
-set(PLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN "org.rdk.Crypto"
-    CACHE STRING "Crypto plugin callsign queried by EyilGateway"
+set(PLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN ""
+    CACHE STRING "Optional Crypto backend callsign"
 )
 ```
 
-The BitBake recipe forwards its product-selected value through EXTRA_OECMAKE:
-
 ```bitbake
-EYILGATEWAY_CRYPTO_CALLSIGN ?= "org.rdk.Crypto"
+EYILGATEWAY_CRYPTO_CALLSIGN ?= ""
 EXTRA_OECMAKE += "-DPLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN=${EYILGATEWAY_CRYPTO_CALLSIGN}"
 ```
 
-EyilGateway.config must carry that value into configuration.cryptocallsign in
-the generated Thunder configuration. The following fragment shows the setting:
+The generated Thunder configuration carries a list of service/callsign entries:
 
 ```json
 {
     "callsign": "org.rdk.EyilGateway",
     "configuration": {
-        "cryptocallsign": "org.rdk.Crypto"
+        "backends": [
+            { "service": "crypto", "callsign": "" }
+        ],
+        "workers": 4
     }
 }
 ```
 
-Configure(IShell*) reads ConfigLine(), validates the callsign is nonempty and
-retains the string for the runtime lifetime. Empty/invalid configuration fails
-Configure; do not substitute another plugin silently. No ICrypto lookup is
-needed during Gateway startup. Every invocation passes the stored value to
-QueryInterfaceByCallsign<Exchange::ICrypto>(). The name is not accepted from
-an application request, and changing it requires Gateway reconfiguration/restart.
-The Gateway's own callsign remains org.rdk.EyilGateway.
+Configure(IShell*) reads ConfigLine() and selects the `crypto` entry by service
+name, independently of list order. Missing/empty `backends`, an omitted `crypto`
+entry or an empty/omitted callsign means no configured Crypto backend. Do not
+query Thunder with an empty callsign or substitute another plugin. Products
+can set it to `org.rdk.Crypto` or their installed callsign. Malformed JSON,
+null entries/fields, empty service names, duplicate service entries or a worker
+count outside 1–255 fail configuration. Entries for future services are accepted
+as configuration, but do not register an adapter or make those RPC services
+supported. This list replaces the single `cryptocallsign` setting.
+
+No ICrypto lookup is needed during Gateway startup. The listener and client
+handshake remain available when Crypto is unconfigured or absent; backend RPCs
+return RPC_STATUS_INTERNAL for an unavailable interface. Gateway-local buffer
+operations do not require Crypto. Every configured invocation resolves the
+selected callsign afresh. Configuration comes from Thunder, never app payloads,
+and changes require reconfiguration/restart. Gateway's own callsign remains
+org.rdk.EyilGateway.
+
+Gateway code does not explicitly throw exceptions. Validation, syscall and
+transport failures return checked errors; Configure maps invalid settings to
+ERROR_BAD_REQUEST and startup failures to ERROR_GENERAL after rollback.
+Catch exceptions from external operations, including Protobuf/STL allocations,
+thread construction and ICrypto invocation, and convert them to the appropriate
+method result. A null backend lookup is a per-invocation error.
+
+The wrapper returns its initialization error without calling Deinitialize.
+Thunder must invoke Deinitialize after a failed Initialize; on R4 this requires
+legacyinitialize=false. A later activation creates a fresh implementation.
+Returning an error does not itself schedule automatic reactivation.
 
 #### Interface ownership
 
 Acquire ICrypto on the private worker immediately before the method invocation.
-Hold the returned reference in a scoped Release guard around that invocation
-and release it as soon as the call returns. The API returns value outputs into
+Hold the returned reference in a local raw ICrypto pointer and call Release
+explicitly as soon as the invocation returns, including the catch path for an
+exception raised by the backend. Do not put Thunder interfaces in C++ smart
+pointers. The API returns value outputs into
 caller-owned storage; check Core::hresult before consuming them, then map and
 serialize them after releasing the interface. Release exactly once on every
 path, including errors and unwinding; later response-allocation failure must
@@ -909,12 +942,12 @@ sequenceDiagram
     participant C as Crypto plugin / ICrypto
     J->>A: Method, trusted ApplicationContext and owned inputs
     Note over J,A: Satisfy required per-connection ordering before acquiring ICrypto
-    A->>T: QueryInterfaceByCallsign(ICrypto ID, configured cryptocallsign)
+    A->>T: QueryInterfaceByCallsign(ICrypto ID, configured Crypto backend callsign)
     T-->>A: Caller-owned interface reference or nullptr
     alt Lookup returns nullptr
         A-->>J: RPC_STATUS_INTERNAL, no Crypto invocation
     else Interface acquired
-        A->>A: Install scoped Release guard
+        A->>A: Retain local raw interface pointer for this invocation
         A->>C: Requested method or NotifyAppState(context, state)
         C-->>A: Core result and method outputs
         A->>C: Release immediately after invocation on every path
@@ -940,8 +973,10 @@ ApplicationContext and key ID. Crypto must preserve that session's state across
 these independent interface references. Releasing an interface must not invoke
 NotifyAppState(DISCONNECTED) or discard the app's keys.
 
-In the current design, NotifyAppState(CONNECTED) completes during authentication
-before ZAP success and RPC admission. Keep that connection's ApplicationContext
+In the current design, the NotifyAppState(CONNECTED) attempt settles during
+authentication before ZAP success and RPC admission; backend failure does not
+reject the transport. Matching DISCONNECTED is sent if CONNECTED succeeded.
+Keep that connection's ApplicationContext
 stable across CONNECTED, operations and DISCONNECTED. Each detected disconnect
 starts teardown of its corresponding context, even if the app remains alive or
 has another connection. After accepted work finishes, send DISCONNECTED once
@@ -1039,7 +1074,7 @@ sequenceDiagram
     L->>R: RpcRequest(service=CRYPTO, schema=1)
     R->>J: Submit retained context and request
     J->>J: Validate operation, parameters and entitlement, satisfy context ordering
-    J->>T: Query ICrypto using configuration.cryptocallsign
+    J->>T: Query ICrypto using the configured Crypto backend callsign
     T-->>J: Caller-owned interface reference or nullptr
     alt Lookup returns nullptr
         J-->>R: RPC_STATUS_INTERNAL
@@ -1516,8 +1551,8 @@ Definitive backend return still ends the lease and can complete pending release;
 response validation or serialization must not leave completed access active.
 
 The four shared-memory operations follow one flow, drawn once below. Each
-invocation acquires its own scoped ICrypto reference. CONNECTED has already
-completed during authentication; null lookup and invocation failures follow
+invocation acquires its own scoped ICrypto reference. The CONNECTED attempt has
+already settled during authentication; null lookup and invocation failures follow
 sections 6.7 and 6.15. The table lists what differs per operation. Each
 `break` block ends the job early; its error completion still reaches the client
 through the same single send attempt as the final response.
@@ -1564,7 +1599,7 @@ sequenceDiagram
         J->>J: Log ERROR with input length and operation limit
         J-->>R: RPC_STATUS_OK with CRYPTO_ERROR_OVERSIZED_INPUT_DATA, no Crypto call
     end
-    J->>T: Query ICrypto using configuration.cryptocallsign
+    J->>T: Query ICrypto using the configured Crypto backend callsign
     T-->>J: Scoped reference or nullptr
     break Lookup returns nullptr
         J->>B: FinishUse for the unused lease, finalize pending release if eligible
@@ -1938,9 +1973,9 @@ received any application message. The application may immediately disconnect
 one of its Clients while keeping its other connections open. A transport failure
 can also occur before its first queued message reaches Gateway.
 
-Gateway already creates an independent ApplicationContext and completes
-NotifyAppState(CONNECTED) during authentication, before ZAP success. That context
-needs matching cleanup even if no RPC follows. This failure does not require a
+Gateway already creates an independent ApplicationContext and attempts
+NotifyAppState(CONNECTED) during authentication, before ZAP success. When that
+notification succeeds, it needs matching cleanup even if no RPC follows. This failure does not require a
 shared-memory allocation to exist: the authenticated context and Crypto session
 are enough to make targeted disconnect handling necessary.
 
@@ -2335,8 +2370,9 @@ sequenceDiagram
     end
 ```
 
-CONNECTED occurs during authentication, so an authenticated connection that
-sends no RPC still receives matching cleanup. If closure races CONNECTED, await
+CONNECTED is attempted during authentication, so a successfully initialized
+backend context still receives matching cleanup if the client sends no RPC.
+Local resources are also cleaned when initialization failed. If closure races CONNECTED, await
 its outcome and retire the provisional context without admitting requests.
 Do not infer that a failed notification cancelled an outstanding backend call.
 Public admission/route removal is immediate; physical destruction waits for
@@ -2502,9 +2538,9 @@ Coverage: **AC1.8–AC1.12**.
 There is no Crypto health-monitoring component or plugin-availability
 subscription. A request or lifecycle job resolves the configured interface
 when it needs to call it. A failed lookup is an invocation-time condition;
-it does not stop Gateway transport or prevent Gateway-local buffer operations
-on an already authenticated context. A failure of CONNECTED during a new
-authentication rejects that setup as specified in section 6.5.
+it does not stop Gateway transport, reject new client connections or prevent
+Gateway-local buffer operations. A failed CONNECTED attempt is logged and
+recorded separately from transport admission as specified in section 6.5.
 
 ```mermaid
 sequenceDiagram
@@ -2604,15 +2640,22 @@ stateDiagram-v2
     end note
 ```
 
-The wrapper calls the private StopAndWait() lifecycle contract before releasing
-IConfiguration, lifecycle control or IShell. This is not a method on
-IConfiguration. Repeated/concurrent stop calls await the same completion, and
-stop after partial rollback is harmless. Success means no job, callback or
-socket thread can still execute against runtime state.
+The wrapper owns the sole IConfiguration reference to the implementation. During
+Deinitialize it releases that reference on the framework lifecycle thread. The
+final Release synchronously invokes EyilGatewayImplementation's destructor.
+That destructor destroys the runtime first: it closes admission, drains accepted
+work, performs session/buffer cleanup and joins every owned thread. Only then
+may the implementation release its retained IShell and finish destruction.
+The wrapper releases its own IShell after the implementation's Release returns.
 
-Do not rely on a last Release or remote Terminate to stop active work. The
-destructor checks/finalizes an already quiescent runtime. Invoke StopAndWait from
-the framework lifecycle context, never from a worker/socket thread it must join.
+Jobs retain runtime/context/resource state, not IConfiguration references; they
+must not postpone the last interface Release or trigger destruction on a worker.
+The framework serializes activation/deactivation. Do not release the final
+implementation reference from a worker/socket thread that destruction must join.
+Partial-start rollback destroys the same owned runtime and only initialized
+resources. There is no additional lifecycle-control interface. Future remote
+implementation support must separately validate final-release completion and
+library lifetime before remote Terminate can be used.
 Runtime failures request framework deactivation through the wrapper. Suppress
 new lifecycle callbacks and quiesce registered ones without self-joining the
 callback that initiated teardown.
@@ -2676,7 +2719,7 @@ sequenceDiagram
     participant X as Owned ZMQ context
     T->>P: Deinitialize
     P->>P: Suppress new callbacks, retain implementation and IShell
-    P->>I: StopAndWait()
+    P->>I: Final IConfiguration Release invokes implementation destructor
     I->>I: RUNNING to DRAINING under admission lock, mark all contexts DRAINING<br/>(no new admission, routes kept for replies)
     I->>B: Establish lifecycle finalization gates, retain pending releases and quota
     I->>R: Close new admission, keep replies and control processing running
@@ -2723,8 +2766,9 @@ sequenceDiagram
         X-->>I: Context and libzmq internal threads terminated
         I->>W: Stop and join drained private pool
         I->>I: Release current request, completion records and registry, publish STOPPED
-        I-->>P: StopAndWait complete
-        P->>P: Release implementation/control references, reset activation flags
+        I->>I: Release retained IShell, finish destructor
+        I-->>P: Final Release returns after runtime shutdown
+        P->>P: Clear implementation pointer, reset activation flags
         P->>T: Unregister remaining notifications and release IShell
         P-->>T: Deinitialize complete
     end
@@ -2781,7 +2825,7 @@ sequenceDiagram
     participant OLD as Previous Gateway runtime
     participant C as Existing client
     participant NEW as Fresh Gateway runtime
-    T->>OLD: Deinitialize through StopAndWait
+    T->>OLD: Deinitialize: final Release invokes implementation destructor
     OLD-->>C: UDS closes, client monitor reports connection loss
     OLD-->>T: STOPPED, old runtime quiescent
     T->>NEW: Initialize and Configure fresh generation/context
@@ -2906,6 +2950,7 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 release and cleanup failures | Idle and deferred cleanup failures log ERROR and keep the ID unavailable with retained cleanup/accounting; accepted release is not retroactively failed and produces no second response; ENOENT permits remaining cleanup; partial allocation rollback failure retains a private record without publishing an ID |
 | L1 release response loss and deadlines | Response preparation/send failure and a client timeout do not undo accepted release; expiry of the current release request before Dispatch creates no releasePending state. Deferred cleanup has no forced destruction deadline and does not depend on response delivery |
 | L2 transport | Real DEALER/ROUTER IPC, ZAP metadata, reverse-order completion and simultaneous sync/async callers |
+| L2 backend-independent admission | Empty/default backend configuration and absent configured Crypto still allow startup and handshake. Sync/async backend RPCs deliver RPC_STATUS_INTERNAL; local allocate/release and unsupported string responses remain available. Missing backend does not emit a connection-loss callback; duplicate backend service configuration is rejected |
 | L2 connect readiness | CONNECTED alone cannot complete connect; HANDSHAKE_SUCCEEDED returns CLIENT_OK; explicit rejection returns CLIENT_AUTH_FAILED; unresolved/stalled attempt reaches CLIENT_TIMEOUT; each failure wakes the waiter and rolls back resources; no startup outcome invokes a callback, and immediate subsequent loss cannot expose an unpublished handle |
 | L2 explicit reconnect | Verify RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0; after loss and Gateway return, no automatic handshake or old queued send occurs; explicit close/new connect creates an empty client runtime and new Gateway session, rejects old buffer IDs and never delivers old replies to new requests |
 | L2 client disconnect barrier | Disconnect with pending calls and an active short callback; wake callers before waiting, join socket owners without lock deadlocks, discard transport queues, preserve app-owned responses and verify zero callbacks after return |
@@ -2943,7 +2988,7 @@ GatewayRuntime
     // appId = eyil-interim:<unique-token>; separate per-connection sessionId.
     // TODO(AUTH-APPMANAGER): replace acceptance with the formal UID lookup.
     // TODO(API-AUTHORIZATION): populate per-connection API entitlements.
-  cryptoBackend = CryptoServiceAdapter(shell, configuration.cryptocallsign)
+  cryptoBackend = CryptoServiceAdapter(shell, ConfiguredCallsign("crypto"))
     // Query topic/crypto ICrypto immediately before each invocation.
     // Scoped Release after use, no cached interface or Crypto health observer.
     // CONNECTED during authentication; DISCONNECTED after accepted work ends.

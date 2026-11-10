@@ -26,3 +26,6 @@ rootobject = JSON()
 rootobject.add("mode", "@PLUGIN_EYILGATEWAY_MODE@")
 rootobject.add("locator", "lib@PLUGIN_IMPLEMENTATION@.so")
 configuration.add("root", rootobject)
+
+configuration.add("backends", [{"service": "crypto", "callsign": "@PLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN@"}])
+configuration.add("workers", "@PLUGIN_EYILGATEWAY_WORKERS@")

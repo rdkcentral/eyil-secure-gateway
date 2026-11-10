@@ -41,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build g++ git pkg-config python3-pip \
-            protobuf-compiler libprotobuf-dev libzmq3-dev libssl-dev
+            protobuf-compiler libprotobuf-dev libzmq3-dev libssl-dev curl patch
       - name: Set up CMake
         uses: jwlawson/actions-setup-cmake@v2
         with:
@@ -50,10 +50,10 @@ jobs:
         with:
           path: _deps/thunder
           key: eyil-thunder-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/build-thunder.sh') }}
-      - name: Build Thunder SDK
+      - name: Build pinned SDK and runtime dependencies
         run: bash build_dependencies.sh
       - name: Build plugin, client and protocol
-        run: bash build.sh -DENABLE_COVERAGE=${{ inputs.coverage && 'ON' || 'OFF' }}
+        run: bash build.sh -DBUILD_EYIL_DEV_TOOLS=ON -DENABLE_COVERAGE=${{ inputs.coverage && 'ON' || 'OFF' }}
       - name: Run selected test suites
         if: ${{ !inputs.coverage }}
         env:

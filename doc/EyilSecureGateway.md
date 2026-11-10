@@ -36,7 +36,8 @@ callsign is `org.rdk.EyilGateway`, and its independent C client library is
 
 > **Integration scope:** ICrypto from entservices-apis branch `topic/crypto` is
 > a required Gateway build/API dependency. The deployed Crypto plugin supplies
-> the runtime implementation and is available before Gateway activation.
+> the runtime implementation when configured; its presence is not required for
+> Gateway activation or transport admission.
 > Gateway queries its configurable callsign for
 > each invocation and releases that interface reference immediately after use.
 > AppManager/RuntimeManager API integration remains at the explicitly marked
@@ -210,7 +211,7 @@ presence in diagrams does not add their implementation to this repository.
 
 | Part | Responsibility | Integration boundary |
 | --- | --- | --- |
-| Thunder wrapper | IPlugin, Root<IConfiguration>(), Configure(), private StopAndWait(), release and remote-connection notification | Await drain and teardown before releasing the implementation |
+| Thunder wrapper | IPlugin, Root<IConfiguration>(), Configure(), final release and remote-connection notification | Final Release invokes the implementation destructor; drain and teardown finish before it returns |
 | Implementation library | IConfiguration and runtime ownership | Transport, authentication seam, registry, private pool, CryptoServiceAdapter using ICrypto, router and buffers |
 | EyilClient | Nine C APIs, connection handles, coordinator, I/O thread, pending requests and response ownership | Independent of Thunder and ICrypto; async behavior uses the public callback signatures, as specified in section 5.4 |
 | Protocol | Generated rpc.proto and crypto.proto, schema constant 1 | EyilClient handles the RPC envelope; service consumers handle service payloads |
@@ -226,12 +227,14 @@ CryptoServiceAdapter calls the deployed Crypto plugin using trusted connection
 metadata and checks both invocation and service results. Gateway-local buffer
 allocation/release needs no ICrypto call.
 
-Short-lived interface ownership does not remove the ICrypto dependency.
-Crypto is available before Gateway activation. The application chooses its
+Crypto operations depend on ICrypto, but Gateway startup and client admission
+do not require an available backend. The default backend callsign is empty;
+unavailable Crypto is reported through backend RPC results. The application chooses its
 connection lifetime; retaining one connection across operations and idle periods
 for the app instance's lifetime is recommended. Gateway uses the corresponding
 connection's ApplicationContext for notifications. The current design sends
-CONNECTED during authentication. A detected disconnect immediately starts that
+a CONNECTED attempt during authentication, recording backend failure separately
+from transport admission. A detected disconnect immediately starts that
 connection's teardown, with DISCONNECTED after accepted work ends and before
 final resource release. No reconnect grace period or last-connection wait
 applies. Crypto owns its internal session, key and recovery implementation.
@@ -360,7 +363,7 @@ a blocked in-process backend. Those limits matter while Gateway is in process.
 | --- | --- | --- |
 | TODO(AUTH-APPMANAGER) | AuthenticationProvider called by ZAP; future Gateway → AppManager → RuntimeManager lookup using trusted UID | Accept valid direct UDS peers, record UID/GID/PID, create appId `eyil-interim:<unique-token>` and a separate unique sessionId per connection; the prefix marks non-authoritative identity |
 | TODO(API-AUTHORIZATION) | Admission check against entitlements cached in the connection context | Allow all structurally valid supported APIs; still enforce limits and buffer ownership |
-| ICrypto lifecycle | Scoped NotifyAppState calls through CryptoServiceAdapter using the connection's ApplicationContext | CONNECTED during authentication in the current design; detected disconnect immediately starts per-connection teardown, with DISCONNECTED after safe drain as specified in section 6.14. No grace period or wait for app termination/the last connection; Crypto owns its session/key cleanup |
+| ICrypto lifecycle | Scoped NotifyAppState calls through CryptoServiceAdapter using the connection's ApplicationContext | Attempt CONNECTED during authentication; backend failure does not reject transport admission. Detected disconnect immediately starts per-connection teardown, with DISCONNECTED after safe drain for an initialized backend context as specified in section 6.14. No grace period or wait for app termination/the last connection; Crypto owns its session/key cleanup |
 
 The interface names in this table describe internal seams. They are not
 additional app-facing Thunder interfaces and do not claim that a formal
@@ -815,7 +818,7 @@ unresolved Gateway architecture gaps.
 | DEPLOYMENT | Use the trusted single-instance Thunder lifecycle and container endpoint policy in section 7.4. Verify procfs/user-namespace access, private /dev/shm and blocked direct Crypto communicator access. Leftover storage after a crash belongs to platform recovery; Gateway starts fresh and does not reconstruct or blindly unlink old allocations |
 | Resource policy | Apply the [initial resource policy in section 6.2](EyilGateway.md#initial-resource-policy): four private workers, default stacks, default libzmq HWM and kernel buffers; no additional message/text or response-count/byte caps. Shared memory allows 1.5 MiB (1,572,864 bytes) per buffer and four allocations per trusted host UID across all its connections, including child apps sharing that UID; at most 6 MiB combined, with no global cap. Quota remains charged through deferred cleanup and reconnect. No Gateway request queue exists; the current request pauses further receives while waiting up to ten seconds for a worker. Validate memory/representation behavior without inventing extra admission limits |
 | Private Thunder pool | Validate nonblocking transfer to reserved execution capacity, worker-start acknowledgement, wakeups and drain against Thunder; four private workers, no application backlog in the pool. While the current RPC waits, pause only new receives; after ten seconds return INTERNAL and log worker_pool_exhausted, with no later execution |
-| SDK and runtime dependencies | Supply the selected topic/crypto ICrypto headers/bindings, configured Crypto callsign and matching Thunder interfaces. Platform/Thunder coordination starts Crypto before Gateway and completes Gateway drain before stopping Crypto. Validate per-call references, authentication-time CONNECTED and ordered DISCONNECTED without a Crypto health observer |
+| SDK and runtime dependencies | Supply the selected topic/crypto ICrypto headers/bindings and matching Thunder interfaces. Configure the Crypto entry in the backend list when deployed. Gateway also starts and accepts clients with an empty/default or unavailable backend; backend RPCs report errors. When Crypto is included, platform/Thunder coordination should retain it through Gateway drain. Validate per-call references, authentication-time CONNECTED attempts and ordered DISCONNECTED without a Crypto health observer |
 | Diagnostics | Verify section 4.5: actionable ERROR/WARNING context, bounded startup/stop INFO summaries, suppression counts for repeated errors, no sensitive content and no default full request-flow tracing |
 | Runtime acceptance | Exercise the L1/L2 scenarios in section 6.17 on the intended dependency set and device, including concurrent requests, response drops, stop/reactivation and prepared process freeze |
 

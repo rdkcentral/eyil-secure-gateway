@@ -26,3 +26,5 @@ PointerAlignment: Right
 ReferenceAlignment: Right
 SortIncludes: Never
 UseTab: Never
+SeparateDefinitionBlocks: Always
+EmptyLineBeforeAccessModifier: Always

@@ -38,3 +38,7 @@ set_property(CACHE PLUGIN_EYILGATEWAY_AUTOSTART PROPERTY STRINGS true false)
 set(PLUGIN_EYILGATEWAY_STARTUPORDER ""
     CACHE STRING "EyilGateway startup order"
 )
+
+set(PLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN "" CACHE STRING "Optional Crypto backend callsign")
+set(PLUGIN_EYILGATEWAY_WORKERS "4" CACHE STRING "Private Gateway worker count")
+option(BUILD_EYIL_DEV_TOOLS "Build and install the development CLI (development images only)" OFF)

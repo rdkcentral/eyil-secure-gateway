@@ -52,6 +52,15 @@ if "PLUGIN_EYILGATEWAY:BOOL=ON" in (build / "CMakeCache.txt").read_text():
     config = json.loads(config_path.read_text())
     assert config["callsign"] == "org.rdk.EyilGateway"
     assert config["classname"] == "EyilGateway"
+    selected_callsign = next(
+        line.split("=", 1)[1]
+        for line in (build / "CMakeCache.txt").read_text().splitlines()
+        if line.startswith("PLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN:STRING=")
+    )
+    assert config["configuration"]["backends"] == [
+        {"service": "crypto", "callsign": selected_callsign}
+    ]
+    assert "cryptocallsign" not in config["configuration"]
     library = stage / "usr/lib/wpeframework/plugins" / config["locator"]
     ctypes.CDLL(str(library), mode=os.RTLD_NOW)
     root = config["configuration"]["root"]

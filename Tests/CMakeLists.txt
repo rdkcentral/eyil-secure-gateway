@@ -19,6 +19,25 @@
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# Register separate scenarios so failures name the violated contract.
+function(eyil_test_cases target label)
+    foreach(scenario IN LISTS ARGN)
+        add_test(NAME ${target}.${scenario} COMMAND ${target} ${scenario})
+        set_tests_properties(${target}.${scenario} PROPERTIES
+            LABELS ${label} TIMEOUT 60 RESOURCE_LOCK eyil-ipc)
+    endforeach()
+endfunction()
+
+# Test executables interpose failures at system boundaries; shipped libraries
+# contain neither injection switches nor additional test/control interfaces.
+function(eyil_test_faults target)
+    target_sources(${target} PRIVATE ${PROJECT_SOURCE_DIR}/Tests/support/Faults.cpp)
+    foreach(symbol open openat ftruncate fallocate fchown fchmod fstat unlinkat
+            _ZNSt6chrono3_V212steady_clock3nowEv)
+        target_link_options(${target} PRIVATE "-Wl,--wrap=${symbol}")
+    endforeach()
+endfunction()
+
 if(RDK_SERVICES_L1_TEST)
     add_subdirectory(L1Tests)
 endif()

@@ -31,6 +31,7 @@ if [[ -n "${EYIL_THUNDER_PREFIX:-}" ]]; then
         exit 1
     fi
     printf 'Using the supplied Thunder SDK: %s\n' "$EYIL_THUNDER_PREFIX"
-    exit 0
+else
+    bash "$repo_dir/scripts/build-thunder.sh"
 fi
-exec bash "$repo_dir/scripts/build-thunder.sh"
+bash "$repo_dir/scripts/build-runtime-dependencies.sh"

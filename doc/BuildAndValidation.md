@@ -77,9 +77,11 @@ Building the plugin additionally requires Thunder Core/COM/Plugins, ThunderTools
 matching IConfiguration and ICrypto headers in the SDK. Obtain ICrypto from
 entservices-apis branch topic/crypto as specified in section 6.7. Out-of-process
 use requires compatible proxy/stubs for every crossed interface, including
-ICrypto when Crypto is remote, and IConfiguration plus the private lifecycle
-control interface when Gateway implementation mode is Local. Do not mix headers
-and bindings from incompatible releases.
+ICrypto when Crypto is remote. Gateway currently supports in-process mode Off:
+its final IConfiguration release invokes the implementation destructor, which
+drains the runtime before releasing IShell. Future Local mode requires a verified
+remote destruction/unload contract for IConfiguration. No additional lifecycle
+interface is introduced. Do not mix headers and bindings from incompatible releases.
 
 For Gateway runtime builds and transport L2 tests, use **libzmq 4.3.4 with the
 included [connection-lifetime patch](zmq_connection_lifetime.patch)**,
@@ -97,7 +99,10 @@ before production bind/admission. Stock draft-enabled libzmq can provide monitor
 version 2 without the connection-lifetime patch. Test both rejection of an
 incompatible loaded library and the actual target rootfs under its container
 permissions/namespaces; a native development-container result is not device
-validation. The startup test supplements the full patch regression suite.
+validation. The startup test supplements the full patch regression suite and uses
+a private directory under IShell::VolatilePath(). With the loaded dependency pinned
+and the behavioral checks retained in L2/CI, a later change can remove the startup
+exchange while keeping the inexpensive option-10001 and monitor-v2 capability checks.
 
 With PLUGIN_EYILGATEWAY enabled, ICrypto headers are a required build input:
 configuration must report a missing SDK/API dependency instead of silently
@@ -117,24 +122,26 @@ bash scripts/check-install.sh build rootfs/all
 ```
 
 build_dependencies.sh fetches pinned Thunder R4.4, ThunderTools and
-ThunderInterfaces sources into the ignored _deps directory. It builds the
-IConfiguration headers and proxy/stubs along with Thunder. Supply the selected
-topic/crypto ICrypto headers and any required proxy/stubs through the SDK/API
-dependency as well. The bootstrap does not install system packages. To use an
+ThunderInterfaces sources into the ignored _deps directory. It also supplies
+the selected topic/crypto interface headers and builds libzmq 4.3.4 with the
+connection-lifetime patch. Native tests use in-process Crypto; remote Crypto
+still requires matching COM-RPC proxy/stubs from the product SDK. The bootstrap does not install system packages. To use an
 existing SDK, set EYIL_THUNDER_PREFIX; optional
 EYIL_DEPS_DIR selects local dependency storage. EYIL_CONFIGURATION_INCLUDE_DIR
 can select the SDK include directory containing `interfaces/IConfiguration.h`
 when it is not found automatically.
 
-To generate a configuration for a separate implementation process, build with
-`bash build.sh -DPLUGIN_EYILGATEWAY_MODE=Local`. The default is `Off`. Install both
-plugin libraries and make the matching proxy/stubs available to Thunder and
-WPEProcess before using Local mode.
+The implemented lifecycle contract supports `PLUGIN_EYILGATEWAY_MODE=Off`.
+The implementation destructor drains the runtime on final Release. `Local` is
+rejected in this version; remote destruction and library lifetime need separate
+validation. See [development and container validation](DevelopmentClient.md) for
+the CLI, dev-rootfs bundle, startup-service selection and expected no-Crypto result.
 
 Select the Crypto callsign through
 `-DPLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN=org.rdk.Crypto` or the product-specific
-value. Section 6.7 defines how the BitBake recipe forwards that setting and how
-it reaches configuration.cryptocallsign. It is independent of Gateway's own
+value. Its default is empty, allowing transport and local buffer operations
+without a backend. Section 6.7 defines how BitBake forwards that setting to the
+`crypto` entry in configuration.backends. It is independent of Gateway's own
 callsign and implementation mode.
 
 The client and protocol can be built without Thunder:
@@ -157,6 +164,29 @@ provides eyilclient.pc. Both plugin libraries install to the Thunder plugin
 directory. The generated configuration uses org.rdk.EyilGateway, with autostart
 false by default. No test executables are installed.
 
+L1 scenarios are registered individually in CTest. The suites cover:
+
+| Suite | Regression coverage |
+| --- | --- |
+| Shared buffers | Exact size boundaries, host-UID quotas across connections, region overflow/overlap, busy and deferred release, concurrent release/cleanup, allocation rollback, ENOSPC and open/create/truncate/chown/chmod/stat/unlink failures |
+| Crypto adapter | All 17 operations, exact backend arguments and trusted context, enum/optional/oneof validation, every defined CryptoError, null lookup, failed/throwing invocation, output allocation failure after interface release, output-region validation and BUFFER_OVERFLOW propagation |
+| Client | Public argument/output contracts, raw strings, request correlation, malformed/duplicate/unknown replies, EAGAIN/EINTR, send acceptance versus deadline, input/owner/response allocation failures, authentication/setup errors, callback restrictions/quiescence and cleanup with pending calls |
+| Implementation lifecycle | Rejected configuration, partial-start rollback, repeated configuration rejection and final IConfiguration Release invoking destruction with idle resources or an active ICrypto call; IShell remains retained until completion |
+| Common runtime | Descriptor ownership, wakeups, transport settings, token format, credential numeric bounds, monitor framing and bounded diagnostic suppression |
+| L2 | Real DEALER/ROUTER IPC with the patched libzmq, concurrent callers/out-of-order results, real timeout budgets, missing Crypto, multiple connections, duplicate request IDs, disconnect before the first request, route reuse, stale reply prevention and single-attempt reply delivery under EAGAIN/EHOSTUNREACH/partial-send failures; response allocation/serialization failures during admission, admission-error handling, worker execution and worker timeout, including INTERNAL fallback, dropped-reply cleanup and continued service |
+| Thunder L2 | Actual wrapper/implementation activation and destruction with the test-only ICrypto plugin and with the backend absent |
+| Wrapper lifecycle | Failed Initialize retains state for framework-driven Deinitialize; missing implementation, invalid configuration, repeated cleanup, fresh activation and configured volatile-directory failure/recovery |
+
+Fault injection uses test-only linker wrappers and allocation overrides. No test
+hooks or additional Thunder interfaces are installed. Client fault tests compile
+the production client source directly so the wrappers can intercept its external
+calls. Other L2 tests exercise the shared library that is installed. Simulated
+clock advancement isolates request races; L2 separately checks the real 10-second
+worker wait and 15-second synchronous deadline, plus later async responses.
+The test ICrypto performs deterministic fake operations, not cryptography.
+Container mounts, device credentials and remote Crypto access still require the
+separate device validation described in the architecture.
+
 L1 and L2 runners invoke CTest and emit summaries and JUnit reports.
 Install-consumer checks cover compilation, linking and the Protobuf status
 contract. Runtime tests validate the client and Gateway flows described above.
@@ -167,12 +197,35 @@ source scripts/environment.sh
 python3 scripts/coverage.py --build-dir build-coverage
 ```
 
-Coverage instruments handwritten plugin/client code, excluding generated
-Protobuf and dependency sources. Empty suites produce an explicit coverage
-unavailable summary. Once real tests are registered with L1/L2 labels, the same
-runner produces XML, HTML and text reports. No artificial percentage is reported.
+Coverage instruments handwritten plugin/client code and shared runtime helpers, excluding generated
+Protobuf and dependency sources. Registered L1/L2 tests exercise the implementation;
+the runner produces XML, HTML and text reports. An empty selected suite produces
+an explicit coverage-unavailable summary instead of an artificial percentage.
 Use `--label L1` or `--label L2` to run coverage for one suite; the default runs
 both suites.
+
+#### Optional memory and undefined-behavior checks
+
+Use a separate native build for sanitizers. The SDK's Thunder executable is not
+sanitized, so this build omits the development executable and the real-host
+Thunder test; run that test in the ordinary native build above.
+
+```sh
+EYIL_BUILD_DIR=build-sanitize bash build.sh -DENABLE_COVERAGE=OFF \
+  -DBUILD_EYIL_DEV_TOOLS=OFF \
+  '-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' \
+  '-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer'
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:suppressions=$PWD/Tests/support/ThunderR44.ubsan.supp" \
+  ctest --test-dir build-sanitize --output-on-failure
+```
+
+The pinned Thunder R4.4 `ProxyObject::operator delete` calls `__Destructed()`
+after destruction, which triggers a UBSan vptr diagnostic. The supplied
+[suppression](../Tests/support/ThunderR44.ubsan.supp) applies only to vptr checks
+in that dependency header; it does not suppress Eyil diagnostics or leak checks.
+Reassess and remove it when updating the SDK. Test allocation overrides cover
+both throwing and nothrow forms to preserve allocator pairing under ASan.
 
 #### Repository checks and GitHub configuration
 

@@ -37,6 +37,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(Protobuf 3.15 REQUIRED MODULE)
 find_package(ZeroMQ 4.3 REQUIRED)
+find_package(Threads REQUIRED)
 
 include(EyilProtocol)
 
@@ -55,6 +56,13 @@ if(PLUGIN_EYILGATEWAY)
     add_subdirectory(src/gateway)
 endif()
 
+if(BUILD_EYIL_DEV_TOOLS)
+    if(NOT BUILD_EYILCLIENT)
+        message(FATAL_ERROR "Development tools require BUILD_EYILCLIENT")
+    endif()
+    add_subdirectory(src/tools)
+endif()
+
 if(BUILD_TESTING)
     add_subdirectory(Tests)
 endif()
@@ -63,6 +71,12 @@ install(FILES LICENSE NOTICE
     DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/eyil-secure-gateway
 )
 
-install(FILES doc/EyilSecureGateway.md
+install(FILES
+    doc/EyilSecureGateway.md
+    doc/EyilClient.md
+    doc/EyilGateway.md
+    doc/BuildAndValidation.md
+    doc/DevelopmentClient.md
+    doc/zmq_connection_lifetime.patch
     DESTINATION ${CMAKE_INSTALL_DOCDIR}
 )
