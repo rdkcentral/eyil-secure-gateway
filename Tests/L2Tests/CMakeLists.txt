@@ -41,6 +41,12 @@ if(TARGET EyilCryptoMock AND TARGET eyil-client)
     find_program(EYIL_THUNDER_EXECUTABLE NAMES WPEFramework Thunder
         HINTS "${${NAMESPACE}Core_DIR}/../../../bin" "$ENV{EYIL_THUNDER_PREFIX}/bin")
     if(EYIL_THUNDER_EXECUTABLE)
+        set(crypto_test_backend_arguments)
+        if(TARGET ${NAMESPACE}CryptoTestBackend)
+            list(APPEND crypto_test_backend_arguments
+                --crypto-test-backend $<TARGET_FILE:${NAMESPACE}CryptoTestBackend>
+                --crypto-test-backend-configuration ${PROJECT_BINARY_DIR}/src/tools/CryptoTestBackend/config/CryptoTestBackend.json)
+        endif()
         add_test(NAME eyil-thunder-l2
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test-thunder-runtime.py
                 --thunder ${EYIL_THUNDER_EXECUTABLE}
@@ -50,6 +56,7 @@ if(TARGET EyilCryptoMock AND TARGET eyil-client)
                 --configuration ${PROJECT_BINARY_DIR}/src/gateway/config/EyilGateway.json
                 --client $<TARGET_FILE:eyil-client>
                 --reports ${PROJECT_BINARY_DIR}/reports/thunder
+                ${crypto_test_backend_arguments}
                 --library-dir $<TARGET_FILE_DIR:${NAMESPACE}Core::${NAMESPACE}Core>
                 --library-dir $<TARGET_FILE_DIR:ZeroMQ::ZeroMQ>
                 --library-dir $<TARGET_FILE_DIR:protobuf::libprotobuf>)

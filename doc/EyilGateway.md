@@ -865,7 +865,11 @@ FD integer is not an interprocess shared-memory identity.
 
 #### Callsign configuration: BitBake to CMake to runtime
 
-The default callsign is empty: an image can run Gateway without a Crypto backend.
+The production default callsign is empty: an image can run Gateway without a Crypto backend.
+With `BUILD_EYIL_DEV_TOOLS=ON`, an empty configured value selects the installed
+development-only `org.rdk.CryptoTestBackend` plugin. An explicit callsign is preserved;
+disabling development tools restores the empty default. See
+[development tools](DevelopmentClient.md#development-cryptotestbackend).
 Products select the installed plugin explicitly through CMake/BitBake:
 
 ```cmake

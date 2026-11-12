@@ -1,7 +1,13 @@
 # Copyright 2026 RDK Management
 # SPDX-License-Identifier: Apache-2.0
-add_executable(eyil-client EyilClientExample.cpp)
-target_link_libraries(eyil-client PRIVATE EyilClient::EyilClient EyilProtocol::EyilProtocol Threads::Threads)
+if(PLUGIN_EYILGATEWAY)
+    add_subdirectory(CryptoTestBackend)
+endif()
+
+add_executable(eyil-client EyilClientExample.cpp
+    client/TestClient.cpp client/CryptoCases.cpp client/BufferCases.cpp client/ClientCases.cpp)
+target_compile_options(eyil-client PRIVATE -Wall -Wextra)
+target_link_libraries(eyil-client PRIVATE EyilClient::EyilClient EyilProtocol::EyilProtocol Threads::Threads rt)
 install(TARGETS eyil-client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(EYIL_DEV_SYSROOT "${CMAKE_SYSROOT}" CACHE PATH "Target runtime sysroot for the development client bundle")

@@ -25,6 +25,12 @@ add_custom_target(check-l1
     VERBATIM
 )
 
+if(TARGET ${NAMESPACE}CryptoTestBackend)
+    add_executable(eyil-crypto-test-backend-l1 CryptoTestBackendTests.cpp)
+    target_link_libraries(eyil-crypto-test-backend-l1 PRIVATE ${NAMESPACE}CryptoTestBackend)
+    eyil_test_cases(eyil-crypto-test-backend-l1 L1 sessions fixed-replies round-trip signature regions files)
+endif()
+
 if(TARGET EyilGatewayRuntime AND TARGET eyilclient)
     add_executable(eyil-l1 RuntimeTests.cpp)
     target_link_libraries(eyil-l1 PRIVATE EyilGatewayRuntime EyilClient::EyilClient)

@@ -191,7 +191,7 @@ L1 scenarios are registered individually in CTest. The suites cover:
 | Implementation lifecycle | Rejected configuration, partial-start rollback, repeated configuration rejection and final IConfiguration Release invoking destruction with idle resources or an active ICrypto call; IShell remains retained until completion |
 | Common runtime | Descriptor ownership, wakeups, transport settings, token format, credential numeric bounds, monitor framing and bounded diagnostic suppression |
 | L2 | Real DEALER/ROUTER IPC with the patched libzmq, concurrent callers/out-of-order results, real timeout budgets, missing Crypto, multiple connections, duplicate request IDs, disconnect before the first request, route reuse, stale reply prevention and single-attempt reply delivery under EAGAIN/EHOSTUNREACH/partial-send failures; response allocation/serialization failures during admission, admission-error handling, worker execution and worker timeout, including INTERNAL fallback, dropped-reply cleanup and continued service |
-| Thunder L2 | Actual wrapper/implementation activation and destruction with the test-only ICrypto plugin and with the backend absent |
+| Thunder L2 | Actual wrapper/implementation activation and destruction with the test-only ICrypto mock, with the backend absent, and with the development CryptoTestBackend plugin plus CLI shared-memory checks when development tools are enabled |
 | Wrapper lifecycle | Failed Initialize retains state for framework-driven Deinitialize; missing implementation, invalid configuration, repeated cleanup, fresh activation and configured volatile-directory failure/recovery |
 
 Fault injection uses test-only linker wrappers and allocation overrides. No test

@@ -108,6 +108,13 @@ install(TARGETS ${MODULE_NAME} ${PLUGIN_IMPLEMENTATION}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/${_plugin_directory}/plugins
 )
 
+# Preserve the product's cache value so disabling development tools restores the
+# empty default, and an explicitly selected real backend always takes precedence.
+set(EYIL_CONFIG_CRYPTO_CALLSIGN "${PLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN}")
+if(BUILD_EYIL_DEV_TOOLS AND EYIL_CONFIG_CRYPTO_CALLSIGN STREQUAL "")
+    set(EYIL_CONFIG_CRYPTO_CALLSIGN "org.rdk.CryptoTestBackend")
+endif()
+
 write_config(PLUGINS ${PLUGIN_NAME}
     CLASSNAME EyilGateway
     COMPONENT eyilgateway

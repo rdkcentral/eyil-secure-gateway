@@ -55,6 +55,7 @@ for entry in (build / "install_manifest.txt").read_text().splitlines():
         or str(path).endswith("/include/eyilclient/EyilClient.h")
         or str(path).endswith("/bin/eyil-client")
         or str(path).endswith("/WPEFramework/plugins/EyilGateway.json")
+        or str(path).endswith("/WPEFramework/plugins/CryptoTestBackend.json")
         or (
             path.parent.name == "EyilClient"
             and path.parent.parent.name == "cmake"
@@ -82,6 +83,9 @@ if "PLUGIN_EYILGATEWAY:BOOL=ON" in (build / "CMakeCache.txt").read_text():
         for line in (build / "CMakeCache.txt").read_text().splitlines()
         if line.startswith("PLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN:STRING=")
     )
+    development = "BUILD_EYIL_DEV_TOOLS:BOOL=ON" in (build / "CMakeCache.txt").read_text()
+    if development and not selected_callsign:
+        selected_callsign = "org.rdk.CryptoTestBackend"
     assert config["configuration"]["backends"] == [
         {"service": "crypto", "callsign": selected_callsign}
     ]
@@ -93,4 +97,14 @@ if "PLUGIN_EYILGATEWAY:BOOL=ON" in (build / "CMakeCache.txt").read_text():
     implementation = library.parent / root["locator"]
     ctypes.CDLL(str(implementation), mode=os.RTLD_NOW)
     print("Installed EyilGateway wrapper and implementation libraries loaded successfully.")
+    test_config_path = stage / "etc/WPEFramework/plugins/CryptoTestBackend.json"
+    if development:
+        test_config = json.loads(test_config_path.read_text())
+        assert test_config["callsign"] == "org.rdk.CryptoTestBackend"
+        assert test_config["classname"] == "CryptoTestBackend"
+        assert test_config["autostart"] is False
+        ctypes.CDLL(str(library.parent / test_config["locator"]), mode=os.RTLD_NOW)
+        print("Installed development-only CryptoTestBackend plugin loaded successfully.")
+    else:
+        assert not test_config_path.exists(), "CryptoTestBackend must not be installed without development tools"
 PY

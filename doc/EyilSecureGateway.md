@@ -228,8 +228,10 @@ metadata and checks both invocation and service results. Gateway-local buffer
 allocation/release needs no ICrypto call.
 
 Crypto operations depend on ICrypto, but Gateway startup and client admission
-do not require an available backend. The default backend callsign is empty;
-unavailable Crypto is reported through backend RPC results. The application chooses its
+do not require an available backend. The production default backend callsign is
+empty; development builds with the CLI select `org.rdk.CryptoTestBackend` when no callsign
+was supplied (see [development tools](DevelopmentClient.md#development-cryptotestbackend)).
+Unavailable Crypto is reported through backend RPC results. The application chooses its
 connection lifetime; retaining one connection across operations and idle periods
 for the app instance's lifetime is recommended. Gateway uses the corresponding
 connection's ApplicationContext for notifications. The current design sends
