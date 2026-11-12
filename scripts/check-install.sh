@@ -85,7 +85,7 @@ for entry in (build / "install_manifest.txt").read_text().splitlines():
         or str(path).endswith("/include/eyilclient/EyilClient.h")
         or (path.parent.name == "eyilprotocol" and path.name in {"rpc.pb.h", "crypto.pb.h", "ProtocolVersion.h"})
         or (path.parent == prefix / datadir / "eyil/proto" and path.name in {"rpc.proto", "crypto.proto"})
-        or str(path).endswith("/bin/eyil-client")
+        or str(path).endswith("/bin/CryptoTestClient")
         or str(path).endswith("/WPEFramework/plugins/EyilGateway.json")
         or str(path).endswith("/WPEFramework/plugins/CryptoTestBackend.json")
         or (
@@ -102,13 +102,11 @@ for name in ("rpc.proto", "crypto.proto"):
     assert installed(Path(datadir) / "eyil/proto" / name).is_file()
 print("Install manifest contains runtime artifacts and the client/protocol SDKs, without documentation.")
 if "BUILD_EYIL_DEV_TOOLS:BOOL=ON" in (build / "CMakeCache.txt").read_text():
-    bundle = installed(Path(cache["CMAKE_INSTALL_LIBDIR"]) / "eyil")
-    assert installed(Path(cache["CMAKE_INSTALL_BINDIR"]) / "eyil-client").is_file()
-    assert (bundle / "eyil-client").is_file()
-    assert (bundle / "run").is_file()
-    assert all(path.name in {"eyil-client", "run"} or ".so" in path.name for path in bundle.iterdir())
-    subprocess.run([str(bundle / "run"), "--help"], check=True)
-    print(f"Installed container client starts from {bundle} with its private libraries.")
+    client = installed(Path(cache["CMAKE_INSTALL_BINDIR"]) / "CryptoTestClient")
+    assert client.is_file()
+    assert not installed(Path(cache["CMAKE_INSTALL_LIBDIR"]) / "eyil").exists(), "Remove the obsolete bundle from the staging directory"
+    subprocess.run([str(client), "--help"], check=True, env={**os.environ, "LD_BIND_NOW": "1"})
+    print(f"Installed client starts from {client} using the normal runtime libraries.")
 if "PLUGIN_EYILGATEWAY:BOOL=ON" in (build / "CMakeCache.txt").read_text():
     config_path = stage / "etc/WPEFramework/plugins/EyilGateway.json"
     config = json.loads(config_path.read_text())

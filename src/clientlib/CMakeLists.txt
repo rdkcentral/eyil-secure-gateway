@@ -22,7 +22,7 @@ add_library(EyilClient::EyilClient ALIAS eyilclient)
 
 set_target_properties(eyilclient PROPERTIES
     VERSION ${PROJECT_VERSION}
-    SOVERSION 0
+    SOVERSION ${PROJECT_VERSION_MAJOR}
     EXPORT_NAME EyilClient
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES

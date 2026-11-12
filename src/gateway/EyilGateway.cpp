@@ -46,68 +46,90 @@ namespace WPEFramework
 
         const string EyilGateway::Initialize(PluginHost::IShell *service)
         {
-            if (service == nullptr || _service != nullptr)
             {
-                return "Invalid EyilGateway initialization";
+                Core::SafeSyncType<Core::CriticalSection> lock(_adminLock);
+                if (service == nullptr || _service != nullptr)
+                {
+                    return "Invalid EyilGateway initialization";
+                }
+                _service = service;
+                _service->AddRef();
             }
 
-            _service = service;
-            _service->AddRef();
-            _service->Register(&_notification);
+            service->Register(&_notification);
 
-            _implementation = _service->Root<Exchange::IConfiguration>(
-                _connectionId, ImplementationTimeoutMs, _T("EyilGatewayImplementation"));
-            if (_implementation == nullptr)
+            uint32_t connectionId = 0;
+            auto *implementation = service->Root<Exchange::IConfiguration>(
+                connectionId, ImplementationTimeoutMs, _T("EyilGatewayImplementation"));
+            {
+                Core::SafeSyncType<Core::CriticalSection> lock(_adminLock);
+                _implementation = implementation;
+                _connectionId = connectionId;
+            }
+            if (implementation == nullptr)
             {
                 return "EyilGateway implementation could not be created";
             }
 
             // The initial deployment uses synchronous destruction in this process.
-            if (_connectionId != 0)
+            if (connectionId != 0)
             {
                 return "EyilGateway requires in-process mode";
             }
-            const Core::hresult result = _implementation->Configure(_service);
+            const Core::hresult result = implementation->Configure(service);
             if (result != Core::ERROR_NONE)
             {
                 SYSLOG(Logging::Error, (_T("EyilGateway implementation configuration failed: %u"), result));
                 return "EyilGateway implementation could not be configured";
             }
 
-            SYSLOG(Logging::Notification, (_T("EyilGateway initialized, connectionId=%u"), _connectionId));
+            SYSLOG(Logging::Notification, (_T("EyilGateway initialized, connectionId=%u"), connectionId));
             return {};
         }
 
         void EyilGateway::Deinitialize(PluginHost::IShell *service)
         {
-            if (_service == nullptr || _service != service)
+            PluginHost::IShell *retainedService = nullptr;
+            Exchange::IConfiguration *implementation = nullptr;
+            uint32_t connectionId = 0;
             {
-                return;
+                Core::SafeSyncType<Core::CriticalSection> lock(_adminLock);
+                if (_service == nullptr || _service != service)
+                {
+                    return;
+                }
+                // Transfer owned references and stop admitting notifications before draining.
+                retainedService = _service;
+                implementation = _implementation;
+                connectionId = _connectionId;
+                _service = nullptr;
+                _implementation = nullptr;
+                _connectionId = 0;
             }
 
-            _service->Unregister(&_notification);
+            retainedService->Unregister(&_notification);
             RPC::IRemoteConnection *connection
-                = _connectionId != 0 ? _service->RemoteConnection(_connectionId) : nullptr;
+                = connectionId != 0 ? retainedService->RemoteConnection(connectionId) : nullptr;
 
-            if (_implementation != nullptr)
+            if (implementation != nullptr)
             {
                 // The wrapper owns the implementation's sole interface reference.
                 // Its destructor drains the runtime before this final Release returns.
-                const uint32_t released = _implementation->Release();
+                const uint32_t released = implementation->Release();
+                implementation = nullptr;
                 ASSERT(released == Core::ERROR_DESTRUCTION_SUCCEEDED);
                 (void)released;
-                _implementation = nullptr;
             }
 
             if (connection != nullptr)
             {
                 connection->Terminate();
                 connection->Release();
+                connection = nullptr;
             }
 
-            _connectionId = 0;
-            _service->Release();
-            _service = nullptr;
+            retainedService->Release();
+            retainedService = nullptr;
             SYSLOG(Logging::Notification, (_T("EyilGateway deinitialized")));
         }
 
@@ -118,10 +140,38 @@ namespace WPEFramework
 
         void EyilGateway::Deactivated(RPC::IRemoteConnection *connection)
         {
-            if (connection != nullptr && _connectionId != 0 && connection->Id() == _connectionId && _service != nullptr)
+            if (connection == nullptr)
+                return;
+
+            const uint32_t connectionId = connection->Id();
+            PluginHost::IShell *service = nullptr;
             {
-                Core::IWorkerPool::Instance().Submit(PluginHost::IShell::Job::Create(
-                    _service, PluginHost::IShell::DEACTIVATED, PluginHost::IShell::FAILURE));
+                Core::SafeSyncType<Core::CriticalSection> lock(_adminLock);
+                if (_connectionId != 0 && connectionId == _connectionId && _service != nullptr)
+                {
+                    service = _service;
+                    service->AddRef();
+                }
+            }
+            if (service != nullptr)
+            {
+                // Job creation/submission can allocate in Thunder. Keep the shell alive
+                // independently of Deinitialize, without holding our lock in framework code.
+                try
+                {
+                    Core::IWorkerPool::Instance().Submit(PluginHost::IShell::Job::Create(
+                        service, PluginHost::IShell::DEACTIVATED, PluginHost::IShell::FAILURE));
+                }
+                catch (const std::exception &error)
+                {
+                    SYSLOG(Logging::Error, (_T("EyilGateway deactivation scheduling failed: %s"), error.what()));
+                }
+                catch (...)
+                {
+                    SYSLOG(Logging::Error, (_T("EyilGateway deactivation scheduling failed")));
+                }
+                service->Release();
+                service = nullptr;
             }
         }
     }

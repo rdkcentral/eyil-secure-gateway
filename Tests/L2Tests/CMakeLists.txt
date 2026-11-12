@@ -37,7 +37,7 @@ if(TARGET EyilGatewayRuntime)
     target_link_libraries(EyilCryptoMock PRIVATE EyilGatewayRuntime)
     target_compile_definitions(EyilCryptoMock PRIVATE MODULE_NAME=Plugin_EyilCryptoMock BUILD_REFERENCE="test-only")
 endif()
-if(TARGET EyilCryptoMock AND TARGET eyil-client)
+if(TARGET EyilCryptoMock AND TARGET CryptoTestClient)
     find_program(EYIL_THUNDER_EXECUTABLE NAMES WPEFramework Thunder
         HINTS "${${NAMESPACE}Core_DIR}/../../../bin" "$ENV{EYIL_THUNDER_PREFIX}/bin")
     if(EYIL_THUNDER_EXECUTABLE)
@@ -54,7 +54,7 @@ if(TARGET EyilCryptoMock AND TARGET eyil-client)
                 --implementation $<TARGET_FILE:${NAMESPACE}EyilGatewayImplementation>
                 --mock $<TARGET_FILE:EyilCryptoMock>
                 --configuration ${PROJECT_BINARY_DIR}/src/gateway/config/EyilGateway.json
-                --client $<TARGET_FILE:eyil-client>
+                --client $<TARGET_FILE:CryptoTestClient>
                 --reports ${PROJECT_BINARY_DIR}/reports/thunder
                 ${crypto_test_backend_arguments}
                 --library-dir $<TARGET_FILE_DIR:${NAMESPACE}Core::${NAMESPACE}Core>

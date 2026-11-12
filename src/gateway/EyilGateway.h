@@ -68,6 +68,8 @@ namespace WPEFramework
                 EyilGateway &_parent;
             };
 
+            // Framework lifecycle calls are serialized; remote notifications may race them.
+            Core::CriticalSection _adminLock;
             PluginHost::IShell *_service = nullptr;
             Exchange::IConfiguration *_implementation = nullptr;
             uint32_t _connectionId = 0;

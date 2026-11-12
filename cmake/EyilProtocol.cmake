@@ -32,8 +32,8 @@ add_library(eyilprotocol SHARED ${EYIL_PROTO_SOURCES} ${EYIL_PROTO_HEADERS})
 add_library(EyilProtocol::EyilProtocol ALIAS eyilprotocol)
 
 set_target_properties(eyilprotocol PROPERTIES
-    VERSION 2.0.0
-    SOVERSION 2
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
     EXPORT_NAME EyilProtocol
 )
 
@@ -67,7 +67,7 @@ configure_package_config_file(${PROJECT_SOURCE_DIR}/cmake/EyilProtocolConfig.cma
 )
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/EyilProtocolConfigVersion.cmake
-    VERSION 2.0.0
+    VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
 install(EXPORT EyilProtocolTargets

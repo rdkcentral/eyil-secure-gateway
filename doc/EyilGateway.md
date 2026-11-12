@@ -2814,6 +2814,14 @@ output does not alter the requirement to retain unresolved backend access.
 
 #### ROUTER and context teardown
 
+The wrapper serializes access to its shell pointer and remote-connection ID with
+`Core::CriticalSection`. Deinitialize detaches its owned references and clears
+callback-visible state under that lock, then unregisters and drains outside it.
+A matching deactivation callback retains an `IShell` reference under the lock
+before submitting a framework job outside it. Creation/submission failure releases
+the retained reference and logs an error. Framework lifecycle calls themselves
+remain serialized by Thunder; this protects their overlap with remote notifications.
+
 Set ZMQ_LINGER=0 on all application-owned Gateway sockets when created.
 Execution drains before closure; linger is not an operation or delivery ACK.
 Zero linger prevents unsent traffic to a frozen client from prolonging transport

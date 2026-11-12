@@ -17,10 +17,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Development build and container smoke test
+# CryptoTestClient: development build and container smoke test
 
 The implementation lives in `src/clientlib` and `src/gateway`; public headers
 and Protobuf stay in `apis`. No acceptance-criteria text is changed.
+
+`CryptoTestClient`, in [`tools/CryptoTestClient`](../tools/CryptoTestClient),
+demonstrates integrating EyilClient with the shared Protobuf bindings: constructing
+Crypto requests and RPC envelopes, calling the synchronous and asynchronous APIs,
+and decoding responses. It also checks normal and error paths against Gateway
+with or without the development CryptoTestBackend plugin.
 
 ## Build and install
 
@@ -46,16 +52,11 @@ directory containing `interfaces/ICrypto.h` and matching `IConfiguration.h`,
 
 For a development image, set `BUILD_EYIL_DEV_TOOLS=ON`. CMake defaults to OFF.
 The current Yocto integration recipe deliberately enables `dev-tools` until
-integration is complete; remove that PACKAGECONFIG feature for production. The install target installs `/usr/bin/eyil-client` and a self-contained
-runtime bundle in `/usr/lib/eyil`. The bundle includes a launcher,
-the client executable, its ELF interpreter and required libraries. Sources live
-in `tools/`, separately from production runtime code in `src/`. The private
-library copies let the host-built CLI run in an app container with its own
-rootfs. Host package dependencies alone do not make those libraries available
-inside a container. The `run` launcher executes the bundled ELF interpreter with
-`--library-path` pointing at this directory; it does not activate plugins.
-The bundle can be removed once the app rootfs supplies compatible dependencies;
-its copied libraries are private and do not replace Yocto's rootfs providers.
+integration is complete; remove that PACKAGECONFIG feature for production.
+The install target installs `/usr/bin/CryptoTestClient`. It uses the system ELF loader
+and libraries in their normal runtime locations. No private library bundle,
+loader copy or launcher is installed. Sources live in `tools/`, separately from
+production runtime code in `src/`.
 When Gateway is enabled, the same option also builds and installs
 `libWPEFrameworkCryptoTestBackend.so` in the Thunder plugin directory and
 `CryptoTestBackend.json` in its configuration directory. Both development artifacts
@@ -63,10 +64,12 @@ belong to the Yocto `eyil-secure-gateway-tools` package. With development tools
 disabled, neither the CLI nor CryptoTestBackend is built or installed. A standalone
 client build with Gateway disabled continues to require no Thunder SDK and
 does not build CryptoTestBackend.
-`scripts/stage-dev-client.py` uses readelf and never executes target
-binaries. Cross installs need `CMAKE_SYSROOT` or `EYIL_DEV_SYSROOT` containing
-the target interpreter and runtime libraries. Keep the original dependency
-package licenses in the image; the bundle does not change their licenses.
+Yocto's shared-library dependency analysis supplies the required runtime packages,
+including EyilClient, EyilProtocol, Protobuf, ZeroMQ and their dependencies.
+Each package owns its libraries; normal stripping/debug splitting applies.
+The CLI requires those compatible libraries inside the container as well as on
+the host. A container with a separate rootfs must install or expose them through
+its platform configuration. Host installation alone does not satisfy that case.
 
 ## Build integration outside the component repositories
 
@@ -81,9 +84,10 @@ Eyil in that list so the common target requests it through `Wants`, not `Require
 THUNDER_OPTIONAL_STARTUP_SERVICES ?= "wpeframework-eyilgateway.service"
 ```
 
-RuntimeManager requests EyilGateway activation through `Wants=` and orders it
-first with `After=`; the Gateway unit also declares `Before=` RuntimeManager.
-A missing or failed Gateway service does not prevent RuntimeManager activation.
+EyilGateway starts independently through Thunder's optional service target.
+It does not require RuntimeManager or the `/tmp/ai2managers` marker; RuntimeManager
+does not require EyilGateway. Create the application container after the socket
+appears when that application needs Gateway access.
 Gateway binds and accepts valid clients even if Crypto is missing; backend RPCs
 report `RPC_STATUS_INTERNAL`. The production default Crypto callsign is empty.
 When development tools and Gateway are enabled, an empty CMake callsign produces
@@ -114,10 +118,17 @@ The existence check runs during configuration generation; removal between that
 check and Dobby's bind mount can still fail container startup.
 
 For development AppManagers builds (`RDK_APPMANAGERS_DEBUG`), both generation
-paths additionally bind `/usr/lib/eyil` read-only when that directory
-exists. It is executable, unlike the socket mount. This is why a host-rootfs
-binary is actually reachable inside the app container. Enable development tools
-only in development images and create the container after the bundle is installed.
+paths additionally bind `/usr/bin/CryptoTestClient` read-only when it is a regular
+file. Execution is permitted for this binary. Its loader and libraries must
+already be available at their normal paths in the container; validate that
+deployment separately for Legacy and RALF.
+
+The temporary AS integration adds only the optional socket mount. Its platform
+mounts expose `/usr` and `/lib`, including the diagnostic executable and runtime
+libraries. There is no dedicated Eyil library-directory mount. Enable development
+tools only in development images. Use a fresh image/package installation to remove
+any old private bundle; installing new files into a reused staging directory
+does not remove obsolete files automatically.
 
 ## Run with no Crypto implementation
 
@@ -125,7 +136,7 @@ After the new image boots and an application container is running:
 
 ```sh
 DobbyTool list
-DobbyTool exec <container-id> '/usr/lib/eyil/run --expect-no-crypto'
+DobbyTool exec <container-id> '/usr/bin/CryptoTestClient --expect-no-crypto'
 ```
 
 For this scenario, leave CryptoTestBackend inactive and do not activate another backend
@@ -158,7 +169,7 @@ an unavailable/stalled transport; `CLIENT_AUTH_FAILED` means an explicit denial.
 ## Run with a backend
 
 ```sh
-DobbyTool exec <container-id> '/usr/lib/eyil/run --exercise'
+DobbyTool exec <container-id> '/usr/bin/CryptoTestClient --exercise'
 ```
 
 This mode tests transport, GenerateRandom, both string APIs, local argument
@@ -228,7 +239,7 @@ application container:
 
 ```sh
 /usr/bin/PluginActivator org.rdk.CryptoTestBackend
-DobbyTool exec <container-id> '/usr/lib/eyil/run --crypto-test-backend'
+DobbyTool exec <container-id> '/usr/bin/CryptoTestClient --crypto-test-backend'
 ```
 
 Gateway must already be active with `crypto` routed to `org.rdk.CryptoTestBackend`.

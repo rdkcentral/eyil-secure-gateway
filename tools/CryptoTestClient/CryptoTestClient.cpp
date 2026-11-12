@@ -1,7 +1,8 @@
 // Copyright 2026 RDK Management
 // SPDX-License-Identifier: Apache-2.0
-// Development diagnostic client. No cryptographic implementation or secret logging.
-#include "client/TestClient.h"
+// Crypto integration example: EyilClient transport and shared Protobuf bindings.
+// Development diagnostics only; no cryptographic implementation or secret logging.
+#include "TestClient.h"
 
 #include <cstring>
 #include <iostream>
@@ -14,7 +15,7 @@ int main(int argc, char **argv)
             && std::strcmp(argv[1], "--crypto-test-backend")))
     {
         std::cout
-            << "Usage: eyil-client --expect-no-crypto | --exercise | --crypto-test-backend\n"
+            << "Usage: CryptoTestClient --expect-no-crypto | --exercise | --crypto-test-backend\n"
                "--expect-no-crypto: all 15 backend operations must return INTERNAL; local buffer APIs still work.\n"
                "--exercise: transport, strings, mixed sync/async and Gateway-owned buffer cases.\n"
                "--crypto-test-backend: all 17 operations, deterministic outputs, async shared memory and edge cases.\n"

@@ -147,7 +147,7 @@ Gateway's generated configuration always uses in-process mode `Off`; there is
 no implementation-mode CMake option. The wrapper rejects a manually supplied
 remote mode. The implementation destructor drains the runtime on final Release;
 remote destruction and library lifetime need separate validation. See [development and container validation](DevelopmentClient.md) for
-the CLI, dev-rootfs bundle, startup-service selection and expected no-Crypto result.
+the CLI, container runtime dependencies, startup-service selection and expected no-Crypto result.
 
 Select the Crypto callsign through
 `-DPLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN=org.rdk.Crypto` or the product-specific
@@ -186,8 +186,12 @@ bindings. Its SDK includes `rpc.pb.h`, `crypto.pb.h` and `ProtocolVersion.h` und
 link this shared target and must not compile another copy of these `.pb.cc`
 files into the same process. Use the same SDK's Protobuf version; the exported
 package requires the version used to build the generated bindings. Library
-SONAMEs remain unchanged: client ABI 0 and protocol ABI 2 are independent of
-project version 1.0.0 and envelope schema 1.
+Both shared libraries and their CMake package versions use `PROJECT_VERSION`;
+their SONAMEs use `PROJECT_VERSION_MAJOR`. With project version 1.0.0, this
+produces `libeyilclient.so.1` and `libeyilprotocol.so.1`. Consumers of the earlier
+development SONAMEs (`.so.0` and `.so.2`) must be rebuilt and relinked together
+with this update; do not add compatibility symlinks. Envelope schema 1 remains
+independent of library versioning.
 
 Schemas install under `${datadir}/eyil/proto` for SDK tooling and consumers in
 other languages. Installing them is not an instruction to regenerate duplicate
@@ -236,7 +240,7 @@ L1 scenarios are registered individually in CTest. The suites cover:
 | Common runtime | Descriptor ownership, wakeups, transport settings, token format, credential numeric bounds, monitor framing and bounded diagnostic suppression |
 | L2 | Real DEALER/ROUTER IPC with the patched libzmq, concurrent callers/out-of-order results, real timeout budgets, missing Crypto, multiple connections, duplicate request IDs, disconnect before the first request, route reuse, stale reply prevention and single-attempt reply delivery under EAGAIN/EHOSTUNREACH/partial-send failures; response allocation/serialization failures during admission, admission-error handling, worker execution and worker timeout, including INTERNAL fallback, dropped-reply cleanup and continued service |
 | Thunder L2 | Actual wrapper/implementation activation and destruction with the test-only ICrypto mock, with the backend absent, and with the development CryptoTestBackend plugin plus CLI shared-memory checks when development tools are enabled |
-| Wrapper lifecycle | Failed Initialize retains state for framework-driven Deinitialize; missing implementation, invalid configuration, repeated cleanup, fresh activation and configured volatile-directory failure/recovery |
+| Wrapper lifecycle | Failed Initialize retains state for framework-driven Deinitialize; missing implementation, invalid configuration, repeated cleanup, fresh activation, configured volatile-directory failure/recovery; remote notifications during Root/unregistration, unrelated/null IDs, concurrent deinitialization during job submission and submission allocation failure without a leaked shell reference |
 
 Fault injection uses test-only linker wrappers and allocation overrides. No test
 hooks or additional Thunder interfaces are installed. Client fault tests compile

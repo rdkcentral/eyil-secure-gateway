@@ -62,6 +62,8 @@ namespace
 
         void Submit(const Core::ProxyType<Core::IDispatch> &job) override
         {
+            if (beforeSubmit)
+                beforeSubmit();
             std::lock_guard<std::mutex> lock(mutex);
             pending = job;
             ++submissions;
@@ -71,7 +73,8 @@ namespace
         {
             std::lock_guard<std::mutex> lock(mutex);
             auto job = pending;
-            pending.Release();
+            if (pending.IsValid())
+                pending.Release();
             return job;
         }
 
@@ -88,11 +91,123 @@ namespace
         const Metadata &Snapshot() const override { return metadata; }
 
         std::atomic<unsigned> submissions { 0 };
+        std::function<void()> beforeSubmit;
 
     private:
         std::mutex mutex;
         Core::ProxyType<Core::IDispatch> pending;
         Metadata metadata {};
+    };
+
+    class TestConnection : public WPEFramework::RPC::IRemoteConnection
+    {
+    public:
+        explicit TestConnection(uint32_t id)
+            : id(id)
+        {
+        }
+
+        uint32_t AddRef() const override { return ++references; }
+
+        uint32_t Release() const override { return --references; }
+
+        void *QueryInterface(uint32_t interfaceId) override
+        {
+            if (interfaceId != ID && interfaceId != Core::IUnknown::ID)
+                return nullptr;
+            AddRef();
+            return static_cast<IRemoteConnection *>(this);
+        }
+
+        uint32_t Id() const override { return id; }
+
+        uint32_t RemoteId() const override { return 0; }
+
+        void *Acquire(uint32_t, const string &, uint32_t, uint32_t) override { return nullptr; }
+
+        void Terminate() override { ++terminations; }
+
+        uint32_t Launch() override { return Core::ERROR_NONE; }
+
+        void PostMortem() override { }
+
+        mutable std::atomic<unsigned> references { 1 };
+        std::atomic<unsigned> terminations { 0 };
+
+    private:
+        uint32_t id;
+    };
+
+    class NotificationShell : public MockShell, public WPEFramework::PluginHost::IShell::ICOMLink
+    {
+    public:
+        using Observer = WPEFramework::RPC::IRemoteConnection::INotification;
+        using LinkObserver = WPEFramework::PluginHost::IShell::ICOMLink::INotification;
+
+        WPEFramework::PluginHost::IShell::ICOMLink *COMLink() override { return this; }
+
+        void Register(Observer *sink) override
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            CHECK(!observer);
+            sink->AddRef();
+            observer = sink;
+        }
+
+        void Unregister(const Observer *sink) override
+        {
+            Observer *retained = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                CHECK(observer == sink);
+                retained = observer;
+                observer = nullptr;
+            }
+            // Model a notification already being delivered when unregistration begins.
+            retained->Deactivated(&connection);
+            retained->Release();
+        }
+
+        void Register(LinkObserver *) override { }
+
+        void Unregister(LinkObserver *) override { }
+
+        WPEFramework::RPC::IRemoteConnection *RemoteConnection(uint32_t id) override
+        {
+            CHECK(id == connection.Id());
+            connection.AddRef();
+            return &connection;
+        }
+
+        void *Instantiate(const WPEFramework::RPC::Object &, uint32_t, uint32_t &id) override
+        {
+            id = connection.Id();
+            Notify(&connection); // Root has not published the connection ID yet.
+            return Core::Service<WPEFramework::Plugin::EyilGatewayImplementation>::Create<
+                WPEFramework::Exchange::IConfiguration>();
+        }
+
+        void Notify(WPEFramework::RPC::IRemoteConnection *value)
+        {
+            Observer *retained = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                retained = observer;
+                if (retained)
+                    retained->AddRef();
+            }
+            if (retained)
+            {
+                retained->Deactivated(value);
+                retained->Release();
+            }
+        }
+
+        TestConnection connection { 42 };
+
+    private:
+        std::mutex mutex;
+        Observer *observer = nullptr;
     };
 
     struct Implementation
@@ -350,6 +465,83 @@ namespace
         CHECK(failed.Destroy() == Core::ERROR_DESTRUCTION_SUCCEEDED && shell.references == 1);
     }
 
+    void WrapperNotification(bool submissionFailure)
+    {
+        FrameworkPool pool;
+        NotificationShell shell;
+        // Exercise notification ownership through the public shell API. Remote
+        // mode is still rejected; no remote process or Gateway runtime is started.
+        shell.config = R"({"root":{"mode":"Local"}})";
+        auto *plugin = Core::Service<WPEFramework::Plugin::EyilGateway>::Create<WPEFramework::PluginHost::IPlugin>();
+        CHECK(plugin);
+
+        struct Cleanup
+        {
+            WPEFramework::PluginHost::IPlugin *plugin;
+            NotificationShell &shell;
+            FrameworkPool &pool;
+
+            ~Cleanup()
+            {
+                plugin->Deinitialize(&shell);
+                plugin->Release();
+                auto job = pool.Take();
+                if (job.IsValid())
+                    job.Release();
+                pool.beforeSubmit = {};
+            }
+        } cleanup { plugin, shell, pool };
+
+        CHECK(plugin->Initialize(&shell) == "EyilGateway requires in-process mode");
+        CHECK(pool.submissions == 0 && shell.references == 2);
+        TestConnection unrelated { 43 };
+        shell.Notify(nullptr);
+        shell.Notify(&unrelated);
+        CHECK(pool.submissions == 0);
+
+        if (submissionFailure)
+        {
+            pool.beforeSubmit = [] { throw std::bad_alloc(); };
+            shell.Notify(&shell.connection);
+            CHECK(pool.submissions == 0 && shell.references == 2);
+            pool.beforeSubmit = {};
+            shell.Notify(&shell.connection);
+        }
+        else
+        {
+            std::promise<void> entered, released;
+            auto enteredFuture = entered.get_future();
+            const auto allowed = released.get_future().share();
+            pool.beforeSubmit = [&]
+            {
+                entered.set_value();
+                CHECK(allowed.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+            };
+            auto callback = std::async(std::launch::async, [&] { shell.Notify(&shell.connection); });
+            CHECK(enteredFuture.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+            auto stopped = std::async(std::launch::async, [&] { plugin->Deinitialize(&shell); });
+            // Submission must not hold the wrapper lock or lose its shell reference.
+            CHECK(stopped.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+            stopped.get();
+            CHECK(shell.references == 3); // Test owner, callback snapshot and framework job.
+            CHECK(pool.submissions == 0 && shell.connection.terminations == 1);
+            released.set_value();
+            callback.get();
+            pool.beforeSubmit = {};
+        }
+
+        CHECK(pool.submissions == 1);
+        auto job = pool.Take();
+        CHECK(job.IsValid());
+        job->Dispatch();
+        job.Release();
+        CHECK(shell.deactivations == 1);
+        plugin->Deinitialize(&shell);
+        shell.Notify(&shell.connection);
+        CHECK(pool.submissions == 1 && shell.references == 1);
+        CHECK(shell.connection.references == 1 && shell.connection.terminations == 1);
+    }
+
     void BackendList()
     {
         RequireUnusedEndpoint();
@@ -430,6 +622,8 @@ int main(int argc, char **argv)
             { "omitted-callsign", [] { MissingBackend(R"({"backends":[{"service":"crypto"}]})"); } },
             { "backend-list", BackendList }, { "wrapper-failed-config", [] { WrapperFailure(false); } },
             { "runtime-deactivation", RuntimeDeactivation },
+            { "wrapper-notification-race", [] { WrapperNotification(false); } },
+            { "wrapper-notification-submit-failure", [] { WrapperNotification(true); } },
             { "wrapper-missing-implementation", [] { WrapperFailure(true); } },
             { "volatile-directory", VolatileDirectory } });
 }

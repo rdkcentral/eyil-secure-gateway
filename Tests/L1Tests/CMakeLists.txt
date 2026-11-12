@@ -69,7 +69,7 @@ if(TARGET EyilGatewayRuntime AND TARGET eyilclient)
     set(lifecycle_cases invalid-config partial-startup destructor-idle
         destructor-inflight missing-backend default-backends empty-backends empty-callsign
         omitted-callsign backend-list wrapper-failed-config wrapper-missing-implementation volatile-directory
-        runtime-deactivation)
+        runtime-deactivation wrapper-notification-race wrapper-notification-submit-failure)
     eyil_test_cases(eyil-lifecycle-l1 L1 ${lifecycle_cases})
     foreach(scenario IN LISTS lifecycle_cases)
         # Root() loads Thunder Plugins and its indirect SDK dependencies.
