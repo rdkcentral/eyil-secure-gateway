@@ -24,14 +24,34 @@ source "$repo_dir/scripts/environment.sh"
 build_dir=$(realpath "${1:-$repo_dir/build}")
 stage_dir=$(realpath -m "${2:-$repo_dir/rootfs/all}")
 DESTDIR="$stage_dir" cmake --install "$build_dir"
-export LD_LIBRARY_PATH="$stage_dir/usr/lib:$LD_LIBRARY_PATH"
+mapfile -t install_paths < <(python3 - "$build_dir/CMakeCache.txt" "$stage_dir" <<'PATHS'
+from pathlib import Path
+import sys
+cache = {}
+for line in Path(sys.argv[1]).read_text().splitlines():
+    if "=" in line and not line.startswith(("//", "#")):
+        key, value = line.split("=", 1)
+        cache[key.split(":", 1)[0]] = value
+prefix = Path(cache["CMAKE_INSTALL_PREFIX"])
+stage = Path(sys.argv[2])
+for path in (prefix, prefix / cache["CMAKE_INSTALL_LIBDIR"]):
+    print(stage / path.relative_to("/"))
+PATHS
+)
+install_prefix=${install_paths[0]}
+install_libdir=${install_paths[1]}
+export LD_LIBRARY_PATH="$install_libdir:$LD_LIBRARY_PATH"
+test -f "$install_libdir/cmake/EyilClient/EyilClientConfig.cmake"
+test -f "$install_libdir/cmake/EyilProtocol/EyilProtocolConfig.cmake"
 cmake -S "$repo_dir/scripts/consumer" -B "$build_dir/consumer" -G Ninja \
-    -UEyilClient_DIR -UEYIL_PROTOCOL_LIBRARY -DCMAKE_PREFIX_PATH="$stage_dir/usr" \
-    -DEYIL_INSTALL_ROOT="$stage_dir" -DEYIL_BUILD_DIR="$build_dir"
+    -DCMAKE_PREFIX_PATH="$install_prefix" \
+    -DEyilClient_DIR="$install_libdir/cmake/EyilClient" \
+    -DEyilProtocol_DIR="$install_libdir/cmake/EyilProtocol" \
+    -UEYIL_PROTOCOL_LIBRARY -UEYIL_BUILD_DIR -UEYIL_INSTALL_ROOT
 cmake --build "$build_dir/consumer" --parallel "${BUILD_JOBS:-4}"
 "$build_dir/consumer/eyil-c-consumer"
 "$build_dir/consumer/eyil-protocol-consumer"
-export PKG_CONFIG_LIBDIR="$stage_dir/usr/lib/pkgconfig"
+export PKG_CONFIG_LIBDIR="$install_libdir/pkgconfig"
 export PKG_CONFIG_SYSROOT_DIR="$stage_dir"
 client_flag_string=$(pkg-config --cflags --libs eyilclient)
 read -r -a client_flags <<< "$client_flag_string"
@@ -48,31 +68,47 @@ from pathlib import Path
 
 build = Path(sys.argv[1])
 stage = Path(sys.argv[2])
+cache = {}
+for line in (build / "CMakeCache.txt").read_text().splitlines():
+    if "=" in line and not line.startswith(("//", "#")):
+        key, value = line.split("=", 1)
+        cache[key.split(":", 1)[0]] = value
+prefix = Path(cache["CMAKE_INSTALL_PREFIX"])
+datadir = cache["CMAKE_INSTALL_DATADIR"] or cache["CMAKE_INSTALL_DATAROOTDIR"]
+def installed(path):
+    return stage / (prefix / path).relative_to("/")
+
 for entry in (build / "install_manifest.txt").read_text().splitlines():
     path = Path(entry)
     allowed = (
         ".so" in path.name
         or str(path).endswith("/include/eyilclient/EyilClient.h")
+        or (path.parent.name == "eyilprotocol" and path.name in {"rpc.pb.h", "crypto.pb.h", "ProtocolVersion.h"})
+        or (path.parent == prefix / datadir / "eyil/proto" and path.name in {"rpc.proto", "crypto.proto"})
         or str(path).endswith("/bin/eyil-client")
         or str(path).endswith("/WPEFramework/plugins/EyilGateway.json")
         or str(path).endswith("/WPEFramework/plugins/CryptoTestBackend.json")
         or (
-            path.parent.name == "EyilClient"
+            path.parent.name in {"EyilClient", "EyilProtocol"}
             and path.parent.parent.name == "cmake"
             and path.suffix == ".cmake"
         )
         or str(path).endswith("/pkgconfig/eyilclient.pc")
     )
     assert allowed, f"Unexpected install artifact: {entry}"
-print("Install manifest contains runtime artifacts and the client SDK, without documentation.")
+for name in ("rpc.pb.h", "crypto.pb.h", "ProtocolVersion.h"):
+    assert installed(Path(cache["CMAKE_INSTALL_INCLUDEDIR"]) / "eyilprotocol" / name).is_file()
+for name in ("rpc.proto", "crypto.proto"):
+    assert installed(Path(datadir) / "eyil/proto" / name).is_file()
+print("Install manifest contains runtime artifacts and the client/protocol SDKs, without documentation.")
 if "BUILD_EYIL_DEV_TOOLS:BOOL=ON" in (build / "CMakeCache.txt").read_text():
-    bundle = stage / "usr/lib/eyil"
-    assert (stage / "usr/bin/eyil-client").is_file()
+    bundle = installed(Path(cache["CMAKE_INSTALL_LIBDIR"]) / "eyil")
+    assert installed(Path(cache["CMAKE_INSTALL_BINDIR"]) / "eyil-client").is_file()
     assert (bundle / "eyil-client").is_file()
     assert (bundle / "run").is_file()
     assert all(path.name in {"eyil-client", "run"} or ".so" in path.name for path in bundle.iterdir())
     subprocess.run([str(bundle / "run"), "--help"], check=True)
-    print("Installed container client starts from /usr/lib/eyil with its private libraries.")
+    print(f"Installed container client starts from {bundle} with its private libraries.")
 if "PLUGIN_EYILGATEWAY:BOOL=ON" in (build / "CMakeCache.txt").read_text():
     config_path = stage / "etc/WPEFramework/plugins/EyilGateway.json"
     config = json.loads(config_path.read_text())
@@ -90,10 +126,10 @@ if "PLUGIN_EYILGATEWAY:BOOL=ON" in (build / "CMakeCache.txt").read_text():
         {"service": "crypto", "callsign": selected_callsign}
     ]
     assert "cryptocallsign" not in config["configuration"]
-    library = stage / "usr/lib/wpeframework/plugins" / config["locator"]
+    library = installed("lib/wpeframework/plugins") / config["locator"]
     ctypes.CDLL(str(library), mode=os.RTLD_NOW)
     root = config["configuration"]["root"]
-    assert root["mode"] in {"Off", "Local"}
+    assert root["mode"] == "Off"
     implementation = library.parent / root["locator"]
     ctypes.CDLL(str(implementation), mode=os.RTLD_NOW)
     print("Installed EyilGateway wrapper and implementation libraries loaded successfully.")

@@ -32,9 +32,9 @@ A stock libzmq library causes activation to fail explicitly.
 
 ```sh
 bash build_dependencies.sh
-bash build.sh -DBUILD_EYIL_DEV_TOOLS=ON
-python3 scripts/run-tests.py --build-dir build --label L1
-python3 scripts/run-tests.py --build-dir build --label L2
+bash build.sh --preset dev
+ctest --preset l1
+ctest --preset l2
 DESTDIR="$PWD/rootfs/dev" cmake --install build
 ```
 
@@ -44,10 +44,18 @@ compatible ICrypto headers/bindings. Set `EYIL_CRYPTO_INCLUDE_DIR` to the SDK
 directory containing `interfaces/ICrypto.h` and matching `IConfiguration.h`,
 `Ids.h`, `Module.h` and `entservices_errorcodes.h`.
 
-For a development image, set `BUILD_EYIL_DEV_TOOLS=ON`. Production defaults to
-OFF. The install target installs `/usr/bin/eyil-client` and a self-contained
+For a development image, set `BUILD_EYIL_DEV_TOOLS=ON`. CMake defaults to OFF.
+The current Yocto integration recipe deliberately enables `dev-tools` until
+integration is complete; remove that PACKAGECONFIG feature for production. The install target installs `/usr/bin/eyil-client` and a self-contained
 runtime bundle in `/usr/lib/eyil`. The bundle includes a launcher,
-the client executable, its ELF interpreter and required libraries.
+the client executable, its ELF interpreter and required libraries. Sources live
+in `tools/`, separately from production runtime code in `src/`. The private
+library copies let the host-built CLI run in an app container with its own
+rootfs. Host package dependencies alone do not make those libraries available
+inside a container. The `run` launcher executes the bundled ELF interpreter with
+`--library-path` pointing at this directory; it does not activate plugins.
+The bundle can be removed once the app rootfs supplies compatible dependencies;
+its copied libraries are private and do not replace Yocto's rootfs providers.
 When Gateway is enabled, the same option also builds and installs
 `libWPEFrameworkCryptoTestBackend.so` in the Thunder plugin directory and
 `CryptoTestBackend.json` in its configuration directory. Both development artifacts

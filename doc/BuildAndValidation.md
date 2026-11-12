@@ -34,7 +34,8 @@ requires the [behavior tests in section 6.17](EyilGateway.md#617-implementation-
 
 #### Repository layout
 
-Public interfaces live in `apis/`; implementation lives in `src/`.
+Public interfaces live in `apis/`; production implementation lives in `src/`.
+The optional diagnostic client and CryptoTestBackend live in `tools/`.
 
 ```text
 apis/
@@ -49,11 +50,14 @@ src/
 cmake/
   EyilProtocol.cmake          Protocol generation, library and install rules
   EyilClientConfig.cmake.in   Installed client CMake package template
+  EyilProtocolConfig.cmake.in Installed shared C++ protocol package template
   eyilclient.pc.in            Installed client pkg-config template
   Coverage.cmake             Coverage configuration
   FindZeroMQ.cmake            ZeroMQ discovery
 CMakeLists.txt                Top-level build
-Tests/                       Test suites
+Tests/                       Test suites and fault-injection mocks
+tools/                       Optional diagnostic CLI and CryptoTestBackend
+CMakePresets.json             Native development and L1/L2 presets
 scripts/                     Build and validation utilities
 doc/                         Architecture and supporting material
 ```
@@ -62,8 +66,10 @@ The interface tree contains only public headers and schemas. Build rules stay
 outside it; generated Protobuf sources/headers are written to the build directory.
 The client keeps the public include path `eyilclient/EyilClient.h`. The build
 targets `EyilClient::EyilClient` and `EyilProtocol::EyilProtocol` are available
-inside this build. The installed client also exports `EyilClient::EyilClient`
-through `find_package(EyilClient CONFIG REQUIRED)` and provides `eyilclient.pc`.
+both inside this build and through the installed `EyilClient` and `EyilProtocol`
+CMake packages. The C client also provides `eyilclient.pc`. A C-only consumer of
+EyilClient does not need Protobuf headers; service consumers use the separate
+public C++ protocol package from the same SDK.
 
 <details>
 <summary>Build, installation, coverage and GitHub workflow details</summary>
@@ -109,14 +115,21 @@ building an adapter without Crypto support. The platform image supplies the
 Crypto plugin and required bindings. Client/protocol-only builds do not require
 ICrypto or the Crypto plugin.
 
+`BUILD_TESTING`, `RDK_SERVICES_L1_TEST` and `RDK_SERVICE_L2_TEST` default to OFF.
+The `dev` preset enables all three and the diagnostic tools; CI selects it
+explicitly. A normal product build therefore compiles no test executables.
+For a custom build directory, use `ctest --test-dir <dir> -L '^L1$'` or `'^L2$'`
+with `--output-on-failure --no-tests=error`. Add `--output-junit <file>` when a
+JUnit artifact is needed. Presets remain compatible with CMake 3.21.
+
 For a native SDK build, install the host development prerequisites, then run:
 
 ```sh
 bash build_dependencies.sh
-bash build.sh
+bash build.sh --preset dev
 source scripts/environment.sh
-python3 scripts/run-tests.py --build-dir build --label L1
-python3 scripts/run-tests.py --build-dir build --label L2
+ctest --preset l1
+ctest --preset l2
 bash scripts/check-install.sh build rootfs/all
 ```
 
@@ -130,10 +143,10 @@ EYIL_DEPS_DIR selects local dependency storage. EYIL_CONFIGURATION_INCLUDE_DIR
 can select the SDK include directory containing `interfaces/IConfiguration.h`
 when it is not found automatically.
 
-The implemented lifecycle contract supports `PLUGIN_EYILGATEWAY_MODE=Off`.
-The implementation destructor drains the runtime on final Release. `Local` is
-rejected in this version; remote destruction and library lifetime need separate
-validation. See [development and container validation](DevelopmentClient.md) for
+Gateway's generated configuration always uses in-process mode `Off`; there is
+no implementation-mode CMake option. The wrapper rejects a manually supplied
+remote mode. The implementation destructor drains the runtime on final Release;
+remote destruction and library lifetime need separate validation. See [development and container validation](DevelopmentClient.md) for
 the CLI, dev-rootfs bundle, startup-service selection and expected no-Crypto result.
 
 Select the Crypto callsign through
@@ -157,17 +170,36 @@ Use a CMake toolchain file and target dependency prefixes when cross compiling.
 Protobuf_PROTOC_EXECUTABLE must identify a host-runnable protoc. Cross-platform
 rootfs validation is still pending.
 
-Installation contains the shared libraries, `eyilclient/EyilClient.h`, client
-CMake/pkg-config metadata, enabled development executables and the generated
-Thunder plugin configuration. Both
-plugin libraries install to the Thunder plugin directory. The configuration
-uses org.rdk.EyilGateway, with autostart false by default. Consumers include the
-client header and link the imported `EyilClient::EyilClient` target, or use
-`pkg-config --cflags --libs eyilclient`. Protobuf schemas remain in
-`apis/proto` for service consumers to generate their own bindings. Documentation,
-patches, raw/generated protocol headers and test
-executables are not installed. License collection for images belongs to the
-packaging system.
+Installation contains the shared libraries, public client/protocol headers,
+CMake/pkg-config metadata, Protobuf schemas, enabled development executables
+and generated Thunder plugin configuration. Gateway and CryptoTestBackend
+plugins install under `lib/${STORAGE_DIRECTORY}/plugins`, matching Thunder R4's
+systempath even when ordinary libraries use `CMAKE_INSTALL_LIBDIR=lib64`.
+The configuration uses org.rdk.EyilGateway, with autostart false by default.
+Consumers include `eyilclient/EyilClient.h` and link `EyilClient::EyilClient`,
+or use `pkg-config --cflags --libs eyilclient`.
+
+The public `libeyilprotocol.so` owns the generated `rpc.proto` and `crypto.proto`
+bindings. Its SDK includes `rpc.pb.h`, `crypto.pb.h` and `ProtocolVersion.h` under
+`${includedir}/eyilprotocol`, plus `EyilProtocol::EyilProtocol` from
+`find_package(EyilProtocol CONFIG REQUIRED)`. C++ consumers, including Firebolt,
+link this shared target and must not compile another copy of these `.pb.cc`
+files into the same process. Use the same SDK's Protobuf version; the exported
+package requires the version used to build the generated bindings. Library
+SONAMEs remain unchanged: client ABI 0 and protocol ABI 2 are independent of
+project version 1.0.0 and envelope schema 1.
+
+Schemas install under `${datadir}/eyil/proto` for SDK tooling and consumers in
+other languages. Installing them is not an instruction to regenerate duplicate
+C++ bindings alongside `libeyilprotocol.so`. Yocto puts schemas, headers and
+CMake metadata in the development package/SDK, while shared libraries belong
+to runtime packages. Documentation, patches and test executables are not
+installed. License collection for images belongs to the packaging system.
+
+`check-install.sh` builds a consumer using only installed CMake packages and
+headers, with no includes from this repository's source or build tree. It also
+links a separate shared consumer library with hidden symbols and verifies that
+both consumers resolve the same RPC/Crypto descriptors and exchange a payload.
 
 An application with the installation prefix in its CMake search path needs only:
 
@@ -177,7 +209,19 @@ target_link_libraries(my_app PRIVATE EyilClient::EyilClient)
 ```
 
 The imported target supplies the client include directory and library location.
-Yocto places the header and CMake/pkg-config files in `eyil-secure-gateway-dev`;
+
+For a C++ service consumer such as Firebolt Crypto, also use the shared protocol
+bindings:
+
+```cmake
+find_package(EyilProtocol CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE EyilProtocol::EyilProtocol)
+```
+
+This target supplies the include path for `rpc.pb.h`, `crypto.pb.h` and
+`ProtocolVersion.h`, along with its Protobuf dependency.
+
+Yocto places the headers and CMake/pkg-config files in `eyil-secure-gateway-dev`;
 they are available to consumer builds through the recipe sysroot/SDK and are not
 required in the runtime image.
 
@@ -204,12 +248,13 @@ The test ICrypto performs deterministic fake operations, not cryptography.
 Container mounts, device credentials and remote Crypto access still require the
 separate device validation described in the architecture.
 
-L1 and L2 runners invoke CTest and emit summaries and JUnit reports.
+L1 and L2 use CTest directly; the development presets and check-l1/check-l2
+targets select their labels. CI and the check targets also write JUnit reports.
 Install-consumer checks cover compilation, linking and the Protobuf status
 contract. Runtime tests validate the client and Gateway flows described above.
 
 ```sh
-EYIL_BUILD_DIR=build-coverage bash build.sh -DENABLE_COVERAGE=ON
+EYIL_BUILD_DIR=build-coverage bash build.sh --preset dev -DENABLE_COVERAGE=ON
 source scripts/environment.sh
 python3 scripts/coverage.py --build-dir build-coverage
 ```
@@ -228,7 +273,7 @@ sanitized, so this build omits the development executable and the real-host
 Thunder test; run that test in the ordinary native build above.
 
 ```sh
-EYIL_BUILD_DIR=build-sanitize bash build.sh -DENABLE_COVERAGE=OFF \
+EYIL_BUILD_DIR=build-sanitize bash build.sh --preset dev -DENABLE_COVERAGE=OFF \
   -DBUILD_EYIL_DEV_TOOLS=OFF \
   '-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' \
   '-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer'

@@ -22,9 +22,9 @@ cmake_minimum_required(VERSION 3.21)
 project(eyil-secure-gateway VERSION 1.0.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
-include(CTest)
 include(CMakePackageConfigHelpers)
 include(services.cmake)
+include(CTest)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -53,6 +53,10 @@ if(PLUGIN_EYILGATEWAY)
 
     include(CmakeHelperFunctions)
 
+    # Thunder R4 systempath is independent of GNUInstallDirs/multilib.
+    string(TOLOWER "${NAMESPACE}" STORAGE_DIRECTORY)
+    set(EYIL_PLUGIN_INSTALL_DIR "lib/${STORAGE_DIRECTORY}/plugins")
+
     add_subdirectory(src/gateway)
 endif()
 
@@ -60,7 +64,7 @@ if(BUILD_EYIL_DEV_TOOLS)
     if(NOT BUILD_EYILCLIENT)
         message(FATAL_ERROR "Development tools require BUILD_EYILCLIENT")
     endif()
-    add_subdirectory(src/tools)
+    add_subdirectory(tools)
 endif()
 
 if(BUILD_TESTING)

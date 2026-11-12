@@ -53,14 +53,15 @@ jobs:
       - name: Build pinned SDK and runtime dependencies
         run: bash build_dependencies.sh
       - name: Build plugin, client and protocol
-        run: bash build.sh -DBUILD_EYIL_DEV_TOOLS=ON -DENABLE_COVERAGE=${{ inputs.coverage && 'ON' || 'OFF' }}
+        run: bash build.sh --preset dev -DENABLE_COVERAGE=${{ inputs.coverage && 'ON' || 'OFF' }}
       - name: Run selected test suites
         if: ${{ !inputs.coverage }}
         env:
           TEST_LABEL: ${{ inputs.label }}
         run: |
           source scripts/environment.sh
-          python3 scripts/run-tests.py --build-dir build --label "$TEST_LABEL"
+          ctest --test-dir build -L "$TEST_LABEL" --output-on-failure --no-tests=error \
+            --output-junit build/reports/junit.xml
       - name: Run coverage
         if: inputs.coverage
         env:

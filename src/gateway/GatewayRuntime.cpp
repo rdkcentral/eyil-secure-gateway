@@ -201,6 +201,36 @@ namespace Eyil
                 static_cast<long long>(elapsed));
     }
 
+    void GatewayRuntime::LogCleanupWait(Connection &connection, CleanupWait reason)
+    {
+        const unsigned bit = static_cast<unsigned>(reason);
+        if (connection.cleanupWaitsLogged & bit)
+            return;
+        connection.cleanupWaitsLogged |= bit;
+        const char *waitingOn = "cleanup_failure";
+        switch (reason)
+        {
+        case CleanupWait::Authentication:
+            waitingOn = "authentication";
+            break;
+        case CleanupWait::AcceptedWork:
+            waitingOn = "accepted_work";
+            break;
+        case CleanupWait::BufferAccess:
+            waitingOn = "buffer_access";
+            break;
+        case CleanupWait::WorkerCapacity:
+            waitingOn = "worker_capacity";
+            break;
+        case CleanupWait::CleanupFailure:
+            break;
+        }
+        LogScope scope({ connection.peer.lifetime, 0, connection.peer.uid });
+        log.Warning(Reason::CleanupWaiting,
+            "reason=cleanup_wait waiting_on=%s active_requests=%u workers=%u running=%u reserved=%u stopping=%u",
+            waitingOn, connection.active, workers, running, reserved, static_cast<unsigned>(stopping));
+    }
+
     bool GatewayRuntime::Schedule(const std::shared_ptr<Work> &work)
     {
         if (reserved + running >= workers)
@@ -326,7 +356,10 @@ namespace Eyil
                 connection.cleanupFinished = cleaned;
                 // A failed unlink keeps its record and quota. No backend notification replay.
                 if (!cleaned)
+                {
                     log.Error(Reason::Buffer, "cleanup_incomplete uid=%u", connection.peer.uid);
+                    LogCleanupWait(connection, CleanupWait::CleanupFailure);
+                }
             }
             else
             {
@@ -350,19 +383,30 @@ namespace Eyil
             auto connection = it->second;
             if (stopping)
                 Close(connection, false);
-            if (connection->closing && !connection->active && connection->authFinished)
+            if (connection->closing)
             {
-                if (connection->cleanupFinished)
+                if (!connection->authFinished)
+                    LogCleanupWait(*connection, CleanupWait::Authentication);
+                else if (connection->active)
+                    LogCleanupWait(*connection, CleanupWait::AcceptedWork);
+                else if (connection->cleanupFinished)
                 {
                     it = connections.erase(it);
                     StateChanged();
                     continue;
                 }
-                if (!connection->cleanupScheduled && buffers.Idle(connection->userId) && reserved + running < workers)
+                else if (!connection->cleanupScheduled)
                 {
-                    auto work = std::make_shared<Work>(Kind::Cleanup, connection);
-                    if (Schedule(work))
-                        connection->cleanupScheduled = true;
+                    if (!buffers.Idle(connection->userId))
+                        LogCleanupWait(*connection, CleanupWait::BufferAccess);
+                    else if (reserved + running >= workers)
+                        LogCleanupWait(*connection, CleanupWait::WorkerCapacity);
+                    else
+                    {
+                        auto work = std::make_shared<Work>(Kind::Cleanup, connection);
+                        if (Schedule(work))
+                            connection->cleanupScheduled = true;
+                    }
                 }
             }
             ++it;
@@ -415,6 +459,8 @@ namespace Eyil
                 Fatal("ROUTER bind failed");
                 return;
             }
+            // Interim accept-all deployment: apps have different UIDs and no shared
+            // Gateway group. Container mounts select access; 0666 also permits host peers.
             if (endpoint.rfind("ipc://", 0) == 0 && chmod(endpoint.substr(6).c_str(), 0666))
             {
                 Fatal("ROUTER endpoint permissions failed");

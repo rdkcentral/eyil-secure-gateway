@@ -341,9 +341,15 @@ Crypto, including locators, usages, import/export restrictions and sharing.
 ### 3.3 Container mounts and direct access
 
 The AC endpoint is `ipc:///tmp/app-eyil-gateway.ipc`. Thunder is trusted to run
-one Gateway instance. Container policy supplies the correct endpoint mount and
-access permissions, including exposure of the current socket after endpoint
-recreation. These are selected deployment assumptions, described in section
+one Gateway instance. The initial Gateway implementation explicitly applies
+mode `0666` to its socket after binding. This lets applications with different
+UIDs connect without a shared Gateway group; it also permits local host processes
+that can reach the path. This is an explicit part of interim accept-all admission,
+not app authorization. Container policy supplies the correct endpoint mount,
+including exposure of the current socket after endpoint recreation. A product
+that narrows socket permissions must also provide the required UID/GID or ACL
+access for every intended app; changing to `0600` or `0660` alone breaks those
+clients. These are selected deployment assumptions, described in section
 7.4; endpoint ownership and server identity are not open Gateway design topics.
 
 The AppManagers Legacy and RALF generators add the socket bind mount only when
@@ -409,7 +415,13 @@ or fallback protocol in the current schema. Library/package ABI versions and
 Thunder plugin metadata versions are separate concepts.
 
 Client and Gateway must use matching generated rpc.proto and crypto.proto
-definitions for the agreed schema.
+definitions for the agreed schema. C++ consumers such as Firebolt use the public
+`EyilProtocol::EyilProtocol` shared library and its installed generated headers.
+Do not compile a second copy of those bindings into the same process: both RPC
+and Crypto descriptors must have one shared implementation. EyilClient remains
+the transport API; the protocol library only supplies message types and codecs.
+The original ACs require the schemas and EyilClient, not independent C++ code
+generation by every consumer. See the [SDK contract](BuildAndValidation.md).
 
 **Agreed envelope handling:** EyilClient
 serializes/deserializes the outer RPC envelope, owns request IDs, sets
@@ -696,6 +708,14 @@ than the client password. See the
 The initial implementation emphasizes actionable warning/error diagnostics.
 Use the platform's existing logging facilities and a consistent reason code;
 no new metrics service, app API or mandatory request-tracing system is required.
+
+Connection teardown emits `WARNING reason=cleanup_wait` once per connection and
+waiting cause: authentication, accepted work, unresolved buffer access, worker
+capacity or failed final cleanup. Include connection/UID, active-request count,
+worker running/reserved counts and whether Gateway is stopping. Repeated I/O
+wakeups do not repeat the same warning. Existing category suppression still
+limits bursts across connections. This is event-driven diagnostics; it adds no
+periodic poll, cleanup replay or permission to free an unresolved lease.
 
 | Severity | Events and required context |
 | --- | --- |

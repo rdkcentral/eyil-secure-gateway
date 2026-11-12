@@ -12,6 +12,5 @@ target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_NAME=Plugin_CryptoTestB
 target_compile_options(${MODULE_NAME} PRIVATE -Wall -Wextra)
 eyil_enable_coverage(${MODULE_NAME})
 
-string(TOLOWER "${NAMESPACE}" _plugin_directory)
-install(TARGETS ${MODULE_NAME} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/${_plugin_directory}/plugins)
+install(TARGETS ${MODULE_NAME} LIBRARY DESTINATION ${EYIL_PLUGIN_INSTALL_DIR})
 write_config(PLUGINS ${PLUGIN_NAME} CLASSNAME CryptoTestBackend COMPONENT cryptotestbackend)

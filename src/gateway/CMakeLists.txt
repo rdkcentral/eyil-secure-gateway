@@ -41,9 +41,6 @@ if(NOT EYIL_CRYPTO_INCLUDE_DIR)
 endif()
 # IConfiguration and ICrypto must use the same entservices-apis Ids.h.
 set(EYIL_CONFIGURATION_INCLUDE_DIR "${EYIL_CRYPTO_INCLUDE_DIR}")
-if(NOT PLUGIN_EYILGATEWAY_MODE STREQUAL "Off")
-    message(FATAL_ERROR "The initial implementation supports only in-process mode Off")
-endif()
 add_library(EyilGatewayRuntime STATIC
     GatewayRuntime.cpp CryptoServiceAdapter.cpp SharedBuffers.cpp TransportIdentity.cpp)
 target_include_directories(EyilGatewayRuntime PUBLIC ${EYIL_CRYPTO_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
@@ -102,10 +99,8 @@ target_compile_options(${PLUGIN_IMPLEMENTATION} PRIVATE -Wall -Wextra)
 
 eyil_enable_coverage(${PLUGIN_IMPLEMENTATION})
 
-string(TOLOWER "${NAMESPACE}" _plugin_directory)
-
 install(TARGETS ${MODULE_NAME} ${PLUGIN_IMPLEMENTATION}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/${_plugin_directory}/plugins
+    LIBRARY DESTINATION ${EYIL_PLUGIN_INSTALL_DIR}
 )
 
 # Preserve the product's cache value so disabling development tools restores the

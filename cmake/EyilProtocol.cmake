@@ -34,21 +34,48 @@ add_library(EyilProtocol::EyilProtocol ALIAS eyilprotocol)
 set_target_properties(eyilprotocol PROPERTIES
     VERSION 2.0.0
     SOVERSION 2
-    EXPORT_NAME Protocol
+    EXPORT_NAME EyilProtocol
 )
 
 target_include_directories(eyilprotocol
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
         $<BUILD_INTERFACE:${EYIL_PROTO_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/eyilprotocol>
 )
 
-# Generated protocol headers are used inside this build. The installed client
-# exposes only its C header, without a public Protobuf SDK dependency.
-target_link_libraries(eyilprotocol PUBLIC $<BUILD_INTERFACE:protobuf::libprotobuf>)
+# One shared implementation of the generated C++ bindings per process. Consumers
+# link this target instead of compiling another copy of the same .pb.cc files.
+target_link_libraries(eyilprotocol PUBLIC protobuf::libprotobuf)
 
 install(TARGETS eyilprotocol
-    EXPORT EyilClientTargets
+    EXPORT EyilProtocolTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+install(FILES ${EYIL_PROTO_HEADERS} ${EYIL_PROTO_DIR}/ProtocolVersion.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eyilprotocol
+)
+install(FILES ${EYIL_PROTO_FILES}
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/eyil/proto
+)
+
+configure_package_config_file(${PROJECT_SOURCE_DIR}/cmake/EyilProtocolConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/EyilProtocolConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/EyilProtocol
+)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/EyilProtocolConfigVersion.cmake
+    VERSION 2.0.0
+    COMPATIBILITY SameMajorVersion
+)
+install(EXPORT EyilProtocolTargets
+    NAMESPACE EyilProtocol::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/EyilProtocol
+)
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/EyilProtocolConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/EyilProtocolConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/EyilProtocol
 )

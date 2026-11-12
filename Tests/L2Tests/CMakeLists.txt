@@ -19,9 +19,9 @@
 
 
 add_custom_target(check-l2
-    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/run-tests.py
-        --build-dir ${PROJECT_BINARY_DIR}
-        --label L2
+    COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${PROJECT_BINARY_DIR}
+        -L "^L2$" --output-on-failure --no-tests=error
+        --output-junit ${PROJECT_BINARY_DIR}/reports/l2-junit.xml
     VERBATIM
 )
 
@@ -45,7 +45,7 @@ if(TARGET EyilCryptoMock AND TARGET eyil-client)
         if(TARGET ${NAMESPACE}CryptoTestBackend)
             list(APPEND crypto_test_backend_arguments
                 --crypto-test-backend $<TARGET_FILE:${NAMESPACE}CryptoTestBackend>
-                --crypto-test-backend-configuration ${PROJECT_BINARY_DIR}/src/tools/CryptoTestBackend/config/CryptoTestBackend.json)
+                --crypto-test-backend-configuration ${PROJECT_BINARY_DIR}/tools/CryptoTestBackend/config/CryptoTestBackend.json)
         endif()
         add_test(NAME eyil-thunder-l2
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test-thunder-runtime.py

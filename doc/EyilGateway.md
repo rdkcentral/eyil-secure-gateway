@@ -2806,6 +2806,12 @@ sequenceDiagram
     end
 ```
 
+A retained connection that prevents teardown is diagnosed with the
+`cleanup_wait` warning defined in section 4.5. It identifies the wait cause and
+active work counts once per cause, without an idle timer or automatic cleanup
+retry. `cleanup_incomplete` remains an ERROR when finalization fails. Diagnostic
+output does not alter the requirement to retain unresolved backend access.
+
 #### ROUTER and context teardown
 
 Set ZMQ_LINGER=0 on all application-owned Gateway sockets when created.

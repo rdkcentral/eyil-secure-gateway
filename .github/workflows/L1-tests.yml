@@ -35,6 +35,9 @@ jobs:
       coverage: true
   client-only:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        libdir: [lib, lib64]
     steps:
       - uses: actions/checkout@v4
       - name: Host development dependencies
@@ -48,6 +51,6 @@ jobs:
       - name: Build and verify client without Thunder
         run: |
           cmake -S . -B build-client -G Ninja -DPLUGIN_EYILGATEWAY=OFF \
-            -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib
+            -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=${{ matrix.libdir }}
           cmake --build build-client --parallel 4
           bash scripts/check-install.sh build-client rootfs/client

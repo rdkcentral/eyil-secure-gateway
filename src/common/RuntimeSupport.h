@@ -362,6 +362,7 @@ namespace Eyil
         DroppedReply,
         Callback,
         Setup,
+        CleanupWaiting,
         Count
     };
 

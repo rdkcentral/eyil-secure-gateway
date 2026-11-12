@@ -19,9 +19,9 @@
 
 
 add_custom_target(check-l1
-    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/run-tests.py
-        --build-dir ${PROJECT_BINARY_DIR}
-        --label L1
+    COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${PROJECT_BINARY_DIR}
+        -L "^L1$" --output-on-failure --no-tests=error
+        --output-junit ${PROJECT_BINARY_DIR}/reports/l1-junit.xml
     VERBATIM
 )
 

@@ -20,12 +20,35 @@
 #include <ProtocolVersion.h>
 #include <eyilclient/EyilClient.h>
 #include <rpc.pb.h>
+#include <crypto.pb.h>
 
 #include <string>
+
+extern "C" const void *eyil_consumer_rpc_descriptor();
+extern "C" const void *eyil_consumer_crypto_descriptor();
+extern "C" bool eyil_consumer_decode(const char *data, size_t size);
 
 int main()
 {
     if (client_connect(nullptr, nullptr) != CLIENT_INVALID_ARGUMENT)
+    {
+        return 1;
+    }
+    if (eyil_consumer_rpc_descriptor() != RpcRequest::descriptor()
+        || eyil_consumer_crypto_descriptor() != CryptoRequest::descriptor())
+    {
+        return 1;
+    }
+    CryptoRequest crypto;
+    crypto.set_operation(CRYPTO_OPERATION_FLUSH_KEYS);
+    crypto.mutable_flush_keys();
+    RpcRequest request;
+    request.set_request_id(42);
+    request.set_service(RPC_SERVICE_CRYPTO);
+    request.set_schema_version(EYIL_RPC_SCHEMA_VERSION);
+    request.set_payload(crypto.SerializeAsString());
+    const auto encoded = request.SerializeAsString();
+    if (!eyil_consumer_decode(encoded.data(), encoded.size()))
     {
         return 1;
     }

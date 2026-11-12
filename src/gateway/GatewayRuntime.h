@@ -47,6 +47,15 @@ namespace Eyil
             Cleanup
         };
 
+        enum class CleanupWait : unsigned
+        {
+            Authentication = 1,
+            AcceptedWork = 2,
+            BufferAccess = 4,
+            WorkerCapacity = 8,
+            CleanupFailure = 16
+        };
+
         struct Work
         {
             explicit Work(Kind kind, std::shared_ptr<Connection> connection)
@@ -108,6 +117,7 @@ namespace Eyil
         void Lifecycle();
         void StateChanged(); // registry mutex held
         void LogWorkerWait(const Work &work, bool expired); // registry mutex held
+        void LogCleanupWait(Connection &connection, CleanupWait reason); // registry mutex held
 
         Diagnostics log;
         SharedBuffers buffers { log };

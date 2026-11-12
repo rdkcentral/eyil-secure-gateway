@@ -45,6 +45,7 @@ namespace Eyil
         bool authFinished = false;
         bool cleanupScheduled = false;
         bool cleanupFinished = false;
+        unsigned cleanupWaitsLogged = 0;
         unsigned active = 0;
         std::unordered_set<uint64_t> requests;
     };

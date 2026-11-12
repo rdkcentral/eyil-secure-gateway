@@ -21,30 +21,21 @@ cmake_minimum_required(VERSION 3.21)
 
 project(EyilInstalledConsumer LANGUAGES C CXX)
 
-set(EYIL_INSTALL_ROOT "" CACHE PATH "Root containing the staged usr directory")
-set(EYIL_BUILD_DIR "" CACHE PATH "Build directory containing generated protocol headers")
 find_package(EyilClient CONFIG REQUIRED)
+find_package(EyilProtocol CONFIG REQUIRED)
 
 add_executable(eyil-c-consumer main.c)
-
 target_link_libraries(eyil-c-consumer PRIVATE EyilClient::EyilClient)
 
-find_package(Protobuf 3.15 REQUIRED MODULE)
-find_library(EYIL_PROTOCOL_LIBRARY eyilprotocol
-    PATHS "${EYIL_INSTALL_ROOT}/usr/lib" NO_DEFAULT_PATH REQUIRED)
+# Model a Firebolt library with hidden symbols in the application's process.
+# Both sides use the installed shared bindings, never generated .pb.cc copies.
+add_library(eyil-sdk-consumer SHARED protocol-library.cpp)
+set_target_properties(eyil-sdk-consumer PROPERTIES
+    CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+target_compile_features(eyil-sdk-consumer PRIVATE cxx_std_17)
+target_link_libraries(eyil-sdk-consumer PRIVATE EyilProtocol::EyilProtocol)
 
 add_executable(eyil-protocol-consumer protocol.cpp)
-
 target_compile_features(eyil-protocol-consumer PRIVATE cxx_std_17)
-
-# Protocol headers are build inputs, not installed SDK artifacts.
-target_include_directories(eyil-protocol-consumer PRIVATE
-    "${EYIL_BUILD_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../apis/proto")
-
-target_link_libraries(eyil-protocol-consumer
-    PRIVATE
-        "${EYIL_PROTOCOL_LIBRARY}"
-        EyilClient::EyilClient
-        protobuf::libprotobuf
-)
+target_link_libraries(eyil-protocol-consumer PRIVATE
+    EyilClient::EyilClient EyilProtocol::EyilProtocol eyil-sdk-consumer)

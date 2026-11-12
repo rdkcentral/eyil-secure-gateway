@@ -18,6 +18,7 @@
 ###
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/reports")
 
 # Register separate scenarios so failures name the violated contract.
 function(eyil_test_cases target label)

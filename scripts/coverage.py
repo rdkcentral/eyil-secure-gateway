@@ -67,12 +67,15 @@ def main():
         counter.unlink()
     result = subprocess.run(
         [
-            sys.executable,
-            str(root / "scripts/run-tests.py"),
-            "--build-dir",
+            "ctest",
+            "--test-dir",
             str(build_dir),
-            "--label",
+            "-L",
             args.label,
+            "--output-on-failure",
+            "--no-tests=error" if tests else "--no-tests=ignore",
+            "--output-junit",
+            str(report_dir / "junit.xml"),
         ],
         check=False,
     )

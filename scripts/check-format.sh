@@ -27,10 +27,18 @@ python3 scripts/validate-files.py
 python3 -m black --check scripts
 python3 -m yamllint .github .clang-format .yamllint.yml
 mapfile -d '' sources < <(git ls-files -c -o --exclude-standard -z -- '*.h' '*.cpp' '*.c' '*.proto')
-if (( ${#sources[@]} )); then
-    clang-format --dry-run --Werror "${sources[@]}"
+existing_sources=()
+for source in "${sources[@]}"; do
+    if [[ -f "$source" ]]; then
+        existing_sources+=("$source")
+    fi
+done
+if (( ${#existing_sources[@]} )); then
+    clang-format --dry-run --Werror "${existing_sources[@]}"
 fi
 mapfile -d '' scripts < <(git ls-files -c -o --exclude-standard -z -- '*.sh')
 for script in "${scripts[@]}"; do
-    bash -n "$script"
+    if [[ -f "$script" ]]; then
+        bash -n "$script"
+    fi
 done

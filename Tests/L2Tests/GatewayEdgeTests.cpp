@@ -395,6 +395,19 @@ namespace
         } finish { f, stopped };
 
         CHECK(stopped.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
+        Eventually([&] { return !FindLog("reason=cleanup_wait waiting_on=accepted_work").empty(); });
+        const auto warning = FindLog("reason=cleanup_wait waiting_on=accepted_work");
+        CHECK(warning.find(" WARNING ") != std::string::npos);
+        CHECK(warning.find("connection=") != std::string::npos && warning.find("stopping=1") != std::string::npos);
+        CHECK(warning.find("active_requests=") != std::string::npos);
+        // Unrelated wakeups must neither repeat the warning nor create a timer.
+        for (unsigned n = 0; n < 3; ++n)
+        {
+            const auto polls = PollObservation::calls[0].load();
+            PollObservation::Advance(0);
+            Eventually([&] { return PollObservation::calls[0] > polls; });
+        }
+        CHECK(f.gateway.Log().Total(Eyil::Reason::CleanupWaiting) == 1);
         if (expire)
         {
             PollObservation::Advance(10001);
