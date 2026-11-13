@@ -19,8 +19,7 @@ limitations under the License.
 
 # CryptoTestClient: development build and container smoke test
 
-The implementation lives in `src/clientlib` and `src/gateway`; public headers
-and Protobuf stay in `apis`. No acceptance-criteria text is changed.
+Contract requirements: [SDK-01 Public interfaces and build targets](../openspec/specs/sdk-installation/spec.md#requirement-sdk-01-public-interfaces-and-build-targets).
 
 `CryptoTestClient`, in [`tools/CryptoTestClient`](../tools/CryptoTestClient),
 demonstrates integrating EyilClient with the shared Protobuf bindings: constructing
@@ -29,6 +28,8 @@ and decoding responses. It also checks normal and error paths against Gateway
 with or without the development CryptoTestBackend plugin.
 
 ## Build and install
+
+Contract requirements: [SDK-04 Optional tests and development tools](../openspec/specs/sdk-installation/spec.md#requirement-sdk-04-optional-tests-and-development-tools).
 
 `build_dependencies.sh` prepares the pinned native Thunder SDK, the selected
 `topic/crypto` headers and patched libzmq 4.3.4. The dependency build enables
@@ -50,54 +51,14 @@ compatible ICrypto headers/bindings. Set `EYIL_CRYPTO_INCLUDE_DIR` to the SDK
 directory containing `interfaces/ICrypto.h` and matching `IConfiguration.h`,
 `Ids.h`, `Module.h` and `entservices_errorcodes.h`.
 
-For a development image, set `BUILD_EYIL_DEV_TOOLS=ON`. CMake defaults to OFF.
-The current Yocto integration recipe deliberately enables `dev-tools` until
-integration is complete; remove that PACKAGECONFIG feature for production.
-The install target installs `/usr/bin/CryptoTestClient`. It uses the system ELF loader
-and libraries in their normal runtime locations. No private library bundle,
-loader copy or launcher is installed. Sources live in `tools/`, separately from
-production runtime code in `src/`.
-When Gateway is enabled, the same option also builds and installs
-`libWPEFrameworkCryptoTestBackend.so` in the Thunder plugin directory and
-`CryptoTestBackend.json` in its configuration directory. Both development artifacts
-belong to the Yocto `eyil-secure-gateway-tools` package. With development tools
-disabled, neither the CLI nor CryptoTestBackend is built or installed. A standalone
-client build with Gateway disabled continues to require no Thunder SDK and
-does not build CryptoTestBackend.
-Yocto's shared-library dependency analysis supplies the required runtime packages,
-including EyilClient, EyilProtocol, Protobuf, ZeroMQ and their dependencies.
-Each package owns its libraries; normal stripping/debug splitting applies.
-The CLI requires those compatible libraries inside the container as well as on
-the host. A container with a separate rootfs must install or expose them through
-its platform configuration. Host installation alone does not satisfy that case.
-
 ## Build integration outside the component repositories
 
-The product recipe must build/install EyilGateway and EyilClient, apply
-`doc/zmq_connection_lifetime.patch` to the image's libzmq, and supply the selected
-ICrypto headers. Native bootstrap artifacts are not target-image libraries.
-
-The startup-services recipe installs an explicit optional service list. Keep
-Eyil in that list so the common target requests it through `Wants`, not `Requires`:
+Contract requirements: [SDK-02 Compatible build and runtime dependencies](../openspec/specs/sdk-installation/spec.md#requirement-sdk-02-compatible-build-and-runtime-dependencies),
+[SDK-05 In-process plugin and optional startup integration](../openspec/specs/sdk-installation/spec.md#requirement-sdk-05-in-process-plugin-and-optional-startup-integration).
 
 ```bitbake
 THUNDER_OPTIONAL_STARTUP_SERVICES ?= "wpeframework-eyilgateway.service"
 ```
-
-EyilGateway starts independently through Thunder's optional service target.
-It does not require RuntimeManager or the `/tmp/ai2managers` marker; RuntimeManager
-does not require EyilGateway. Create the application container after the socket
-appears when that application needs Gateway access.
-Gateway binds and accepts valid clients even if Crypto is missing; backend RPCs
-report `RPC_STATUS_INTERNAL`. The production default Crypto callsign is empty.
-When development tools and Gateway are enabled, an empty CMake callsign produces
-`org.rdk.CryptoTestBackend` in `configuration.backends`; an explicitly configured callsign
-is preserved. The CMake cache value stays empty, so switching development tools
-off restores the production default. Set the `crypto` entry in
-`configuration.backends` when a real backend is installed. Do not
-substitute the existing `org.rdk.Cryptography` plugin for `org.rdk.Crypto`.
-Crypto startup ordering is the product's responsibility when real Crypto is
-included. The component changes do not modify any Yocto layer or source revision.
 
 ## Container mount
 
@@ -288,6 +249,11 @@ and its recipe are unchanged here; manual activation above is sufficient.
 
 ## L1/L2 implementation evidence
 
+Contract requirements: [GL-01 Wrapper and implementation ownership](../openspec/specs/gateway-lifecycle/spec.md#requirement-gl-01-wrapper-and-implementation-ownership),
+[GL-05 Admission cutoff and graceful drain](../openspec/specs/gateway-lifecycle/spec.md#requirement-gl-05-admission-cutoff-and-graceful-drain),
+[GL-06 Socket and context teardown](../openspec/specs/gateway-lifecycle/spec.md#requirement-gl-06-socket-and-context-teardown),
+[SDK-05 In-process plugin and optional startup integration](../openspec/specs/sdk-installation/spec.md#requirement-sdk-05-in-process-plugin-and-optional-startup-integration).
+
 L1 exercises the host-UID quota shared across connections, ownership rejection,
 overflow-safe region checks, concurrent allocation, deferred release and scoped
 adapter references. A separate C consumer checks the installed public API.
@@ -314,13 +280,3 @@ Gateway. Missing-backend log suppression is checked separately from intentional
 protocol/buffer validation errors. Its L1 tests cover session isolation, fixed replies, XOR round trips, signature
 verification, overflow/range/overlap errors and rejected zero-sized, oversized,
 symlink, FIFO and missing files.
-
-The initial implementation supports `configuration.root.mode=Off`. The wrapper's
-final IConfiguration Release invokes the implementation destructor, which drains
-accepted work and joins owned threads before releasing its retained IShell.
-No additional lifecycle interface exists. Local mode remains unsupported until
-remote destruction and library lifetime have been validated.
-An unreturning backend call or uncertain remote buffer access cannot be forcibly
-cancelled; the backend-completion and authentication-progress boundaries in the
-architecture remain applicable. Container/Dobby validation follows on the new
-image; native L2 is not a substitute for that test.

@@ -1,0 +1,6 @@
+# Copyright 2026 RDK Management
+# SPDX-License-Identifier: Apache-2.0
+
+schema: spec-driven
+created: 2026-11-12
+skip_specs: true

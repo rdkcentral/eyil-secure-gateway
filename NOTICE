@@ -2,3 +2,9 @@ This component contains software that is Copyright (c) 2026 RDK Management.
 
 This component is licensed under the Apache License, Version 2.0.
 See LICENSE for the full license text.
+
+The generated OpenSpec workflow skills in .agents/skills/openspec-*/SKILL.md
+and the .agents/skills/.openspec-target registration come from OpenSpec 2.0.0
+(https://github.com/Fission-AI/OpenSpec), licensed under the MIT License.
+Copyright (c) 2024 OpenSpec Contributors.
+See openspec/LICENSE.OpenSpec for the upstream license text.

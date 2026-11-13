@@ -59,7 +59,20 @@ def main():
                 json.loads(text)
             except ValueError as error:
                 errors.append(f"{name}: {error}")
-        elif name not in {"LICENSE", "NOTICE"}:
+        elif (
+            path.parent.parent == root / ".agents/skills"
+            and path.parent.name.startswith("openspec-")
+            and path.name == "SKILL.md"
+        ):
+            # Preserve generated upstream skills; their notice is in NOTICE.
+            if "\nlicense: MIT\n" not in text[:1800]:
+                errors.append(f"{name}: missing OpenSpec MIT license declaration")
+        elif name not in {
+            "LICENSE",
+            "NOTICE",
+            "openspec/LICENSE.OpenSpec",
+            ".agents/skills/.openspec-target",
+        }:
             if "Copyright 2026 RDK Management" not in text[:1800]:
                 errors.append(f"{name}: missing licensing header")
     if errors:

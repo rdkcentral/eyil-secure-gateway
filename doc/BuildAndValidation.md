@@ -19,11 +19,11 @@ limitations under the License.
 
 # Eyil Secure Gateway build and validation guide
 
-This is a required part of the [architecture and implementation specification](EyilSecureGateway.md).
-Read its original ACs, common protocol/error/logging rules and gaps with this guide.
-Section numbers are shared across the specification; client sections are in
-[EyilClient.md](EyilClient.md), Gateway sections in [EyilGateway.md](EyilGateway.md),
-and build/CI details in [BuildAndValidation.md](BuildAndValidation.md).
+This guide complements the [canonical capability specs](SpecificationMap.md#capability-index).
+Read their full detailed contracts with the diagrams, rationale and procedures here.
+Original ACs and open decisions remain in [EyilSecureGateway.md](EyilSecureGateway.md).
+Section numbers and source anchors are preserved for navigation; the
+[source map](SpecificationMap.md) covers every original section.
 
 - [6.18 Build and repository validation reference](#618-build-and-repository-validation-reference)
 
@@ -34,8 +34,12 @@ requires the [behavior tests in section 6.17](EyilGateway.md#617-implementation-
 
 #### Repository layout
 
+Contract requirements: [SDK-01 Public interfaces and build targets](../openspec/specs/sdk-installation/spec.md#requirement-sdk-01-public-interfaces-and-build-targets).
+
 Public interfaces live in `apis/`; production implementation lives in `src/`.
 The optional diagnostic client and CryptoTestBackend live in `tools/`.
+Optional [OpenSpec workflows](OpenSpec.md) support GitHub Copilot;
+their CLI is not required to build, install or run this component.
 
 ```text
 apis/
@@ -62,40 +66,16 @@ scripts/                     Build and validation utilities
 doc/                         Architecture and supporting material
 ```
 
-The interface tree contains only public headers and schemas. Build rules stay
-outside it; generated Protobuf sources/headers are written to the build directory.
-The client keeps the public include path `eyilclient/EyilClient.h`. The build
-targets `EyilClient::EyilClient` and `EyilProtocol::EyilProtocol` are available
-both inside this build and through the installed `EyilClient` and `EyilProtocol`
-CMake packages. The C client also provides `eyilclient.pc`. A C-only consumer of
-EyilClient does not need Protobuf headers; service consumers use the separate
-public C++ protocol package from the same SDK.
-
 <details>
 <summary>Build, installation, coverage and GitHub workflow details</summary>
 
 #### Build, install and validation
 
-Required tools: CMake 3.21+, Ninja, a C/C++ compiler, Protobuf 3.15+ development
-files and a host-runnable protoc, ZeroMQ development files, and Python 3.9+.
-Building the plugin additionally requires Thunder Core/COM/Plugins, ThunderTools and the
-matching IConfiguration and ICrypto headers in the SDK. Obtain ICrypto from
-entservices-apis branch topic/crypto as specified in section 6.7. Out-of-process
-use requires compatible proxy/stubs for every crossed interface, including
-ICrypto when Crypto is remote. Gateway currently supports in-process mode Off:
-its final IConfiguration release invokes the implementation destructor, which
-drains the runtime before releasing IShell. Future Local mode requires a verified
-remote destruction/unload contract for IConfiguration. No additional lifecycle
-interface is introduced. Do not mix headers and bindings from incompatible releases.
-
-For Gateway runtime builds and transport L2 tests, use **libzmq 4.3.4 with the
-included [connection-lifetime patch](zmq_connection_lifetime.patch)**,
-ENABLE_DRAFTS=ON and matching consumer headers
-with ZMQ_BUILD_DRAFT_API. Section 6.14 defines the required metadata, monitor and
-guarded-send contract. Finding an arbitrary ZeroMQ 4.3+ package is insufficient
-to establish Gateway compatibility. Client/protocol-only builds can use a
-supported stock ZeroMQ 4.3+ package; those builds do not validate the Gateway
-extension. Product builds must link and load the same compatible dependency.
+Contract requirements: [SDK-02 Compatible build and runtime dependencies](../openspec/specs/sdk-installation/spec.md#requirement-sdk-02-compatible-build-and-runtime-dependencies),
+[SDK-04 Optional tests and development tools](../openspec/specs/sdk-installation/spec.md#requirement-sdk-04-optional-tests-and-development-tools),
+[SDK-05 In-process plugin and optional startup integration](../openspec/specs/sdk-installation/spec.md#requirement-sdk-05-in-process-plugin-and-optional-startup-integration),
+[CY-01 Configured backend list and availability](../openspec/specs/crypto-integration/spec.md#requirement-cy-01-configured-backend-list-and-availability),
+[SDK-03 Installed artifacts and shared binding ownership](../openspec/specs/sdk-installation/spec.md#requirement-sdk-03-installed-artifacts-and-shared-binding-ownership).
 
 Gateway startup must probe downstream option 10001 and pass the bounded,
 isolated IPC self-test in
@@ -109,15 +89,6 @@ a private directory under IShell::VolatilePath(). With the loaded dependency pin
 and the behavioral checks retained in L2/CI, a later change can remove the startup
 exchange while keeping the inexpensive option-10001 and monitor-v2 capability checks.
 
-With PLUGIN_EYILGATEWAY enabled, ICrypto headers are a required build input:
-configuration must report a missing SDK/API dependency instead of silently
-building an adapter without Crypto support. The platform image supplies the
-Crypto plugin and required bindings. Client/protocol-only builds do not require
-ICrypto or the Crypto plugin.
-
-`BUILD_TESTING`, `RDK_SERVICES_L1_TEST` and `RDK_SERVICE_L2_TEST` default to OFF.
-The `dev` preset enables all three and the diagnostic tools; CI selects it
-explicitly. A normal product build therefore compiles no test executables.
 For a custom build directory, use `ctest --test-dir <dir> -L '^L1$'` or `'^L2$'`
 with `--output-on-failure --no-tests=error`. Add `--output-junit <file>` when a
 JUnit artifact is needed. Presets remain compatible with CMake 3.21.
@@ -143,19 +114,6 @@ EYIL_DEPS_DIR selects local dependency storage. EYIL_CONFIGURATION_INCLUDE_DIR
 can select the SDK include directory containing `interfaces/IConfiguration.h`
 when it is not found automatically.
 
-Gateway's generated configuration always uses in-process mode `Off`; there is
-no implementation-mode CMake option. The wrapper rejects a manually supplied
-remote mode. The implementation destructor drains the runtime on final Release;
-remote destruction and library lifetime need separate validation. See [development and container validation](DevelopmentClient.md) for
-the CLI, container runtime dependencies, startup-service selection and expected no-Crypto result.
-
-Select the Crypto callsign through
-`-DPLUGIN_EYILGATEWAY_CRYPTO_CALLSIGN=org.rdk.Crypto` or the product-specific
-value. Its default is empty, allowing transport and local buffer operations
-without a backend. Section 6.7 defines how BitBake forwards that setting to the
-`crypto` entry in configuration.backends. It is independent of Gateway's own
-callsign and implementation mode.
-
 The client and protocol can be built without Thunder:
 
 ```sh
@@ -169,36 +127,6 @@ bash scripts/check-install.sh build-client rootfs/client
 Use a CMake toolchain file and target dependency prefixes when cross compiling.
 Protobuf_PROTOC_EXECUTABLE must identify a host-runnable protoc. Cross-platform
 rootfs validation is still pending.
-
-Installation contains the shared libraries, public client/protocol headers,
-CMake/pkg-config metadata, Protobuf schemas, enabled development executables
-and generated Thunder plugin configuration. Gateway and CryptoTestBackend
-plugins install under `lib/${STORAGE_DIRECTORY}/plugins`, matching Thunder R4's
-systempath even when ordinary libraries use `CMAKE_INSTALL_LIBDIR=lib64`.
-The configuration uses org.rdk.EyilGateway, with autostart false by default.
-Consumers include `eyilclient/EyilClient.h` and link `EyilClient::EyilClient`,
-or use `pkg-config --cflags --libs eyilclient`.
-
-The public `libeyilprotocol.so` owns the generated `rpc.proto` and `crypto.proto`
-bindings. Its SDK includes `rpc.pb.h`, `crypto.pb.h` and `ProtocolVersion.h` under
-`${includedir}/eyilprotocol`, plus `EyilProtocol::EyilProtocol` from
-`find_package(EyilProtocol CONFIG REQUIRED)`. C++ consumers, including Firebolt,
-link this shared target and must not compile another copy of these `.pb.cc`
-files into the same process. Use the same SDK's Protobuf version; the exported
-package requires the version used to build the generated bindings. Library
-Both shared libraries and their CMake package versions use `PROJECT_VERSION`;
-their SONAMEs use `PROJECT_VERSION_MAJOR`. With project version 1.0.0, this
-produces `libeyilclient.so.1` and `libeyilprotocol.so.1`. Consumers of the earlier
-development SONAMEs (`.so.0` and `.so.2`) must be rebuilt and relinked together
-with this update; do not add compatibility symlinks. Envelope schema 1 remains
-independent of library versioning.
-
-Schemas install under `${datadir}/eyil/proto` for SDK tooling and consumers in
-other languages. Installing them is not an instruction to regenerate duplicate
-C++ bindings alongside `libeyilprotocol.so`. Yocto puts schemas, headers and
-CMake metadata in the development package/SDK, while shared libraries belong
-to runtime packages. Documentation, patches and test executables are not
-installed. License collection for images belongs to the packaging system.
 
 `check-install.sh` builds a consumer using only installed CMake packages and
 headers, with no includes from this repository's source or build tree. It also
@@ -224,10 +152,6 @@ target_link_libraries(my_app PRIVATE EyilProtocol::EyilProtocol)
 
 This target supplies the include path for `rpc.pb.h`, `crypto.pb.h` and
 `ProtocolVersion.h`, along with its Protobuf dependency.
-
-Yocto places the headers and CMake/pkg-config files in `eyil-secure-gateway-dev`;
-they are available to consumer builds through the recipe sysroot/SDK and are not
-required in the runtime image.
 
 L1 scenarios are registered individually in CTest. The suites cover:
 

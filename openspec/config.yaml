@@ -1,0 +1,65 @@
+# Copyright 2026 RDK Management
+# SPDX-License-Identifier: Apache-2.0
+
+schema: spec-driven
+
+githubCopilot:
+  cloudAgent: false
+
+context: |
+  Write repository artifacts in English, retaining OpenSpec headings and SHALL/MUST keywords.
+  Eyil is a C++17 project: a Thunder R4 Gateway, an independent C client API,
+  and shared Protobuf bindings. OpenSpec is a host development tool only.
+
+  Read openspec/specs/ for the canonical agreed contracts, organized by capability.
+  doc/SpecificationMap.md maps every original source section to its requirement anchors
+  or retained guidance. Detailed contract clauses/tables in each spec are normative;
+  scenarios illustrate those contracts without replacing their exceptions.
+  doc/EyilSecureGateway.md retains the unchanged original ACs and the canonical open
+  decisions in sections 7.1-7.2. doc/EyilClient.md and doc/EyilGateway.md retain diagrams,
+  rationale and verification guidance. doc/BuildAndValidation.md and
+  doc/DevelopmentClient.md retain build/use procedures and diagnostic-tool behavior.
+  Change the affected capability specs through the normal change workflow and update
+  guide links/diagrams when needed; do not create a second normative prose copy in doc/.
+  Do not silently rewrite original ACs, promote proposals/TODOs to decisions, or claim
+  untested behavior works. Runtime contracts describe agreed behavior, not proof that
+  the implementation currently satisfies every requirement.
+
+  Public interfaces belong in apis/, production code in src/, tests in Tests/, and
+  optional examples in tools/. C++ consumers share EyilProtocol bindings from the SDK.
+  Retain Thunder R4 conventions: autostart, explicit AddRef/Release for interfaces,
+  no smart-pointer ownership of COM interfaces, and no new internal lifecycle interface.
+  Prefer explicit error results in production code; handle external-library exceptions
+  at their boundary. Preserve socket ownership, asynchronous completion and buffer lifetimes.
+
+  Keep README.md empty. Add the RDK copyright and Apache-2.0 notice to authored artifacts
+  and change metadata. Generated OpenSpec skills retain their upstream MIT license.
+  Do not commit or push unless the user explicitly requests it. Changes to other component
+  or meta-layer repositories must be identified separately from this repository's work.
+
+rules:
+  proposal:
+    - State the problem, intended behavior, affected AC/doc sections and compatibility impact.
+    - Distinguish existing behavior, agreed changes and unresolved decisions.
+  specs:
+    - Link requirements to original ACs and source-map entries; preserve original AC wording in doc/.
+    - Include applicable success, failure, concurrency and ownership scenarios.
+    - Do not resolve documented integration TODOs by assumption.
+  design:
+    - Describe affected thread/socket ownership, lifecycle, error mapping and deployment contracts.
+    - Record only relevant tradeoffs and decisions; reference existing diagrams instead of copying them.
+  tasks:
+    - Include implementation, affected documentation and proportionate validation tasks.
+    - Use the existing L1/L2 suites and install-consumer checks where the change affects their contracts.
+    - Keep target-device validation separate from native tests; record checks that cannot be run.
+
+operations:
+  apply:
+    guidance:
+      - Follow the authorized scope and retain unrelated user changes.
+      - Run applicable checks from doc/BuildAndValidation.md and record actual results.
+      - Validate changed OpenSpec artifacts and repository formatting before completion.
+  archive:
+    guidance:
+      - Keep canonical capability specs, source-map links and affected guide diagrams consistent.
+      - Report incomplete tasks or unavailable validation rather than marking them complete.

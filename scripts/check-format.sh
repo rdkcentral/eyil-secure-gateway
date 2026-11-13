@@ -25,7 +25,7 @@ source scripts/environment.sh
 export PATH="$eyil_deps_dir/python/bin:$PATH"
 python3 scripts/validate-files.py
 python3 -m black --check scripts
-python3 -m yamllint .github .clang-format .yamllint.yml
+python3 -m yamllint .github .clang-format .yamllint.yml openspec
 mapfile -d '' sources < <(git ls-files -c -o --exclude-standard -z -- '*.h' '*.cpp' '*.c' '*.proto')
 existing_sources=()
 for source in "${sources[@]}"; do

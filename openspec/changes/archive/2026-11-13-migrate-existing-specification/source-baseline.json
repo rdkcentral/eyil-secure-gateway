@@ -1,0 +1,331 @@
+{
+  "description": "Read-only worktree snapshot for migration planning; not a claim of completed extraction.",
+  "captured_date": "2026-11-12",
+  "base_commit": "9046714db6f52a655025f100516258a41957eb5a",
+  "source_scope": "Every file currently under doc/; includes existing uncommitted OpenSpec setup.",
+  "hash_algorithm": "SHA-256 of original UTF-8 file bytes or inclusive line spans, retaining original line endings.",
+  "files": [
+    {
+      "path": "doc/EyilSecureGateway.md",
+      "sha256": "a51c341af7228efd695769bdd767d97f265a0e35014149e3e35bbf37d5253156",
+      "lines": 910,
+      "coverage_rows": 29,
+      "headings": 28
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "sha256": "a326e8b30d5838c59a951a311098297dace3533997917714f8fafee6a34d9ee3",
+      "lines": 1987,
+      "coverage_rows": 45,
+      "headings": 44
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "sha256": "62c3ffaa959eadb0a6d8a13a672360b88bb5a16f3dbc3499b5ca574bd6fa2ac8",
+      "lines": 3049,
+      "coverage_rows": 54,
+      "headings": 53
+    },
+    {
+      "path": "doc/BuildAndValidation.md",
+      "sha256": "2bb2055beaaaab5e48106e91a1f9b055045ea86e5e36026df14bfbede5dc1b62",
+      "lines": 349,
+      "coverage_rows": 7,
+      "headings": 6
+    },
+    {
+      "path": "doc/DevelopmentClient.md",
+      "sha256": "785aab3ade39aa4fd7e3d3115166eef837dce4879a104b2ffeeebbaf6bf19254",
+      "lines": 326,
+      "coverage_rows": 11,
+      "headings": 10
+    },
+    {
+      "path": "doc/OpenSpec.md",
+      "sha256": "659efad36291b0fb9bfc527546a9dd6ca42fd3a4ffcf8677218058f168213ae7",
+      "lines": 123,
+      "coverage_rows": 6,
+      "headings": 5
+    },
+    {
+      "path": "doc/zmq_connection_lifetime.patch",
+      "sha256": "1a32f6df8838286ad8d0e2d2ca08da2acf883a42bef202a8debd65e4b07f9e47",
+      "lines": 1421,
+      "coverage_rows": 15,
+      "diff_blocks": 14
+    }
+  ],
+  "protected_acceptance_criteria": [
+    {
+      "path": "doc/EyilSecureGateway.md",
+      "section": "2.1 AC1 - Eyil Gateway Plugin",
+      "start_line": 86,
+      "end_line": 104,
+      "sha256": "132d010d0b29de4d0853b4caf4e29bef302b785c93ed62b0201c6042c2ef7b3d"
+    },
+    {
+      "path": "doc/EyilSecureGateway.md",
+      "section": "2.2 AC2 - Eyil Client Lib",
+      "start_line": 105,
+      "end_line": 116,
+      "sha256": "91f7dd85d44f941931cd351c99f37e3d658a1a3db1bf8cb777a00242187c8244"
+    },
+    {
+      "path": "doc/EyilSecureGateway.md",
+      "section": "2.3 AC2 - Firebolt Crypto Client Library",
+      "start_line": 117,
+      "end_line": 125,
+      "sha256": "5fd289318a1c5e9342a1080c78fedbbb76a5bfbde633c4736234c77cbfcc94d6"
+    }
+  ],
+  "protected_mermaid_blocks": [
+    {
+      "path": "doc/EyilSecureGateway.md",
+      "heading": "3.1 RDK deployment",
+      "start_line": 259,
+      "end_line": 305,
+      "sha256": "172e4637cbf72c10779b733cebfcb7ae13219b9ad478dd68453215e0a56d9778"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "5.2 Component organization and ownership",
+      "start_line": 115,
+      "end_line": 157,
+      "sha256": "80754adce05714835d8f1bf89aa7514ae4ef9ee18ebd59eb0390b350d0e69c9a"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "Shared submission diagram (F1\u2013F6)",
+      "start_line": 306,
+      "end_line": 361,
+      "sha256": "758780a0d456c8a33e3a9736276926dafd68ec8eb51215fc854874509f8e33ca"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "5.3 General routing: concurrent requests on one connection",
+      "start_line": 387,
+      "end_line": 435,
+      "sha256": "b124172b6696c7a9f8022f263db6e01713a57bb52e2f66e5cc35380f22223a69"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "Connection sequence",
+      "start_line": 775,
+      "end_line": 858,
+      "sha256": "bee112467e9535cfdb05483faf7a1998b69c5961ea0bdacaa14a60acfc2b3220"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "Submission and synchronous wait",
+      "start_line": 943,
+      "end_line": 984,
+      "sha256": "26c8c0ce00e1498f31d05b8621d9361d224b9fb917fd505c0745b208574f5104"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "Shared nonblocking send and receive pipeline",
+      "start_line": 1033,
+      "end_line": 1085,
+      "sha256": "a749b732397403d9d9701fbaa5adb860a0c994d3063899bea99ea5451ee73400"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "Synchronous timeout, disconnect and response races",
+      "start_line": 1162,
+      "end_line": 1206,
+      "sha256": "68b4ad5eea006eb8680783d056f0539428be83f6e9031c129eb52c952c0bcf8c"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "5.7 client_send_request_async()",
+      "start_line": 1254,
+      "end_line": 1290,
+      "sha256": "891f569a0996f221724c958a41c033e553ecf4e61c5d030268eeb4d1cc12763c"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "Defined wire request and error response",
+      "start_line": 1350,
+      "end_line": 1393,
+      "sha256": "f8c0aec5fd6f16162c3dab6e3437977191328b538867e32c51cad5fa9c17a9fb"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "5.9 client_send_request_string_async() \u2014 Gateway returns unsupported service",
+      "start_line": 1433,
+      "end_line": 1470,
+      "sha256": "1dad073fe7cc642228ecd1162368628cce7acf652e7aba2958e8032dcb171c5b"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "5.10 client_free_response()",
+      "start_line": 1492,
+      "end_line": 1503,
+      "sha256": "d1c5b76c5c39471705638fb053a37acb98cadcedf80590a102f92cbb8b5d68a9"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "5.11 client_register_notifications()",
+      "start_line": 1518,
+      "end_line": 1525,
+      "sha256": "4404f9271039206ab8fbeb58bd3f8aa391d432e20fa4fa9feef58893516efe1a"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "5.12 client_unregister_notifications()",
+      "start_line": 1543,
+      "end_line": 1550,
+      "sha256": "5d91702e6f72c5976dc5fe7b7c248791e9b7a78ac1d3c5c034f59685b7c8829c"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "Results and callback behavior during explicit close",
+      "start_line": 1596,
+      "end_line": 1632,
+      "sha256": "361ac98d8900981973378822bac6b128e56971ada77a7469c00e56a21eb0509b"
+    },
+    {
+      "path": "doc/EyilClient.md",
+      "heading": "Terminal connection loss and explicit reconnect",
+      "start_line": 1797,
+      "end_line": 1827,
+      "sha256": "2e253c84683091df447061dfd66940602301b3272e07ed0f683047ee50c364ee"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Gateway component and API-call overview",
+      "start_line": 94,
+      "end_line": 142,
+      "sha256": "ab7bc48c56ae11e63a12118781197158669197b9e432f0c7c57f3f09cd279a61"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "6.4 Startup and partial-start failure",
+      "start_line": 435,
+      "end_line": 474,
+      "sha256": "985303b8d13ad7eb52effec671f56310433620af82b3e9b304d02dd9b6078614"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "6.5 ZAP, interim identity and future AppManager lookup",
+      "start_line": 516,
+      "end_line": 572,
+      "sha256": "ee84d07c0a3fca67923511a37c30c614d6616fb87045e1ff11c5858d8954bc2a"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "6.6 Request ingress, dispatch and response delivery",
+      "start_line": 657,
+      "end_line": 731,
+      "sha256": "e5b1335246eace0640f014eb4665344c11ea4d02b1a56d4d6f14a4503a91504a"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Interface ownership",
+      "start_line": 956,
+      "end_line": 980,
+      "sha256": "8f840ca9af8ec3d9e69f63b33960f63f5c719f3a26faac3055755e83674aa635"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "6.9 Non-shared-memory operations",
+      "start_line": 1082,
+      "end_line": 1112,
+      "sha256": "8904b15e22211c20192171b9f25f4e46d697387026325d7aa5ff8b5f54192748"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "6.11 AllocateSharedBuffer and client mapping",
+      "start_line": 1437,
+      "end_line": 1498,
+      "sha256": "b3301b585aea8a21485c97f567fa015fab10b1a3da959a49f50b5cb8130c1a52"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "6.12 Shared-memory operations: common backend boundary",
+      "start_line": 1597,
+      "end_line": 1659,
+      "sha256": "62f362b5c6f45cd6ff78bcb7f6b2d374b5a4fc2c206308092c3f1c14838a92eb"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Release request sequence",
+      "start_line": 1742,
+      "end_line": 1782,
+      "sha256": "66bfd66bbef058d4931ffa19d938eab2bf67074d0c7bb13fa7f8c5798d6e7edf"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Release request sequence",
+      "start_line": 1786,
+      "end_line": 1822,
+      "sha256": "54e62f57ccec19a0e14e68c4ac2beffd3967acfc9822936dd941c16f7d61d419"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Release request sequence",
+      "start_line": 1826,
+      "end_line": 1848,
+      "sha256": "3cfd9a625b1f398b987fa07e2cee24a9aac9cad90a7c8d6fe3dd32350eef3fd3"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Failure sequence without a shared transport identity",
+      "start_line": 2018,
+      "end_line": 2055,
+      "sha256": "f77ee3c90b868c10238182a3e022f66b5c8b3a7d858f4d019ee6a69ec8ff73db"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Selected sequence with the connection-lifetime extension",
+      "start_line": 2094,
+      "end_line": 2130,
+      "sha256": "174d60b18be6367cad921639bb94a75cef46dd207a08f3f31a0f1fcd704fbb79"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Event-driven connection cleanup",
+      "start_line": 2337,
+      "end_line": 2399,
+      "sha256": "f932f12892fb78720b9f13ce5b7e1c0808b7b51fc43033c04646f909a6c478d5"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Intended process-freeze behavior and prerequisites",
+      "start_line": 2459,
+      "end_line": 2489,
+      "sha256": "d6ccc731efb371f1e245374089c28fc25b3ea09184960e005453de127e793336"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "6.15 On-demand Crypto lookup and invocation failures",
+      "start_line": 2573,
+      "end_line": 2614,
+      "sha256": "b579548e8ad5e25b4e6d06a8d3baf1a02497822c57afb103fb47b8d8985bdb54"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "States and explicit stop ownership",
+      "start_line": 2654,
+      "end_line": 2669,
+      "sha256": "e7afda085d9bbd9653bec7ffd526b1b169f186fbcecb4489c950f115d9234656"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Deactivation sequence",
+      "start_line": 2739,
+      "end_line": 2807,
+      "sha256": "fa394e23431a8dd18daa978c17a652cad14c34c42fffad0c7be1f59b6e58aa5f"
+    },
+    {
+      "path": "doc/EyilGateway.md",
+      "heading": "Reactivation and fresh startup after a crash",
+      "start_line": 2868,
+      "end_line": 2885,
+      "sha256": "89944eeb35e1bfe75594803c36c02d197825b1c49ec0c4ce628d65ec28a2fdd8"
+    }
+  ],
+  "total_source_lines": 8165,
+  "total_coverage_rows": 167,
+  "protected_patch": "doc/zmq_connection_lifetime.patch"
+}
