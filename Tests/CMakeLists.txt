@@ -33,7 +33,7 @@ endfunction()
 # contain neither injection switches nor additional test/control interfaces.
 function(eyil_test_faults target)
     target_sources(${target} PRIVATE ${PROJECT_SOURCE_DIR}/Tests/support/Faults.cpp)
-    foreach(symbol open openat ftruncate fallocate fchown fchmod fstat unlinkat
+    foreach(symbol open openat ftruncate fallocate fchown fchmod fstat unlinkat setfsuid setfsgid
             _ZNSt6chrono3_V212steady_clock3nowEv)
         target_link_options(${target} PRIVATE "-Wl,--wrap=${symbol}")
     endforeach()

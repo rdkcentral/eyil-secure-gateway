@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <sys/types.h>
 
 namespace EyilTest
 {
@@ -30,11 +31,18 @@ namespace EyilTest
         Chown,
         Chmod,
         Stat,
-        Unlink
+        Unlink,
+        FilesystemUid,
+        FilesystemGid,
+        RestoreFilesystemUid,
+        RestoreFilesystemGid
     };
     extern thread_local Syscall failingCall;
     extern thread_local int failureError, failuresLeft, allocationCountdown;
     extern thread_local bool simulateOwnership;
+    extern thread_local bool simulateFilesystemIdentity;
+    extern thread_local uid_t filesystemUid, createUid, unlinkUid, ownershipUid, directoryUid;
+    extern thread_local gid_t filesystemGid, createGid, unlinkGid;
     extern std::atomic<long long> clockAdvanceMs;
 
     struct FailSystemCall

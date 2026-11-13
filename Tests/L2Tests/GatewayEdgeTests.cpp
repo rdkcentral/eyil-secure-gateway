@@ -16,6 +16,7 @@
 #include "../support/MockCrypto.h"
 #include "GatewayRuntime.h"
 #include <future>
+#include <memory>
 using namespace EyilTest;
 
 namespace ReplyFault
@@ -31,6 +32,7 @@ namespace ResponseFault
 {
     std::atomic<uint64_t> request { 0 };
     std::atomic<uint64_t> parsed { 0 };
+    std::atomic<unsigned> parsedCount { 0 };
     std::atomic<uint64_t> admissionAllocation { 0 };
     std::atomic<unsigned> attempts { 0 };
     std::atomic<int> failures { 0 };
@@ -137,6 +139,7 @@ extern "C"
         const auto *request = dynamic_cast<const RpcRequest *>(message);
         if (result && request)
         {
+            ++ResponseFault::parsedCount;
             auto target = ResponseFault::admissionAllocation.load();
             if (target && request->request_id() == target
                 && ResponseFault::admissionAllocation.compare_exchange_strong(target, 0))
@@ -190,6 +193,7 @@ namespace
             ReplyFault::countSends = false;
             ResponseFault::request = 0;
             ResponseFault::parsed = 0;
+            ResponseFault::parsedCount = 0;
             ResponseFault::admissionAllocation = 0;
             ResponseFault::attempts = 0;
             ResponseFault::failures = 0;
@@ -492,6 +496,114 @@ namespace
         CHECK(p.Read().request_id() == 41);
     }
 
+    void WorkerBurstSaturation()
+    {
+        constexpr unsigned workers = 4;
+        constexpr unsigned peerCount = 4;
+        constexpr unsigned burstPerPeer = 250;
+        constexpr unsigned timedOut = 16;
+        Fixture f(workers);
+        std::array<std::unique_ptr<Peer>, peerCount> peers;
+        std::array<std::set<uint64_t>, peerCount> received;
+        for (auto &peer : peers)
+            peer = std::make_unique<Peer>(f);
+        // Finish authentication before occupying all lifecycle/request capacity.
+        Eventually([&] { return f.crypto.SessionCount() == peerCount; });
+        for (auto &peer : peers)
+        {
+            auto ready = Request(burstPerPeer + 3);
+            ready.set_service(RPC_SERVICE_UNSPECIFIED);
+            peer->Send(ready.SerializeAsString());
+            CHECK(peer->Read().status() == RPC_STATUS_UNSUPPORTED_SERVICE);
+        }
+        const auto initiallyParsed = ResponseFault::parsedCount.load();
+
+        f.crypto.block = true;
+        for (auto &peer : peers)
+            peer->Send(Request(1).SerializeAsString());
+        Eventually([&] { return f.crypto.entered == workers; });
+
+        // Keep each route below its default HWM. This stresses worker capacity,
+        // not dropped replies caused by intentionally saturated output queues.
+        for (uint64_t id = 2; id <= burstPerPeer + 1; ++id)
+            for (auto &peer : peers)
+                peer->Send(Request(id).SerializeAsString());
+
+        std::array<zmq_pollitem_t, peerCount> items {};
+        for (unsigned i = 0; i < peerCount; ++i)
+            items[i] = { peers[i]->socket.Get(), 0, ZMQ_POLLIN, 0 };
+        const auto readResponse = [&](RpcStatus expected)
+        {
+            CHECK(zmq_poll(items.data(), items.size(), 3000) > 0);
+            for (unsigned i = 0; i < peerCount; ++i)
+            {
+                if (!(items[i].revents & ZMQ_POLLIN))
+                    continue;
+                const auto response = peers[i]->Read();
+                CHECK(response.schema_version() == 1 && response.service() == RPC_SERVICE_CRYPTO);
+                CHECK(response.status() == expected);
+                CHECK(response.request_id() >= 1 && response.request_id() <= burstPerPeer + 1);
+                CHECK(received[i].insert(response.request_id()).second);
+                if (expected == RPC_STATUS_INTERNAL)
+                {
+                    CHECK(response.request_id() != 1); // Running calls must not expire.
+                    CHECK(response.payload().empty());
+                }
+                else
+                {
+                    CryptoResponse crypto;
+                    CHECK(crypto.ParseFromString(response.payload()));
+                    CHECK(crypto.error() == CRYPTO_ERROR_NONE && crypto.has_generate_random());
+                    CHECK(crypto.generate_random().random_value() == std::string(16, '\x5a'));
+                }
+                return;
+            }
+            CHECK(false); // Poll indicated an event but no complete response was readable.
+        };
+
+        for (unsigned expired = 0; expired < timedOut; ++expired)
+        {
+            Eventually([&] { return f.gateway.Log().Total(Eyil::Reason::WorkerWaiting) == expired + 1; });
+            CHECK(f.crypto.entered == workers);
+            // Exactly one request beyond the running calls has been parsed.
+            // The rest remain in libzmq while ROUTER reception is paused.
+            CHECK(ResponseFault::parsedCount == initiallyParsed + workers + expired + 1);
+            PollObservation::Advance(clockAdvanceMs.load() + 10001);
+            readResponse(RPC_STATUS_INTERNAL);
+            CHECK(f.gateway.Log().Total(Eyil::Reason::WorkerExhausted) == expired + 1);
+            CHECK(f.crypto.entered == workers); // Expired work never reaches Crypto.
+        }
+
+        Eventually([&] { return f.gateway.Log().Total(Eyil::Reason::WorkerWaiting) == timedOut + 1; });
+        CHECK(ResponseFault::parsedCount == initiallyParsed + workers + timedOut + 1);
+        CHECK(PollObservation::paused > 0);
+        CHECK(FindLog("reason=worker_pool_wait").find("workers=4 running=4 reserved=0") != std::string::npos);
+        CHECK(FindLog("reason=worker_pool_exhausted").find(" ERROR ") != std::string::npos);
+
+        // Do not advance the clock again. Unread requests get their own admission
+        // deadline when received, rather than inheriting the first request's age.
+        f.crypto.Unblock();
+        constexpr unsigned submitted = workers + peerCount * burstPerPeer;
+        for (unsigned remaining = 0; remaining < submitted - timedOut; ++remaining)
+            readResponse(RPC_STATUS_OK);
+        for (const auto &ids : received)
+            CHECK(ids.size() == burstPerPeer + 1);
+        CHECK(f.crypto.entered == submitted - timedOut);
+        CHECK(f.gateway.Log().Total(Eyil::Reason::WorkerExhausted) == timedOut);
+
+        // A fresh operation on every connection proves recovery after the burst.
+        for (unsigned i = 0; i < peerCount; ++i)
+        {
+            peers[i]->Send(Request(burstPerPeer + 2).SerializeAsString());
+            const auto reply = peers[i]->Read();
+            CHECK(reply.request_id() == burstPerPeer + 2 && reply.status() == RPC_STATUS_OK);
+        }
+        CHECK(f.crypto.entered == submitted - timedOut + peerCount);
+        CHECK(zmq_poll(items.data(), items.size(), 30) == 0); // No late/duplicate completion.
+        std::cout << "SATURATION workers=" << workers << " peers=" << peerCount << " burst=" << peerCount * burstPerPeer
+                  << " timed_out=" << timedOut << " recovery_requests=" << peerCount << '\n';
+    }
+
     void DropReply(int error, bool body, bool admission = false)
     {
         Fixture f;
@@ -649,7 +761,8 @@ namespace
 int main(int argc, char **argv)
 {
     return RunCases(argc, argv,
-        { { "idle-poll", IdlePoll }, { "worker-logs", WorkerLogs }, { "envelopes", Envelopes },
+        { { "idle-poll", IdlePoll }, { "worker-logs", WorkerLogs },
+            { "worker-burst-saturation", WorkerBurstSaturation }, { "envelopes", Envelopes },
             { "framing-drain", Framing }, { "duplicate-id", DuplicateInFlight },
             { "disconnect-before-request", DisconnectBeforeRequest }, { "route-reuse", RouteReuse },
             { "drain-replies", [] { DrainReplies(false, false); } },

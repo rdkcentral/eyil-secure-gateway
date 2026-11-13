@@ -72,6 +72,9 @@ namespace Eyil
         {
         }
 
+        // Mutating operations (including lease completion/cleanup) run on the
+        // Gateway-owned private pool. Filesystem credential scopes must never
+        // execute on transport, ZAP/monitor or framework/global-pool threads.
         Allocation Allocate(const std::shared_ptr<Connection> &owner, uint32_t size);
         CryptoError Release(const std::shared_ptr<Connection> &owner, const std::string &id);
         CryptoError TryUse(const std::shared_ptr<Connection> &owner, const std::string &id, const Region *regions,
@@ -93,6 +96,7 @@ namespace Eyil
             std::string name;
             std::string path;
             uint32_t uid = 0;
+            uint32_t gid = 0;
             uint32_t size = 0;
             LogContext cleanupContext;
             Fd directory;

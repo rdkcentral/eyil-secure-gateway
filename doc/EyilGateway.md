@@ -613,6 +613,12 @@ part of the selected path/name-based ICrypto integration.
 
 ### 6.11 AllocateSharedBuffer and client mapping
 
+Container-owned tmpfs creation and cleanup use
+[SM-10 Scoped private-worker filesystem identity](../openspec/specs/shared-memory/spec.md#requirement-sm-10-scoped-private-worker-filesystem-identity).
+The host's root UID may be unmapped in the container's tmpfs user namespace;
+the private worker uses the trusted mapped UID/GID and restores its filesystem
+credentials and capability state before returning to other work.
+
 Contract requirements: [SM-04 Exclusive allocation and backing-space reservation](../openspec/specs/shared-memory/spec.md#requirement-sm-04-exclusive-allocation-and-backing-space-reservation).
 
 Coverage: **AC1.9–AC1.11; AC2-Client.5; AC2-Firebolt.1–AC2-Firebolt.2**. No ICrypto call is involved.
@@ -1519,6 +1525,7 @@ routing and lifecycle work without deferring the ICrypto dependency:
 | L1 release and cleanup failures | Idle and deferred cleanup failures log ERROR and keep the ID unavailable with retained cleanup/accounting; accepted release is not retroactively failed and produces no second response; ENOENT permits remaining cleanup; partial allocation rollback failure retains a private record without publishing an ID |
 | L1 release response loss and deadlines | Response preparation/send failure and a client timeout do not undo accepted release; expiry of the current release request before Dispatch creates no releasePending state. Deferred cleanup has no forced destruction deadline and does not depend on response delivery |
 | L2 transport | Real DEALER/ROUTER IPC, ZAP metadata, reverse-order completion and simultaneous sync/async callers |
+| L2 worker burst saturation | Four authenticated connections send 1,000 additional requests while all four workers are blocked in mock Crypto. Advance the test clock through 16 separate admission deadlines; assert INTERNAL replies, one parsed waiting request, paused ROUTER reception and no backend execution of expired requests. Unblock workers, validate every remaining response and per-connection ID exactly once, then send fresh requests on every connection. This uses simulated deadlines alongside the separate real-time ten-second exhaustion test; it does not impose FIFO/fairness or an application request queue |
 | L2 backend-independent admission | Empty/default backend configuration and absent configured Crypto still allow startup and handshake. Sync/async backend RPCs deliver RPC_STATUS_INTERNAL; local allocate/release and unsupported string responses remain available. Missing backend does not emit a connection-loss callback; duplicate backend service configuration is rejected |
 | L2 connect readiness | CONNECTED alone cannot complete connect; HANDSHAKE_SUCCEEDED returns CLIENT_OK; explicit rejection returns CLIENT_AUTH_FAILED; unresolved/stalled attempt reaches CLIENT_TIMEOUT; each failure wakes the waiter and rolls back resources; no startup outcome invokes a callback, and immediate subsequent loss cannot expose an unpublished handle |
 | L2 explicit reconnect | Verify RECONNECT_IVL=-1, IMMEDIATE=1 and LINGER=0; after loss and Gateway return, no automatic handshake or old queued send occurs; explicit close/new connect creates an empty client runtime and new Gateway session, rejects old buffer IDs and never delivers old replies to new requests |

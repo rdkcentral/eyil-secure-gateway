@@ -115,6 +115,22 @@ The detailed [contract](#contract-sm-09-buffer-service-error-mapping) is normati
 - **WHEN** a request has an overlapping input region, a busy buffer or an exhausted shared UID quota
 - **THEN** Gateway returns RPC_STATUS_OK with the operation-matching CryptoResponse and respectively INVALID_PARAMETERS, INVALID_SESSION_STATE or OPERATION_FAILED; no rejected use reaches Crypto.
 
+### Requirement: SM-10 Scoped private-worker filesystem identity
+
+Gateway SHALL use the trusted mapped host UID/GID for buffer creation and unlinking, with the complete credential scope defined below.
+
+The detailed [contract](#contract-sm-10-scoped-private-worker-filesystem-identity) is normative for this requirement.
+
+#### Scenario: Container-owned tmpfs
+
+- **WHEN** a container's tmpfs rejects creation by unmapped host root
+- **THEN** a private Gateway worker creates/preallocates the object using the authenticated peer's mapped filesystem identity and restores its original credentials before publication or ICrypto.
+
+#### Scenario: Failure and deferred cleanup
+
+- **WHEN** preparation fails or a pending release becomes eligible for cleanup on another private worker
+- **THEN** each filesystem scope restores that worker's saved identity and capabilities; retained allocation UID/GID and directory references support cleanup without reopening procfs.
+
 ## Detailed contracts
 
 These clauses and tables are normative parts of the linked requirements.
@@ -332,9 +348,13 @@ its response, which follows the infrastructure fallback in [section 4.2](../../.
 
 After exclusive creation, set the logical size with ftruncate(), then call
 `fallocate(fd, 0, 0, capacity)` for the complete allocation before publishing
-the buffer ID/name or handing the object to the app. Perform preallocation while
-the new object still has Gateway-only access, then apply the agreed peer
-ownership/permissions and verify the final size. ftruncate alone does not reserve
+the buffer ID/name or handing the object to the app. Create using the mapped
+peer filesystem UID/GID and mode 0600 as specified in SM-10; keep the random name
+unpublished during preparation. Restore Gateway credentials, verify the agreed
+peer ownership/permissions and final size, then publish. The peer UID owns the
+file from creation, so initialization relies on the existing trusted-app
+cooperation contract rather than claiming enforced Gateway-only access.
+ftruncate alone does not reserve
 tmpfs space; this step detects insufficient backing capacity during allocation
 instead of leaving Crypto to discover it while accessing a mapped buffer.
 See [fallocate](https://man7.org/linux/man-pages/man2/fallocate.2.html).
@@ -611,6 +631,46 @@ or invalidate active leases. Roll back partial reservations. If constructing
 a service-error response itself fails, report RPC_STATUS_INTERNAL only if a
 correlated fallback can be prepared before any send attempt; otherwise log/drop.
 Neither fallback nor response loss undoes side effects or releases active memory.
+
+### Contract: SM-10 Scoped private-worker filesystem identity
+
+Implementation: [SharedBuffers.cpp](../../../src/gateway/SharedBuffers.cpp).
+This namespace compatibility fix refines the allocation and cleanup flows in
+[section 6.11](../../../doc/EyilGateway.md#611-allocatesharedbuffer-and-client-mapping)
+and [section 6.13](../../../doc/EyilGateway.md#613-releasesharedbuffer-and-conflicting-buffer-operations).
+Original AC1.9–AC1.12 and the public API remain unchanged.
+
+- Filesystem credential changes run only on Gateway-owned private-pool workers.
+  ROUTER, ZAP, monitor and Thunder framework/global-pool threads do not enter
+  these scopes. Do not change effective/real/saved process UID/GID or join a
+  container user namespace in a Thunder thread.
+- Resolve/open the peer's `/proc/<pid>/root/dev/shm` directory before switching
+  filesystem identity. Retain its FD. Use the trusted host UID/GID from ZAP,
+  never a caller-provided ID or the container's internal UID 0.
+- Save the executing thread's filesystem UID/GID and capability sets. Apply
+  `setfsgid()` followed by `setfsuid()` and explicitly query both to detect
+  silent rejection. Run exclusive creation, truncate and full preallocation
+  inside the scope through the retained directory FD.
+- Restore the saved filesystem UID before GID, restore the exact saved
+  capability state, and verify restoration on every exit, including failed
+  entry and preparation errors. Preserve the operation errno. Restore before
+  ownership verification, publication, response processing, ICrypto or worker
+  reuse. Perform no unrelated application/framework calls inside a normal scope.
+- A detected entry failure creates no object and uses the existing
+  `RPC_STATUS_OK` / `CRYPTO_ERROR_OPERATION_FAILED` allocation path. Rollback
+  retains its existing accounting/ownership rules. Recheck restoration once on
+  failure; if it still cannot be verified, log an unrecoverable error and stop
+  the process rather than return a worker with an unknown identity to its pool.
+- Retain both UID and GID in each allocation record. Explicit release,
+  allocation rollback, deferred finalization and disconnect cleanup use that
+  identity only around `unlinkat()` on the retained directory FD. Restore before
+  closing descriptors, updating accounting or logging an ordinary cleanup error.
+  Failed cleanup keeps the allocation charge and record; no forced destruction
+  or new retry policy is introduced.
+- Gateway retains allocation lifecycle ownership and the descriptor. Filesystem
+  ownership remains the app UID/GID with mode 0600. Input/output cooperation,
+  per-host-UID quotas, connection ownership and backend access rules remain in
+  force; a credential scope does not cancel Crypto or revoke app mappings.
 
 ## Related contracts and open decisions
 

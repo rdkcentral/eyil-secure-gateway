@@ -18,6 +18,7 @@
 #include <cstdarg>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/fsuid.h>
 #include <unistd.h>
 
 namespace EyilTest
@@ -25,6 +26,9 @@ namespace EyilTest
     thread_local Syscall failingCall = Syscall::None;
     thread_local int failureError = EIO, failuresLeft = 0, allocationCountdown = -1;
     thread_local bool simulateOwnership = false;
+    thread_local bool simulateFilesystemIdentity = false;
+    thread_local uid_t filesystemUid = geteuid(), createUid = -1, unlinkUid = -1, ownershipUid = -1, directoryUid = -1;
+    thread_local gid_t filesystemGid = getegid(), createGid = -1, unlinkGid = -1;
     std::atomic<long long> clockAdvanceMs { 0 };
 
     bool Fail(Syscall call)
@@ -98,9 +102,49 @@ extern "C"
     int __real_fchmod(int, mode_t);
     int __real_fstat(int, struct stat *);
     int __real_unlinkat(int, const char *, int);
+    int __real_setfsuid(uid_t);
+    int __real_setfsgid(gid_t);
+
+    int __wrap_setfsuid(uid_t uid)
+    {
+        using namespace EyilTest;
+        const bool simulated = simulateFilesystemIdentity || simulateOwnership;
+        const uid_t previous = simulated ? filesystemUid : static_cast<uid_t>(__real_setfsuid(-1));
+        if (uid == static_cast<uid_t>(-1))
+            return previous;
+        const auto call = uid == geteuid() && previous != uid ? Syscall::RestoreFilesystemUid : Syscall::FilesystemUid;
+        if (Fail(call))
+            return previous; // Linux setters return the old ID even on rejection.
+        if (simulated)
+        {
+            filesystemUid = uid;
+            return previous;
+        }
+        return __real_setfsuid(uid);
+    }
+
+    int __wrap_setfsgid(gid_t gid)
+    {
+        using namespace EyilTest;
+        const bool simulated = simulateFilesystemIdentity || simulateOwnership;
+        const gid_t previous = simulated ? filesystemGid : static_cast<gid_t>(__real_setfsgid(-1));
+        if (gid == static_cast<gid_t>(-1))
+            return previous;
+        const auto call = gid == getegid() && previous != gid ? Syscall::RestoreFilesystemGid : Syscall::FilesystemGid;
+        if (Fail(call))
+            return previous;
+        if (simulated)
+        {
+            filesystemGid = gid;
+            return previous;
+        }
+        return __real_setfsgid(gid);
+    }
 
     int __wrap_open(const char *path, int flags, ...)
     {
+        if (flags & O_DIRECTORY)
+            EyilTest::directoryUid = __wrap_setfsuid(-1);
         if (EyilTest::Fail(EyilTest::Syscall::Open))
             return -1;
         mode_t mode = 0;
@@ -116,6 +160,8 @@ extern "C"
 
     int __wrap_openat(int fd, const char *path, int flags, ...)
     {
+        EyilTest::createUid = __wrap_setfsuid(-1);
+        EyilTest::createGid = __wrap_setfsgid(-1);
         if (EyilTest::Fail(EyilTest::Syscall::OpenAt))
             return -1;
         mode_t mode = 0;
@@ -141,6 +187,7 @@ extern "C"
 
     int __wrap_fchown(int fd, uid_t uid, gid_t gid)
     {
+        EyilTest::ownershipUid = __wrap_setfsuid(-1);
         if (EyilTest::Fail(EyilTest::Syscall::Chown))
             return -1;
         return EyilTest::simulateOwnership ? 0 : __real_fchown(fd, uid, gid);
@@ -158,6 +205,8 @@ extern "C"
 
     int __wrap_unlinkat(int fd, const char *path, int flags)
     {
+        EyilTest::unlinkUid = __wrap_setfsuid(-1);
+        EyilTest::unlinkGid = __wrap_setfsgid(-1);
         return EyilTest::Fail(EyilTest::Syscall::Unlink) ? -1 : __real_unlinkat(fd, path, flags);
     }
 

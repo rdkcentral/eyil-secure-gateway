@@ -32,7 +32,7 @@ The [libzmq patch](zmq_connection_lifetime.patch) remains unchanged.
 | [gateway-routing](../openspec/specs/gateway-routing/spec.md) | 7 | AC1.1,6–8 |
 | [rpc-protocol](../openspec/specs/rpc-protocol/spec.md) | 5 | AC1.8; AC2-Client.5; AC2-Firebolt.2 |
 | [sdk-installation](../openspec/specs/sdk-installation/spec.md) | 5 | AC2-Client.1; AC2-Firebolt.2 |
-| [shared-memory](../openspec/specs/shared-memory/spec.md) | 9 | AC1.9–12 |
+| [shared-memory](../openspec/specs/shared-memory/spec.md) | 10 | AC1.9–12 |
 
 AC traceability does not amend the original ACs or assert that every implementation
 already complies. The thread-wording interpretation and current string-service
@@ -241,6 +241,12 @@ limitation remain explicit in [section 2.4](EyilSecureGateway.md#24-design-decis
 | ZP-015 | [diff --git a/tests/test_connection_lifetime.cpp b/tests/test_connection_lifetime.cpp](zmq_connection_lifetime.patch) | 938–1421 | Protected verbatim: dependency patch | Retained source (no separate contract copy) |
 
 ## Reading and maintenance
+
+Post-migration refinement:
+[SM-10 Scoped private-worker filesystem identity](../openspec/specs/shared-memory/spec.md#requirement-sm-10-scoped-private-worker-filesystem-identity)
+adds mapped tmpfs creation/cleanup scopes to the allocation flow in section 6.11
+and deferred cleanup in section 6.13. SM-04 records the corresponding unpublished
+preparation rule. The original source-range inventory above remains historical.
 
 Each detailed contract identifies its source range IDs; the tables above provide
 the reverse direction. A retained diagram or test matrix illustrates the linked

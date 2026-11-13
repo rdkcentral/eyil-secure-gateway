@@ -51,7 +51,9 @@ if(TARGET EyilGatewayRuntime)
     eyil_test_cases(eyil-buffer-l1 L1 log-correlation sizes range-arithmetic uid-isolation
         allocation-memory release-failure lease-lifetime release-race open-denied
         exclusive-create-failed truncate-failed allocate-enospc chown-failed
-        chmod-failed stat-failed allocate-eintr)
+        chmod-failed stat-failed allocate-eintr filesystem-scopes filesystem-failures
+        filesystem-restore-retry filesystem-cleanup-failure filesystem-thread-isolation
+        filesystem-saved-identity filesystem-deferred-cleanup)
     add_executable(eyil-adapter-l1 AdapterTests.cpp)
     target_link_libraries(eyil-adapter-l1 PRIVATE EyilGatewayRuntime)
     eyil_test_faults(eyil-adapter-l1)
